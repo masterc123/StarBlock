@@ -1,0 +1,10265 @@
+// ============================================================================
+// 0. GLOBAL RUNTIME ERROR HANDLER & SELF-HEALING DIAGNOSTIC GUARD
+// ============================================================================
+window.APP_ERROR_HANDLER = {
+    errors: [],
+    maxLogs: 25,
+    lastToastMs: 0,
+    record(context, err) {
+        const msg = err && err.message ? err.message : String(err);
+        const entry = { time: new Date().toISOString().slice(11, 19), context, message: msg };
+        this.errors.push(entry);
+        if (this.errors.length > this.maxLogs) this.errors.shift();
+        const now = performance.now();
+        if (now - this.lastToastMs > 2500) {
+            this.lastToastMs = now;
+            console.warn(`[RTS Error Guard - ${context}]:`, msg);
+        }
+    }
+};
+window.addEventListener('error', (ev) => {
+    if (ev && ev.error) window.APP_ERROR_HANDLER.record('window.onerror', ev.error);
+});
+window.addEventListener('unhandledrejection', (ev) => {
+    const reason = ev && ev.reason ? String(ev.reason.message || ev.reason) : '';
+    if (reason.includes('WebSocket')) {
+        ev.preventDefault();
+        return;
+    }
+    window.APP_ERROR_HANDLER.record('unhandledrejection', ev.reason);
+});
+
+// ============================================================================
+// 7. STARCRAFT 1:1 COMMAND CONSOLE, CLICK-AND-DRAG BOX SELECTION & MINIMAP
+// ============================================================================
+const COSTS = { base: 0, barracks: 100, factory: 200, hero: 150, turret: 75, tech_lab: 150, solaris_nexus: 0, solaris_pylon: 75, solaris_gate: 150, solaris_robotics: 200, solaris_spire: 100, solaris_cyber_lab: 150, barrier: 35, mine_drill: 120 };
+const BUILDING_MAX_HP = { base: 1500, barracks: 500, factory: 680, hero: 500, turret: 380, tech_lab: 650, solaris_nexus: 1600, solaris_pylon: 550, solaris_gate: 650, solaris_robotics: 750, solaris_spire: 480, solaris_cyber_lab: 700, barrier: 900, mine_drill: 560 };
+const WEAPON_COSTS = {
+    none: 0,
+    mg: 1,
+    flame: 2,
+    plasma: 2,
+    rocket: 2,
+    shield: 2,
+    sniper: 3,
+    drone: 3,
+    mortar: 3,
+    mindcontrol: 3
+};
+const WEAPON_LABELS = {
+    none: 'Empty',
+    mg: 'Gatling',
+    flame: 'Napalm',
+    plasma: 'Plasma',
+    rocket: 'Rocket Pod',
+    shield: 'Shield Dome',
+    sniper: 'Sniper',
+    drone: 'FixDrone',
+    mortar: 'Howitzer',
+    mindcontrol: 'Mind Ctrl'
+};
+const POWER_RADIUS = 36;
+
+const buildings = [];
+const enemyBuildings = [];
+const solarisBuildings = [];
+window.solarisBuildings = solarisBuildings;
+const units = [];
+const enemies = [];
+const projectiles = [];
+
+let state = {
+    mode: 'base',
+    playerFaction: 'terran', // 'terran' | 'solaris'
+    isEndless: false,
+    missionWon: false,
+    basePlaced: false,
+    heroPlaced: false,
+    solarisHostile: false,
+    enemyBaseDiscovered: false,
+    discoveredEnemyBasePos: null,
+    baseBuilding: null,
+    humanBadgeDom: null,
+    enemyBase: null,
+    powerRing: null,
+    req: 200,
+    gems: 0,
+    wave: 1,
+    kills: 0,
+    elapsedSec: 0,
+    selectedBuilding: null,
+    selectedUnits: [],
+    unitCommandMode: null, // null | 'move' | 'attack_move'
+    squadFormation: 'concave', // 'concave' | 'wedge' | 'line' | 'box' | 'spread'
+    formSquadEnabled: true,
+    squadIntelligence: true,
+    squadPosture: 'DEFENSIVE', // 'DEFENSIVE' | 'HUNTING'
+    squadIntelTimer: 0.4,
+    upgrades: {
+        terran: { weapons: 0, armor: 0 },
+        solaris: { weapons: 0, armor: 0 },
+        zerg: { weapons: 0, armor: 0 }
+    },
+    zergUpgradeTimer: 34.0,
+    solarisUpgradeTimer: 32.0,
+    activeTurretSlot: 'left',
+    rushGraceTimer: 45.0, // 45s grace period so enemy fliers and heavy units don't rush immediately
+    swarmWaveTimer: 28.0  // Staged Zerg Swarm wave coordination timer
+};
+
+// Marks the Enemy Zerg Base as discovered by scouting units and rallies all auto units & future spawns to attack it!
+function notifyEnemyBaseDiscovered(foundPos) {
+    if (!foundPos) return;
+    const targetPos = (state.enemyBase && state.enemyBase.hp > 0)
+        ? state.enemyBase.pos.clone()
+        : foundPos.clone();
+    state.discoveredEnemyBasePos = targetPos;
+    if (!state.enemyBaseDiscovered) {
+        state.enemyBaseDiscovered = true;
+        const ticker = document.getElementById('directive-ticker');
+        if (ticker && !state.missionWon) {
+            ticker.innerText = 'SCOUT REPORT: ENEMY ZERG HIVE DISCOVERED! All spawned & active combat units converging on Enemy Base!';
+            ticker.style.color = '#ffaa00';
+        }
+        // Immediately redirect all active auto-scouting units to march on the discovered Enemy Base!
+        for (let i = 0; i < units.length; i++) {
+            const u = units[i];
+            if (u && u.hp > 0 && u.order === 'auto') {
+                u.patrolTarget = targetPos.clone();
+            }
+        }
+    }
+}
+
+// Forward Zerg Staging Rally Area (North of the bridge causeways)
+const ENEMY_STAGING_POS = new THREE.Vector3(0, 0, -18);
+
+// Shared Selection Ring Geometry & Materials for Friendly Units
+const unitSelRingGeo = new THREE.RingGeometry(0.55, 0.72, 28);
+unitSelRingGeo.rotateX(-Math.PI / 2);
+const unitSelRingMat = new THREE.MeshBasicMaterial({
+    color: 0x00ff66, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false
+});
+const waypointRingMat = new THREE.MeshBasicMaterial({
+    color: 0x00ff66, side: THREE.DoubleSide, transparent: true, opacity: 0.95
+});
+const attackRingMat = new THREE.MeshBasicMaterial({
+    color: 0xff2a4b, side: THREE.DoubleSide, transparent: true, opacity: 0.95
+});
+
+// Unit & Building Metadata for 1:1 StarCraft Console Wireframes & Comm-Link Portrait
+const UNIT_CONSOLE_META = {
+    grunt:      { title: 'CMC-660 SHOCK TROOPER',   rank: 'CORPORAL',   weapon: 'PLASMA BLADE',            armor: 'CMC-HVY 2', quote: '"BLADES AT THE READY!"' },
+    ranger:     { title: 'C-14 GAUSS MARKSMAN',     rank: 'SERGEANT',   weapon: 'C-14 RIFLE',              armor: 'CMC-LGT 1', quote: '"YOU WANT A PIECE OF ME, BOY?"' },
+    medic:      { title: 'FIELD COMBAT MEDIC',      rank: 'LIEUTENANT', weapon: 'CADUCEUS NANO-BEAM',      armor: 'MED-SUIT 1', quote: '"WHERE DOES IT HURT? HEALING ACTIVE."' },
+    rocketman:  { title: 'HEAVY ROCKET TROOPER',    rank: 'SERGEANT',   weapon: 'JAVELIN AT/AA LAUNCHER',  armor: 'CMC-ORD 2', quote: '"LOCKED ON TARGET — FIRE IN THE HOLE!"' },
+    reaper:     { title: 'DOMINION JUMP-JET REAPER',rank: 'RAIDER',     weapon: 'DUAL P-45 GAUSS PISTOLS', armor: 'JET-PACK 1', quote: '"FEAR THE REAPER! JETS ENGAGED."' },
+    firebat:    { title: 'CMC-660 PYRO-FIREBAT',    rank: 'SERGEANT',   weapon: 'PERDITION FLAMETHROWERS', armor: 'CMC-PYRO 3', quote: '"NEED A LIGHT? INCINERATING SWARM!"' },
+    marauder:   { title: 'CMC-700 BIO-MARAUDER',    rank: 'LIEUTENANT', weapon: 'PUNISHER GRENADE CANNONS',armor: 'CMC-JUGG 3', quote: '"KABOOM, BABY! CONCUSSIVE SHELLS ONLINE."' },
+    hero:       { title: 'VANGUARD COMMANDER',      rank: 'MARSHAL',    weapon: 'AEGIS-X9 SUNLANCE RAIL',  armor: 'AEGIS-3',   quote: '"SUNLANCE RAIL-CANNON CHARGED — FEAR THE DOMINION!"' },
+    tank:       { title: 'M80 GRIZZLY TANK',        rank: 'MAJOR',      weapon: '120MM CANNON',            armor: 'CHOBHAM-4', quote: '"READY TO ROLL OUT!"' },
+    siege_tank: { title: 'CRUCIO SIEGE TANK',       rank: 'COLONEL',    weapon: '180MM SHOCK ARTILLERY',   armor: 'CHOBHAM-5', quote: '"LOCKING HYDRAULIC OUTRIGGERS — ARTILLERY ONLINE!"' },
+    heli:       { title: 'AH-99 HUNTER GUNSHIP',    rank: 'CAPTAIN',    weapon: 'HYDRA + BELLY MINIGUN',   armor: 'AERO-2',    quote: '"MINIGUN & ROCKETS ARMED."' },
+    transport:  { title: 'HERCULES DROPSHIP APC',   rank: 'CAPTAIN',    weapon: 'FORWARD DROP BAY',        armor: 'AERO-3',    quote: '"HOLDING FORWARD DROP ZONE."' },
+    valkyrie:   { title: 'VALKYRIE SEMI-MECH',      rank: 'COMMANDER',  weapon: 'AA HALO / MECH CANNONS',  armor: 'AERO-MECH 3', quote: '"FLIGHT INTERCEPTOR & GROUND MECH WALKER READY!"' },
+    skitterer:  { title: 'PSIONIC ZERGLING (ALLY)', rank: 'THRALL',     weapon: 'CHITIN SCYTHES',          armor: 'CARAPACE-1', quote: '"NEURAL LINK LOCKED."' },
+    spitter:    { title: 'PSIONIC HYDRALISK (ALLY)',rank: 'THRALL',     weapon: 'ACID SPINES',             armor: 'CARAPACE-2', quote: '"OBEYING TERRAN COMMAND."' },
+    crusher:    { title: 'PSIONIC ROACH (ALLY)',    rank: 'THRALL',     weapon: 'SCYTHE CLAWS',            armor: 'CARAPACE-3', quote: '"DOMINION NEURAL THRALL."' },
+    behemoth:   { title: 'PSIONIC ULTRALISK (ALLY)',rank: 'THRALL',     weapon: 'BIO-PLASMA',              armor: 'CARAPACE-4', quote: '"LEVIATHAN SUBJUGATED."' },
+    gorgon:     { title: 'PSIONIC GORGON (ALLY)',   rank: 'THRALL',     weapon: 'BILE-SCORPION CATAPULT',  armor: 'CARAPACE-4', quote: '"SCORPION LEVIATHAN SUBJUGATED."' },
+    mutalisk:   { title: 'PSIONIC MUTALISK (ALLY)', rank: 'THRALL',     weapon: 'GLAIVE WURM',             armor: 'AERO-BIO',   quote: '"SKY THRALL ONLINE."' },
+    zealot:     { title: 'CHRONO-ZEALOT TEMPLAR',   rank: 'TEMPLAR',    weapon: 'TWIN SOLAR PSI-GLAIVES',  armor: 'AURELIAN-3', quote: '"MY LIFE FOR THE SOLARIS SYNOD!"' },
+    stalker:    { title: 'SOLARIS PRISM STALKER',   rank: 'DRAGOON',    weapon: 'PHASE PARTICLE DISRUPTOR',armor: 'OBSIDIAN-3', quote: '"WALKING BETWEEN SHADOW & STARLIGHT."' },
+    archon:     { title: 'AETHER ARCHON SOVEREIGN', rank: 'ASCENDANT',  weapon: 'PSIONIC SOLAR SHOCKWAVE', armor: 'AETHER-SHD', quote: '"POWER OVERWHELMING — THE SYNOD AWAKENS!"' }
+};
+
+const BUILDING_CONSOLE_META = {
+    base:             { title: 'ORBITAL COMMAND CITADEL',rank: 'CITADEL',  weapon: 'ORBITAL GRID', armor: 'FORTIFIED', quote: '"ORBITAL COMMAND CITADEL UPLINK ONLINE."' },
+    barracks:         { title: 'INFANTRY BARRACKS',      rank: 'GARRISON', weapon: 'BIO TRAINER',  armor: 'PLATED-3',  quote: '"TRAINING INFANTRY SQUADS."' },
+    factory:          { title: 'HEAVY WAR FACTORY',      rank: 'FOUNDRY',  weapon: 'MECH BAY',     armor: 'PLATED-4',  quote: '"VEHICLE ASSEMBLY ACTIVE."' },
+    turret:           { title: 'MODULAR BALL TURRET',    rank: 'DEFENSE',  weapon: 'TRI-MOUNT',    armor: 'BUNKER-3',  quote: '"TRACKING HOSTILE SIGNATURES."' },
+    hero:             { title: 'VANGUARD BEACON PAD',    rank: 'SPECIAL',  weapon: 'WARP RELAY',   armor: 'PLATED-3',  quote: '"HERO TELEPORT LOCKED."' },
+    solaris_nexus:    { title: 'SOLARIS CHRONO NEXUS',   rank: 'SYNOD HQ', weapon: 'PSIONIC CORE', armor: 'AURELIAN-5',quote: '"THE CHRONO-SYNOD NEXUS SHINES ETERNAL."' },
+    solaris_pylon:    { title: 'KHAYDARIN POWER PYLON',  rank: 'MATRIX',   weapon: 'PSI MATRIX',   armor: 'CRYSTAL-3', quote: '"PSIONIC POWER MATRIX ONLINE — ENERGIZING WARP GRID."' },
+    solaris_gate:     { title: 'SOLARIS ASTRAL WARP GATE',rank: 'SYNOD',   weapon: 'CHRONO MATRIX',armor: 'AURELIAN-4',quote: '"CHRONO-SYNOD WARP MATRIX ALIGNED."' },
+    solaris_robotics: { title: 'SOLARIS ROBOTICS BAY',   rank: 'SYNOD',    weapon: 'WARP FOUNDRY', armor: 'AURELIAN-4',quote: '"ROBOTICS & FLEET WARP CONDUITS ONLINE."' },
+    solaris_spire:     { title: 'SOLARIS PHOTON SPIRE',    rank: 'DEFENSE',  weapon: 'PRISM BEAM',   armor: 'AURELIAN-3',quote: '"PRISMATIC PHOTON LENS FOCUSED."' },
+    solaris_cyber_lab: { title: 'SOLARIS CYBERNETICS FORGE',rank: 'RESEARCH', weapon: 'KHAYDARIN LAB',armor: 'AURELIAN-4',quote: '"FORGING SOLAR GLAIVES & AURELIAN CARAPACE MATRIX."' },
+    tech_lab:          { title: 'ENGINEERING & WEAPONS LAB',rank: 'RESEARCH', weapon: 'ORDNANCE LAB', armor: 'PLATED-4',  quote: '"UPGRADING DOMINION ARMS & CHOBHAM ARMOR PLATING."' },
+    barrier:           { title: 'BLAST BARRIER WALL',      rank: 'FORTIFY',  weapon: 'CHOBHAM SHIELD', armor: 'HVY-WALL 4', quote: '"BLAST BARRIER LOCKED & REINFORCED."' },
+    mine_drill:        { title: 'DEEP-CORE MINE DRILL',    rank: 'EXCAVATOR',weapon: 'AUGER + LASER',  armor: 'RIG-HVY 3',  quote: '"DEEP-CORE AUGER LOCKED — EXTRACTING MINERALS & KHAYDARIN GEMS!"' }
+};
+
+function getWireframeSvgMarkup(key, strokeCol = '#00ff66') {
+    const fillCol = strokeCol === '#00ff66' ? 'rgba(0,255,102,0.09)' : (strokeCol === '#ffaa00' ? 'rgba(255,170,0,0.1)' : 'rgba(255,42,75,0.12)');
+    if (key === 'mine_drill') {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <polygon points="16,12 48,12 52,26 12,26" fill="${fillCol}"/>
+            <polygon points="24,26 40,26 32,58" fill="${fillCol}"/>
+            <line x1="16" y1="26" x2="8" y2="54" stroke-width="2.5"/>
+            <line x1="48" y1="26" x2="56" y2="54" stroke-width="2.5"/>
+            <circle cx="32" cy="19" r="4" fill="${fillCol}"/>
+        </svg>`;
+    }
+    if (key === 'tank' || key === 'siege_tank') {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <rect x="8" y="14" width="12" height="38" fill="${fillCol}"/>
+            <rect x="44" y="14" width="12" height="38" fill="${fillCol}"/>
+            <rect x="18" y="18" width="28" height="30" fill="${fillCol}"/>
+            <polygon points="24,24 40,24 42,40 22,40" fill="${fillCol}"/>
+            <line x1="32" y1="4" x2="32" y2="26" stroke-width="3.5"/>
+        </svg>`;
+    }
+    if (key === 'valkyrie') {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <polygon points="32,6 42,24 58,18 50,38 38,44 42,58 22,58 26,44 14,38 6,18 22,24" fill="${fillCol}"/>
+            <rect x="14" y="24" width="6" height="14" fill="${fillCol}"/>
+            <rect x="44" y="24" width="6" height="14" fill="${fillCol}"/>
+        </svg>`;
+    }
+    if (key === 'heli' || key === 'transport') {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <polygon points="32,8 44,26 40,46 32,58 24,46 20,26" fill="${fillCol}"/>
+            <line x1="8" y1="28" x2="56" y2="28" stroke-width="2.5"/>
+            <line x1="12" y1="12" x2="52" y2="44" stroke-dasharray="3 2"/>
+            <line x1="52" y1="12" x2="12" y2="44" stroke-dasharray="3 2"/>
+        </svg>`;
+    }
+    if (['grunt', 'ranger', 'medic', 'rocketman', 'reaper', 'firebat', 'marauder', 'hero'].includes(key)) {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <circle cx="32" cy="15" r="8" fill="${fillCol}"/>
+            <polygon points="16,24 48,24 44,44 20,44" fill="${fillCol}"/>
+            <rect x="8" y="22" width="9" height="16" rx="2" fill="${fillCol}"/>
+            <rect x="47" y="22" width="9" height="16" rx="2" fill="${fillCol}"/>
+            <line x1="24" y1="44" x2="21" y2="58" stroke-width="2.5"/>
+            <line x1="40" y1="44" x2="43" y2="58" stroke-width="2.5"/>
+        </svg>`;
+    }
+    if (key === 'turret') {
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+            <polygon points="14,54 50,54 44,36 20,36" fill="${fillCol}"/>
+            <circle cx="32" cy="28" r="12" fill="${fillCol}"/>
+            <line x1="26" y1="8" x2="26" y2="20" stroke-width="2.5"/>
+            <line x1="38" y1="8" x2="38" y2="20" stroke-width="2.5"/>
+        </svg>`;
+    }
+    return `<svg viewBox="0 0 64 64" fill="none" stroke="${strokeCol}" stroke-width="2">
+        <polygon points="32,6 56,18 56,46 32,58 8,46 8,18" fill="${fillCol}"/>
+        <circle cx="32" cy="32" r="12"/>
+        <line x1="32" y1="6" x2="32" y2="20"/><line x1="32" y1="44" x2="32" y2="58"/>
+    </svg>`;
+}
+
+function getPortraitAvatarSvg(key) {
+    const isMech = ['tank', 'heli', 'transport', 'valkyrie', 'factory', 'turret', 'mine_drill'].includes(key);
+    const isStruct = ['base', 'barracks', 'factory', 'turret', 'hero', 'mine_drill'].includes(key);
+    const col = isStruct ? '#00e5ff' : (isMech ? '#38bdf8' : '#00ff66');
+    const visorCol = key === 'medic' ? '#00ff88' : (key === 'hero' || key === 'reaper' || key === 'rocketman' ? '#ffaa00' : (isStruct ? '#00e5ff' : '#ffaa00'));
+
+    if (isStruct) {
+        // StarCraft II Terran Adjutant Cybernetic AI Portrait
+        return `<svg viewBox="0 0 64 64" fill="none" stroke="${col}" stroke-width="1.6">
+            <circle cx="32" cy="30" r="22" stroke="rgba(0,229,255,0.28)" stroke-dasharray="4 2"/>
+            <path d="M18,16 L46,16 L52,30 L44,50 L20,50 L12,30 Z" fill="rgba(0,229,255,0.12)"/>
+            <polygon points="22,23 42,23 45,31 19,31" fill="rgba(0,229,255,0.32)" stroke="#00e5ff"/>
+            <circle cx="26" cy="27" r="2.2" fill="#ffffff"/>
+            <circle cx="38" cy="27" r="2.2" fill="#ffffff"/>
+            <line x1="23" y1="39" x2="41" y2="39" stroke="#00ff66" stroke-width="2"/>
+            <line x1="26" y1="43" x2="38" y2="43" stroke="#00e5ff" stroke-width="1.5"/>
+            <path d="M10,58 L20,50 L44,50 L54,58" stroke="${col}" stroke-width="2"/>
+        </svg>`;
+    }
+
+    // StarCraft II Terran CMC Powered Combat Suit / Pilot Helmet Portrait
+    return `<svg viewBox="0 0 64 64" fill="none" stroke="${col}" stroke-width="1.8">
+        <path d="M8,58 L14,44 L50,44 L56,58" fill="rgba(20,34,52,0.85)" stroke="${col}" stroke-width="2"/>
+        <polygon points="16,12 48,12 55,28 49,48 15,48 9,28" fill="rgba(0,229,255,0.14)"/>
+        <polygon points="18,22 46,22 49,34 15,34" fill="rgba(255,170,0,0.32)" stroke="${visorCol}" stroke-width="1.8"/>
+        <line x1="22" y1="26" x2="32" y2="26" stroke="#ffffff" stroke-width="1.4" opacity="0.8"/>
+        <rect x="23" y="38" width="18" height="5" fill="rgba(0,0,0,0.65)" stroke="${col}" stroke-width="1.2"/>
+        <circle cx="14" cy="19" r="2" fill="#00e5ff"/>
+        <circle cx="50" cy="19" r="2" fill="#00e5ff"/>
+    </svg>`;
+}
+
+function renderWireframeHpBlocks(ratio, col = '#00ff66') {
+    const container = document.getElementById('wireframe-hp-blocks');
+    if (!container) return;
+    const totalBlocks = 12;
+    const activeBlocks = Math.max(0, Math.min(totalBlocks, Math.ceil(ratio * totalBlocks)));
+    let html = '';
+    for (let i = 0; i < totalBlocks; i++) {
+        const bg = i < activeBlocks ? col : '#121c29';
+        html += `<div class="wf-hp-pip" style="background:${bg};"></div>`;
+    }
+    container.innerHTML = html;
+}
+
+function setCmdTooltip(text) {
+    const el = document.getElementById('cmd-tooltip-bar');
+    if (el) el.innerText = text;
+}
+
+function getCmdIconSvg(type) {
+    switch (type) {
+        case 'base': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2"><polygon points="12,2 22,8 22,16 12,22 2,16 2,8"/><circle cx="12" cy="12" r="4"/></svg>`;
+        case 'barracks': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#00ff66" stroke-width="2"><rect x="3" y="6" width="18" height="14"/><path d="M8,20 V12 H16 V20"/></svg>`;
+        case 'factory': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#ffaa00" stroke-width="2"><polygon points="2,20 2,10 8,14 8,10 14,14 14,8 22,8 22,20"/></svg>`;
+        case 'turret': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2"><circle cx="12" cy="14" r="6"/><line x1="12" y1="2" x2="12" y2="10"/><line x1="6" y1="20" x2="18" y2="20"/></svg>`;
+        case 'hero': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#ffaa00" stroke-width="2"><polygon points="12,2 15,9 22,9 16,14 18,21 12,17 6,21 8,14 2,9 9,9"/></svg>`;
+        case 'solaris_gate': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#f5b932" stroke-width="2"><polygon points="12,2 20,12 12,22 4,12"/><circle cx="12" cy="12" r="3.5" stroke="#38bdf8"/></svg>`;
+        case 'tech_lab':
+        case 'solaris_cyber_lab': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><circle cx="12" cy="12" r="5"/><polygon points="12,2 15,6 9,6"/><polygon points="12,22 15,18 9,18"/><polygon points="2,12 6,15 6,9"/><polygon points="22,12 18,15 18,9"/></svg>`;
+        case 'mine_drill': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#e879f9" stroke-width="2"><polygon points="6,4 18,4 15,11 9,11"/><polygon points="9,11 15,11 12,22"/><line x1="6" y1="11" x2="3" y2="20"/><line x1="18" y1="11" x2="21" y2="20"/></svg>`;
+        case 'attack': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#ff2a4b" stroke-width="2"><circle cx="12" cy="12" r="8"/><line x1="12" y1="2" x2="12" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/></svg>`;
+        case 'move': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#00ff66" stroke-width="2"><polyline points="5,12 19,12"/><polyline points="13,6 19,12 13,18"/></svg>`;
+        case 'hold': return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#00e5ff" stroke-width="2"><path d="M12,2 L4,6 V12 C4,17 8,21 12,22 C16,21 20,17 20,12 V6 Z"/></svg>`;
+        default: return `<svg class="cmd-icon-svg" viewBox="0 0 24 24" fill="none" stroke="#9ab0c9" stroke-width="2"><rect x="4" y="4" width="16" height="16"/></svg>`;
+    }
+}
+
+function makeHealthPip(color, isStructure = false) {
+    const root = document.createElement('div');
+    root.className = 'hp-pip' + (isStructure ? ' structure' : '');
+    const shieldBar = document.createElement('div');
+    shieldBar.style.cssText = 'width:0%;height:3px;background:linear-gradient(90deg,#00e5ff,#38bdf8,#e0f2fe);box-shadow:0 0 5px #00e5ff;margin-bottom:1px;display:none;border-radius:1px;transition:width 0.08s linear;';
+    const bar = document.createElement('div');
+    bar.className = 'hp-pip-bar';
+    bar.style.background = color;
+    root.appendChild(shieldBar);
+    root.appendChild(bar);
+    worldUi.appendChild(root);
+    return { root, bar, shieldBar };
+}
+
+function updateHealthPip(hb, hp, maxHp, shield = 0, maxShield = 0) {
+    if (!hb || !hb.bar) return;
+    hb.bar.style.width = `${Math.max(0, Math.min(100, (hp / Math.max(1, maxHp)) * 100))}%`;
+    if (hb.shieldBar) {
+        if (maxShield > 0) {
+            if (hb.shieldBar.style.display !== 'block') hb.shieldBar.style.display = 'block';
+            hb.shieldBar.style.width = `${Math.max(0, Math.min(100, (shield / maxShield) * 100))}%`;
+        } else if (hb.shieldBar.style.display !== 'none') {
+            hb.shieldBar.style.display = 'none';
+        }
+    }
+}
+
+// Fast Camera Frustum Culling Helper so off-screen units/enemies skip expensive skeletal animations, particle emissions & DOM projections
+const _camFrustum = new THREE.Frustum();
+const _camProjScreenMatrix = new THREE.Matrix4();
+const _cullSphere = new THREE.Sphere();
+function updateCameraViewportFrustum() {
+    camera.updateMatrixWorld();
+    _camProjScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    _camFrustum.setFromProjectionMatrix(_camProjScreenMatrix);
+}
+window.isWorldPosInViewport = function(wx, wy, wz, radius = 3.5) {
+    _cullSphere.center.set(wx, wy, wz);
+    _cullSphere.radius = radius;
+    return _camFrustum.intersectsSphere(_cullSphere);
+};
+
+const fowSmoothAlpha = new Float32Array(FOW_RES * FOW_RES).fill(215);
+
+function updateFogOfWarVision() {
+    fowVisible.fill(0);
+
+    const weatherVisMult = (window.WEATHER_SYSTEM && typeof window.WEATHER_SYSTEM.getVisionMultiplier === 'function')
+        ? window.WEATHER_SYSTEM.getVisionMultiplier()
+        : 1.0;
+
+    const visionSources = [];
+    const addVis = (x, z, r) => {
+        const rad = Math.max(1, r);
+        visionSources.push({ x, z, invR2: 1.0 / (rad * rad) });
+    };
+    if (!state.basePlaced) {
+        addVis(PLAYER_START_POS.x, PLAYER_START_POS.z, 36 * weatherVisMult);
+        if (typeof SOLARIS_BASE_POS !== 'undefined') {
+            addVis(SOLARIS_BASE_POS.x, SOLARIS_BASE_POS.z, 22 * weatherVisMult);
+        }
+    } else {
+        for (let i = 0; i < buildings.length; i++) {
+            const b = buildings[i];
+            if (b && b.hp > 0) addVis(b.pos.x, b.pos.z, (b.type === 'base' ? 34 : 23) * weatherVisMult);
+        }
+        for (let i = 0; i < units.length; i++) {
+            const u = units[i];
+            if (u && u.hp > 0) addVis(u.mesh.position.x, u.mesh.position.z, (u.isAir ? 25 : 17.5) * weatherVisMult);
+        }
+        if (!state.solarisHostile) {
+            for (let i = 0; i < solarisBuildings.length; i++) {
+                const sb = solarisBuildings[i];
+                if (sb && sb.hp > 0) addVis(sb.pos.x, sb.pos.z, 22 * weatherVisMult);
+            }
+        }
+    }
+
+    const vLen = visionSources.length;
+    const data = fowImgData.data;
+    const revealAll = !!window.fowRevealAll;
+
+    for (let gy = 0; gy < FOW_RES; gy++) {
+        const wz = ((gy / FOW_RES) - 0.5) * MAP_SIZE;
+        const rowOffset = gy * FOW_RES;
+        for (let gx = 0; gx < FOW_RES; gx++) {
+            const wx = ((gx / FOW_RES) - 0.5) * MAP_SIZE;
+            const idx = rowOffset + gx;
+
+            if (revealAll) {
+                fowExplored[idx] = 1;
+                fowVisible[idx] = 1;
+                fowSmoothAlpha[idx] = 0;
+                const p = idx * 4;
+                data[p] = 6;
+                data[p + 1] = 11;
+                data[p + 2] = 18;
+                data[p + 3] = 0;
+                continue;
+            }
+
+            let minRatioSq = 999;
+            for (let s = 0; s < vLen; s++) {
+                const src = visionSources[s];
+                const dx = wx - src.x;
+                const dz = wz - src.z;
+                const dSq = (dx * dx + dz * dz) * src.invR2;
+                if (dSq < minRatioSq) {
+                    minRatioSq = dSq;
+                    if (dSq < 0.35) break; // Early exit inside bright core vision
+                }
+            }
+
+            let targetAlpha = 212;
+            if (minRatioSq < 1.0) {
+                fowExplored[idx] = 1;
+                fowVisible[idx] = 1;
+                if (minRatioSq < 0.3844) { // 0.62^2
+                    targetAlpha = 0;
+                } else {
+                    const minRatio = Math.sqrt(minRatioSq);
+                    const edgeT = (minRatio - 0.62) / 0.38;
+                    targetAlpha = Math.floor(edgeT * edgeT * (3.0 - 2.0 * edgeT) * 116);
+                }
+            } else if (fowExplored[idx]) {
+                targetAlpha = 116;
+            }
+
+            fowSmoothAlpha[idx] = fowSmoothAlpha[idx] + (targetAlpha - fowSmoothAlpha[idx]) * 0.42;
+            const alpha = Math.max(0, Math.min(255, Math.round(fowSmoothAlpha[idx])));
+
+            const p = idx * 4;
+            data[p] = 6;
+            data[p + 1] = 11;
+            data[p + 2] = 18;
+            data[p + 3] = alpha;
+        }
+    }
+    fowCtx.putImageData(fowImgData, 0, 0);
+    fowTexture.needsUpdate = true;
+
+    for (let i = 0; i < enemies.length; i++) {
+        const e = enemies[i];
+        const vis = isWorldPosVisible(e.mesh.position.x, e.mesh.position.z);
+        e.mesh.visible = vis;
+        if (!vis && e.hb && e.hb.root.style.display !== 'none') e.hb.root.style.display = 'none';
+    }
+
+    for (let i = 0; i < enemyBuildings.length; i++) {
+        const eb = enemyBuildings[i];
+        const exp = isWorldPosExplored(eb.pos.x, eb.pos.z);
+        const vis = isWorldPosVisible(eb.pos.x, eb.pos.z);
+        eb.mesh.visible = true;
+        if (vis && state.basePlaced && !state.enemyBaseDiscovered) {
+            notifyEnemyBaseDiscovered(eb.pos);
+        }
+        if (!exp) {
+            if (eb.badge.style.display !== 'none') eb.badge.style.display = 'none';
+            if (eb.hb.root.style.display !== 'none') eb.hb.root.style.display = 'none';
+        }
+    }
+}
+
+// Helper to ensure AI Buildings NEVER overlap each other, never block base ramps, never spawn in rivers, and always leave wide tank/unit pathways!
+function resolveSafeEnemyBuildingPos(desiredPos, bRadius = 2.6, isProduction = false, anchorCenter = null, maxAnchorDist = 23.5) {
+    const pathwayBuffer = isProduction ? 3.5 : 2.5;
+    const isSpotClear = (tx, tz, ignoreMinorProps = false) => {
+        if (Math.abs(tx) > 102 || Math.abs(tz) > 102) return false;
+        if (anchorCenter) {
+            const dAnchor = Math.hypot(tx - anchorCenter.x, tz - anchorCenter.z);
+            if (dAnchor > maxAnchorDist) return false;
+        }
+        const h = getTerrainHeight(tx, tz);
+        if (h < -0.05 || h > 9.5) return false;
+        if (typeof isPointInValleyRiver === 'function' && isPointInValleyRiver(tx, tz, bRadius + 1.6)) return false;
+        if (typeof isPointInWaterPond === 'function' && isPointInWaterPond(tx, tz, bRadius + 1.4)) return false;
+        if (typeof isOnRiverBridge === 'function' && isOnRiverBridge(tx, tz, bRadius + 1.5)) return false;
+        if (typeof isSpotUnderOrBlockingBridge === 'function' && isSpotUnderOrBlockingBridge(tx, tz, bRadius + 1.5)) return false;
+
+        // Never place AI buildings on any Base Ramp or Merged Ramp Platform so unit/tank pathways stay 100% open!
+        if (Array.isArray(window.BASE_TERRAIN_ZONES)) {
+            for (let zIdx = 0; zIdx < window.BASE_TERRAIN_ZONES.length; zIdx++) {
+                const bz = window.BASE_TERRAIN_ZONES[zIdx];
+                if (!bz || bz.mode === 'no_ramp') continue;
+                if (typeof getBaseZoneRampMetrics === 'function') {
+                    const zm = getBaseZoneRampMetrics(bz, tx, tz);
+                    if (zm.inRampAngle || zm.rampBlend > 0.12 || zm.mergedPlatformBlend > 0.12) {
+                        return false;
+                    }
+                    if (!ignoreMinorProps && zm.dist > bz.radius - (bRadius + 1.1) && zm.dist < bz.rimOuter + (bRadius + 1.1)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Check 8 perimeter points for water/steep slope
+        if (!ignoreMinorProps) {
+            for (let a = 0; a < 8; a++) {
+                const ang = (a / 8) * Math.PI * 2;
+                const px = tx + Math.cos(ang) * (bRadius + 0.8);
+                const pz = tz + Math.sin(ang) * (bRadius + 0.8);
+                const ph = getTerrainHeight(px, pz);
+                if (ph < -0.05 || Math.abs(ph - h) > 1.45) return false;
+                if (typeof isPointInValleyRiver === 'function' && isPointInValleyRiver(px, pz, 0.8)) return false;
+            }
+        }
+
+        // STRICT NON-OVERLAP: Enforce wide Unit & Tank Pathway spacing against ALL Enemy Zerg buildings
+        for (let i = 0; i < enemyBuildings.length; i++) {
+            const eb = enemyBuildings[i];
+            if (!eb || eb.hp <= 0) continue;
+            const ebIsProd = (eb.role === 'barracks' || eb.role === 'factory' || eb.role === 'citadel');
+            const minSep = bRadius + Math.max(eb.footprintRadius || 2.8, 2.2) + ((isProduction || ebIsProd) ? 3.5 : pathwayBuffer);
+            if (Math.hypot(tx - eb.pos.x, tz - eb.pos.z) < minSep) return false;
+        }
+
+        // STRICT NON-OVERLAP: Enforce wide Unit & Tank Pathway spacing against ALL Solaris Protoss buildings
+        if (typeof solarisBuildings !== 'undefined') {
+            for (let i = 0; i < solarisBuildings.length; i++) {
+                const sb = solarisBuildings[i];
+                if (!sb || sb.hp <= 0) continue;
+                const sbIsProd = (sb.role === 'gate' || sb.role === 'robotics' || sb.role === 'nexus');
+                const minSep = bRadius + Math.max(sb.footprintRadius || 2.4, 2.0) + ((isProduction || sbIsProd) ? 3.3 : pathwayBuffer);
+                if (Math.hypot(tx - sb.pos.x, tz - sb.pos.z) < minSep) return false;
+            }
+        }
+
+        // STRICT NON-OVERLAP: Enforce spacing against ALL Player buildings
+        if (typeof buildings !== 'undefined') {
+            for (let i = 0; i < buildings.length; i++) {
+                const pb = buildings[i];
+                if (!pb || pb.hp <= 0) continue;
+                const minSep = bRadius + Math.max(pb.footprintRadius || 2.4, 2.2) + 3.2;
+                if (Math.hypot(tx - pb.pos.x, tz - pb.pos.z) < minSep) return false;
+            }
+        }
+
+        // Avoid terrain obstacles & mineral patches
+        if (typeof obstacles !== 'undefined') {
+            for (let i = 0; i < obstacles.length; i++) {
+                const obs = obstacles[i];
+                if (!obs) continue;
+                if (ignoreMinorProps && !obs.isStructure && obs.type !== 'mineral') continue;
+                const obsRad = obs.footprintR || obs.r || 1.2;
+                if (Math.hypot(tx - obs.x, tz - obs.z) < bRadius + obsRad + (ignoreMinorProps ? 0.6 : 1.1)) return false;
+            }
+        }
+        return true;
+    };
+
+    if (isSpotClear(desiredPos.x, desiredPos.z, false)) {
+        return new THREE.Vector3(desiredPos.x, getTerrainHeight(desiredPos.x, desiredPos.z), desiredPos.z);
+    }
+
+    const searchOrigin = anchorCenter || desiredPos;
+    const maxSearchR = anchorCenter ? maxAnchorDist : 36.0;
+
+    // Pass 1: Strict search around desiredPos, then around anchorCenter
+    for (let r = 2.2; r <= maxSearchR; r += 1.6) {
+        const steps = 28;
+        for (let s = 0; s < steps; s++) {
+            const ang = (s / steps) * Math.PI * 2 + r * 0.35;
+            const tx = desiredPos.x + Math.cos(ang) * r;
+            const tz = desiredPos.z + Math.sin(ang) * r;
+            if (isSpotClear(tx, tz, false)) {
+                return new THREE.Vector3(tx, getTerrainHeight(tx, tz), tz);
+            }
+        }
+    }
+
+    // Pass 2: Ignore minor tree/boulder props, but NEVER overlap any building!
+    for (let r = 2.5; r <= maxSearchR + 8.0; r += 1.8) {
+        const steps = 32;
+        for (let s = 0; s < steps; s++) {
+            const ang = (s / steps) * Math.PI * 2 + r * 0.45;
+            const tx = searchOrigin.x + Math.cos(ang) * r;
+            const tz = searchOrigin.z + Math.sin(ang) * r;
+            if (isSpotClear(tx, tz, true)) {
+                return new THREE.Vector3(tx, getTerrainHeight(tx, tz), tz);
+            }
+        }
+    }
+    return new THREE.Vector3(desiredPos.x, getTerrainHeight(desiredPos.x, desiredPos.z), desiredPos.z);
+}
+
+function initEnemyHiveCluster() {
+    // Enemy Zerg Main Base (Leviathan Citadel) starts ALONE at ENEMY_BASE_POS (zero pre-built barracks/factories/turrets!).
+    // The Enemy Zerg AI progressively constructs its Spawning Pool, Spine Crawlers, Bio-Factory & Drill Towers over time!
+    creepRadius = Math.max(creepRadius || 18.5, 18.5);
+    creepTargetRadius = Math.max(creepTargetRadius || 21.0, 21.0);
+
+    if (typeof window.flattenTerrainUnderBuilding === 'function') {
+        ENEMY_BASE_POS.y = window.flattenTerrainUnderBuilding(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, 4.6, 2.6);
+    } else {
+        ENEMY_BASE_POS.y = getTerrainHeight(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z);
+    }
+    const citadelMesh = createLeviathanCitadel();
+    citadelMesh.position.copy(ENEMY_BASE_POS);
+    scene.add(citadelMesh);
+    const cBadge = document.createElement('div');
+    cBadge.style.display = 'none';
+    const cHb = makeHealthPip('#ff2a4b', true);
+    const citadelObj = {
+        role: 'citadel', mesh: citadelMesh, pos: ENEMY_BASE_POS.clone(),
+        footprintRadius: 3.5,
+        hp: 3500, maxHp: 3500, buildProgress: 1.0, badge: cBadge, hb: cHb
+    };
+    state.enemyBase = citadelObj;
+    enemyBuildings.push(citadelObj);
+
+    // Immediately sync Zerg Creep shader uniforms, 3D creep ground surface, & vertex colors to ENEMY_BASE_POS
+    if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.setZergCreepUniforms === 'function') {
+        SHADER_ENGINE.setZergCreepUniforms(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, creepRadius);
+    }
+    if (typeof updateZergCreepColors === 'function') {
+        updateZergCreepColors(creepRadius, false, true);
+    }
+
+    // Compute smart tactical direction vectors from ENEMY_BASE_POS toward the battlefield center / player base
+    // so the Zerg AI places defensive Spine/Drill towers on its front arc and production structures on wide flank lanes!
+    const toCenterDx = -ENEMY_BASE_POS.x;
+    const toCenterDz = -ENEMY_BASE_POS.z;
+    const toCenterLen = Math.hypot(toCenterDx, toCenterDz) || 1;
+    const fwdX = toCenterDx / toCenterLen;
+    const fwdZ = toCenterDz / toCenterLen;
+    const rightX = -fwdZ;
+    const rightZ = fwdX;
+
+    const makeTacticalOffset = (alongFwd, acrossRight) => new THREE.Vector3(
+        fwdX * alongFwd + rightX * acrossRight,
+        0,
+        fwdZ * alongFwd + rightZ * acrossRight
+    );
+
+    // Progressive Zerg Base Construction Blueprint Queue (Slow-start economy: Main Base ONLY at start; AI builds structures gradually over time!)
+    state.enemyBuildTimer = 22.0;
+    state.enemyBuildBlueprints = [
+        { role: 'barracks',          offset: makeTacticalOffset(4.5, -8.8),  radius: 2.8, maxHp: 1300, color: '#b845ff', idx: 0, isProd: true },
+        { role: 'spine_turret',      offset: makeTacticalOffset(9.6, -3.6),  radius: 1.8, maxHp: 520,  color: '#84cc16', idx: 0, isProd: false },
+        { role: 'evolution_chamber', offset: makeTacticalOffset(-5.4, 7.6),  radius: 2.35,maxHp: 980,  color: '#a3e635', idx: 0, isProd: false },
+        { role: 'factory',           offset: makeTacticalOffset(4.2,  9.2),  radius: 3.0, maxHp: 1600, color: '#b845ff', idx: 0, isProd: true },
+        { role: 'spine_turret',      offset: makeTacticalOffset(9.8,  3.8),  radius: 1.8, maxHp: 520,  color: '#84cc16', idx: 1, isProd: false },
+        { role: 'drill_tower',       offset: makeTacticalOffset(7.5, -9.2),  radius: 2.2, maxHp: 680,  color: '#ff5400', idx: 0, isProd: false },
+        { role: 'spine_turret',      offset: makeTacticalOffset(11.2, 0.0),  radius: 1.8, maxHp: 520,  color: '#84cc16', idx: 2, isProd: false },
+        { role: 'drill_tower',       offset: makeTacticalOffset(7.5,  9.2),  radius: 2.2, maxHp: 680,  color: '#ff5400', idx: 1, isProd: false },
+        { role: 'barracks',          offset: makeTacticalOffset(-7.8, -6.5), radius: 2.8, maxHp: 1300, color: '#b845ff', idx: 1, isProd: true }
+    ];
+
+    initSolarisSynodEnclave();
+}
+
+function constructNextEnemyZergStructure() {
+    if (!state.enemyBase || state.enemyBase.hp <= 0 || !state.enemyBuildBlueprints) return;
+    // Do not start a new Zerg structure while another Zerg structure is still gestating (< 75% complete)
+    const currentlyGestating = enemyBuildings.some(eb => eb && eb.hp > 0 && eb.buildProgress !== undefined && eb.buildProgress < 0.75);
+    if (currentlyGestating) return;
+
+    for (let i = 0; i < state.enemyBuildBlueprints.length; i++) {
+        const bp = state.enemyBuildBlueprints[i];
+        const alreadyExists = enemyBuildings.some(eb => eb.hp > 0 && eb.role === bp.role && (eb.bpIdx || 0) === bp.idx);
+        if (alreadyExists) continue;
+
+        const rawDesired = bp.desiredPos
+            ? bp.desiredPos.clone()
+            : new THREE.Vector3(ENEMY_BASE_POS.x + bp.offset.x, 0, ENEMY_BASE_POS.z + bp.offset.z);
+        const safePos = resolveSafeEnemyBuildingPos(rawDesired, bp.radius, Boolean(bp.isProd), ENEMY_BASE_POS, 23.5);
+        if (typeof window.flattenTerrainUnderBuilding === 'function') {
+            safePos.y = window.flattenTerrainUnderBuilding(safePos.x, safePos.z, bp.radius + 0.6, 1.8);
+        }
+        if (bp.role === 'barracks' && bp.idx === 0) ENEMY_BARRACKS_POS.copy(safePos);
+        if (bp.role === 'factory' && bp.idx === 0) ENEMY_FACTORY_POS.copy(safePos);
+
+        let mesh;
+        if (bp.role === 'barracks') mesh = createEnemySpawningPool();
+        else if (bp.role === 'factory') mesh = createEnemyBioFactory();
+        else if (bp.role === 'evolution_chamber') {
+            mesh = typeof createEnemyEvolutionChamber === 'function' ? createEnemyEvolutionChamber() : createEnemySpawningPool();
+        } else if (bp.role === 'drill_tower') {
+            mesh = typeof createEnemySubterraneanDrillTower === 'function' ? createEnemySubterraneanDrillTower() : createEnemySpineTurret();
+        } else {
+            mesh = createEnemySpineTurret();
+        }
+        mesh.position.copy(safePos);
+        // Keep root mesh.scale at 1.0 so the Zerg Organic Biomass Metamorphosis Cocoon renders at full size!
+        mesh.scale.set(1.0, 1.0, 1.0);
+        scene.add(mesh);
+
+        const badge = document.createElement('div');
+        badge.style.display = 'none';
+        const hb = makeHealthPip(bp.color, true);
+        enemyBuildings.push({
+            role: bp.role,
+            bpIdx: bp.idx,
+            mesh,
+            pos: safePos,
+            footprintRadius: bp.radius,
+            hp: bp.maxHp,
+            maxHp: bp.maxHp,
+            buildProgress: 0.02,
+            badge,
+            hb,
+            spawnTimer: bp.role === 'barracks' ? 6.5 : 10.5,
+            spawnDuration: bp.role === 'barracks' ? 8.5 : 14.5,
+            currentYaw: 0,
+            drillRadius: 18.5,
+            cooldown: 1.0 + bp.idx * 0.35
+        });
+        return;
+    }
+}
+
+// 3RD FACTION: THE SOLARIS CHRONO-SYNOD ENCLAVE (Autonomously builds Khaydarin Pylons first to power Warp Gates, Robotics Bay & Photon Spires!)
+function initSolarisSynodEnclave() {
+    solarisBuildings.forEach(sb => {
+        if (sb.mesh) scene.remove(sb.mesh);
+        if (sb.hb && sb.hb.root) sb.hb.root.remove();
+    });
+    solarisBuildings.length = 0;
+
+    if (typeof SOLARIS_BASE_POS === 'undefined') return;
+    const safeNexusPos = resolveSafeEnemyBuildingPos(SOLARIS_BASE_POS, 3.2, true);
+    SOLARIS_BASE_POS.copy(safeNexusPos);
+    if (typeof window.flattenTerrainUnderBuilding === 'function') {
+        SOLARIS_BASE_POS.y = window.flattenTerrainUnderBuilding(SOLARIS_BASE_POS.x, SOLARIS_BASE_POS.z, 3.8, 2.2);
+    }
+
+    const nexusMesh = createEngineeredBuilding('solaris_nexus', false);
+    nexusMesh.position.copy(SOLARIS_BASE_POS);
+    scene.add(nexusMesh);
+    const nHb = makeHealthPip('#f5b932', true);
+    solarisBuildings.push({
+        type: 'solaris_nexus',
+        role: 'nexus',
+        bpIdx: 0,
+        mesh: nexusMesh,
+        pos: SOLARIS_BASE_POS.clone(),
+        footprintRadius: 2.8,
+        hp: 2400,
+        maxHp: 2400,
+        shield: 1200,
+        maxShield: 1200,
+        shieldRegenDelay: 0,
+        buildProgress: 1.0,
+        hb: nHb,
+        spawnTimer: 8.5,
+        spawnDuration: 12.0,
+        spawnIndex: 0
+    });
+
+    // Pick a dynamic StarCraft Allied Playbook Doctrine on each map seed / match (Strictly within Allied Main Base Radius!)
+    const doctrines = ['zealot_rush', 'massive_fleet', 'fortified_enclave'];
+    state.solarisDoctrine = doctrines[Math.floor(Math.random() * doctrines.length)];
+    state.solarisFleetReleased = false;
+
+    state.solarisBuildTimer = 18.0;
+    state.solarisBuildBlueprints = [
+        // Protoss MUST warp in a Khaydarin Power Pylon FIRST to project a Psionic Matrix before warping in Gates/Robotics/Spires!
+        { type: 'solaris_pylon',    role: 'pylon',    offset: [-5.8, -4.6], radius: 1.85, maxHp: 750,  color: '#38bdf8', idx: 0, label: 'KHAYDARIN PYLON ALPHA' },
+        { type: 'solaris_gate',     role: 'gate',     offset: [-9.2, -3.2], radius: 2.25, maxHp: 1250, color: '#f5b932', idx: 0, label: 'WARP GATE ALPHA' },
+        { type: 'solaris_spire',    role: 'spire',    offset: [-7.8,  5.8], radius: 1.70, maxHp: 900,  color: '#38bdf8', idx: 0, label: 'PHOTON SPIRE ALPHA' },
+        { type: 'solaris_pylon',    role: 'pylon',    offset: [ 5.8, -4.6], radius: 1.85, maxHp: 750,  color: '#38bdf8', idx: 1, label: 'KHAYDARIN PYLON BETA' },
+        { type: 'solaris_robotics', role: 'robotics', offset: [ 8.8, -5.2], radius: 2.50, maxHp: 1450, color: '#f5b932', idx: 0, label: 'ROBOTICS BAY ALPHA' },
+        { type: 'solaris_spire',    role: 'spire',    offset: [-11.6, 1.8], radius: 1.70, maxHp: 900,  color: '#38bdf8', idx: 1, label: 'PHOTON SPIRE BETA' },
+        { type: 'solaris_gate',     role: 'gate',     offset: [ 9.2,  4.8], radius: 2.25, maxHp: 1250, color: '#f5b932', idx: 1, label: 'WARP GATE BETA' },
+        { type: 'solaris_spire',    role: 'spire',    offset: [ 3.4, -9.8], radius: 1.70, maxHp: 900,  color: '#38bdf8', idx: 2, label: 'PHOTON SPIRE GAMMA' }
+    ];
+}
+
+function constructNextSolarisStructure() {
+    if (!state.solarisBuildBlueprints || typeof SOLARIS_BASE_POS === 'undefined') return;
+
+    // Wait if a Solaris structure is currently warping in (< 80% build progress) so AI builds at a natural pace
+    const currentlyBuilding = solarisBuildings.some(sb => sb && sb.hp > 0 && sb.buildProgress !== undefined && sb.buildProgress < 0.80);
+    if (currentlyBuilding) return;
+
+    // 1. Repair damaged completed Solaris structures
+    for (let s = 0; s < solarisBuildings.length; s++) {
+        const sb = solarisBuildings[s];
+        if (!sb || sb.hp <= 0) continue;
+        if ((sb.buildProgress === undefined || sb.buildProgress >= 1.0) && sb.hp < sb.maxHp) {
+            sb.hp = Math.min(sb.maxHp, sb.hp + Math.round(sb.maxHp * 0.25));
+        }
+    }
+
+    // 2. If the Primary Solaris Nexus was destroyed, rebuild it first at SOLARIS_BASE_POS!
+    const hasPrimaryNexus = solarisBuildings.some(sb => sb.hp > 0 && (sb.role === 'nexus' || sb.role === 'solaris_nexus') && (sb.bpIdx || 0) === 0);
+    if (!hasPrimaryNexus) {
+        const safeNexusPos = resolveSafeEnemyBuildingPos(SOLARIS_BASE_POS.clone(), 3.1, true, SOLARIS_BASE_POS, 21.5);
+        if (typeof window.flattenTerrainUnderBuilding === 'function') {
+            safeNexusPos.y = window.flattenTerrainUnderBuilding(safeNexusPos.x, safeNexusPos.z, 3.3, 1.6);
+        }
+        const nexusMesh = createEngineeredBuilding('solaris_nexus', false);
+        nexusMesh.position.copy(safeNexusPos);
+        nexusMesh.scale.set(1.0, 1.0, 1.0);
+        if (nexusMesh.userData && nexusMesh.userData.scaffoldGroup) {
+            nexusMesh.userData.scaffoldGroup.visible = true;
+            if (nexusMesh.userData.mainStructure) nexusMesh.userData.mainStructure.scale.set(0.25, 0.08, 0.25);
+        }
+        scene.add(nexusMesh);
+        const hb = makeHealthPip('#f5b932', true);
+        solarisBuildings.push({
+            type: 'solaris_nexus',
+            role: 'nexus',
+            bpIdx: 0,
+            isProxy: false,
+            mesh: nexusMesh,
+            pos: safeNexusPos,
+            footprintRadius: 2.8,
+            hp: 2400,
+            maxHp: 2400,
+            shield: 1200,
+            maxShield: 1200,
+            shieldRegenDelay: 0,
+            buildProgress: 0.02,
+            hb,
+            spawnTimer: 8.0,
+            spawnDuration: 12.5,
+            cooldown: 0.6
+        });
+        return;
+    }
+
+    // 3. Enforce Protoss Power Matrix Requirement: if no Khaydarin Pylon is active, build solaris_pylon FIRST!
+    const hasCompletedPylon = solarisBuildings.some(sb => sb.hp > 0 && sb.role === 'pylon' && (sb.buildProgress === undefined || sb.buildProgress >= 1.0));
+
+    for (let i = 0; i < state.solarisBuildBlueprints.length; i++) {
+        const bp = state.solarisBuildBlueprints[i];
+        if (!hasCompletedPylon && bp.role !== 'pylon') continue;
+        const exists = solarisBuildings.some(sb => sb.hp > 0 && sb.role === bp.role && (sb.bpIdx || 0) === bp.idx);
+        if (exists) continue;
+
+        const desired = new THREE.Vector3(SOLARIS_BASE_POS.x + bp.offset[0], 0, SOLARIS_BASE_POS.z + bp.offset[1]);
+        const isProd = (bp.role === 'gate' || bp.role === 'robotics' || bp.role === 'nexus');
+        // Resolve a guaranteed non-overlapping spot strictly within 22.0m of SOLARIS_BASE_POS (NO post-clamp overwrite!)
+        const safePos = resolveSafeEnemyBuildingPos(desired, bp.radius + 0.35, isProd, SOLARIS_BASE_POS, 22.0);
+        if (typeof window.flattenTerrainUnderBuilding === 'function') {
+            safePos.y = window.flattenTerrainUnderBuilding(safePos.x, safePos.z, bp.radius + 0.5, 1.6);
+        }
+        const mesh = createEngineeredBuilding(bp.type, false);
+        mesh.position.copy(safePos);
+        mesh.scale.set(1.0, 1.0, 1.0);
+        if (mesh.userData && mesh.userData.scaffoldGroup) {
+            mesh.userData.scaffoldGroup.visible = true;
+            if (mesh.userData.mainStructure) mesh.userData.mainStructure.scale.set(0.25, 0.08, 0.25);
+        }
+        scene.add(mesh);
+        const hb = makeHealthPip(bp.color, true);
+        const maxShd = bp.role === 'nexus' ? 1100 : (bp.role === 'robotics' ? 750 : (bp.role === 'gate' ? 600 : 450));
+        solarisBuildings.push({
+            type: bp.type,
+            role: bp.role,
+            bpIdx: bp.idx,
+            isProxy: false,
+            mesh,
+            pos: safePos,
+            footprintRadius: bp.radius,
+            hp: bp.maxHp,
+            maxHp: bp.maxHp,
+            shield: maxShd,
+            maxShield: maxShd,
+            shieldRegenDelay: 0,
+            buildProgress: 0.02,
+            hb,
+            spawnTimer: 9.0,
+            spawnDuration: 13.5,
+            cooldown: 0.6 + bp.idx * 0.25
+        });
+        return;
+    }
+}
+
+window.togglePlayerFaction = function() {
+    state.playerFaction = state.playerFaction === 'terran' ? 'solaris' : 'terran';
+    const badge = document.getElementById('mode-badge');
+    if (badge) {
+        badge.innerText = state.playerFaction === 'solaris' ? 'SOLARIS PROTOSS' : 'TERRAN DOMINION';
+        badge.style.color = state.playerFaction === 'solaris' ? '#f5b932' : '';
+        badge.style.borderColor = state.playerFaction === 'solaris' ? '#f5b932' : '';
+    }
+    if (state.playerFaction === 'terran' && state.mode === 'solaris_gate') {
+        setMode('select');
+    }
+    if (window.SFX) window.SFX.playClick();
+    renderSC2CommandCard();
+    updateHUD(true);
+};
+
+window.toggleSolarisDiplomacy = function() {
+    state.solarisHostile = !state.solarisHostile;
+    const btn = document.getElementById('btn-solaris-stance');
+    if (btn) {
+        btn.innerText = state.solarisHostile ? '❖ SYNOD: 3-WAY WAR' : '❖ SYNOD: ALLIED';
+        btn.style.borderColor = state.solarisHostile ? '#ffaa00' : '';
+        btn.style.color = state.solarisHostile ? '#ffe066' : '';
+    }
+    if (window.SFX) window.SFX.playClick();
+    updateFogOfWarVision();
+    renderTacticalMinimap();
+};
+
+initEnemyHiveCluster();
+
+const ghostRoot = new THREE.Group();
+scene.add(ghostRoot);
+let ghostMesh = null;
+const matGhostOk = new THREE.MeshBasicMaterial({ color: 0x00ff66, transparent: true, opacity: 0.48 });
+const matGhostBad = new THREE.MeshBasicMaterial({ color: 0xff2a4b, transparent: true, opacity: 0.48 });
+
+const previewRadiusGeo = new THREE.RingGeometry(POWER_RADIUS - 0.25, POWER_RADIUS, 80);
+previewRadiusGeo.rotateX(-Math.PI / 2);
+const previewRadiusRing = new THREE.Mesh(previewRadiusGeo, new THREE.MeshBasicMaterial({ color: 0x00e5ff, side: THREE.DoubleSide, transparent: true, opacity: 0.45 }));
+previewRadiusRing.position.y = 0.15;
+ghostRoot.add(previewRadiusRing);
+
+const selRingGeo = new THREE.RingGeometry(1.2, 1.4, 32);
+selRingGeo.rotateX(-Math.PI / 2);
+const selRing = new THREE.Mesh(selRingGeo, new THREE.MeshBasicMaterial({ color: 0x00ff66, side: THREE.DoubleSide }));
+selRing.visible = false;
+scene.add(selRing);
+
+// ============================================================================
+// 3D HOLOGRAPHIC BASE PLACEMENT BARRIER SELECTION SYSTEM
+// Renders designated Drop-Zone Foundation Barriers with Hazard Boundary Pylons,
+// Pulsing Laser Fences, Holographic Foundation Grid & Tactical Selection API!
+// ============================================================================
+let BASE_PLACEMENT_BARRIERS = [];
+let selectedBaseBarrierId = 'alpha';
+const baseBarrierGroups = [];
+
+function syncBasePlacementBarriersFromZones() {
+    if (typeof BASE_PLACEMENT_ZONES !== 'undefined' && Array.isArray(BASE_PLACEMENT_ZONES) && BASE_PLACEMENT_ZONES.length > 0) {
+        BASE_PLACEMENT_BARRIERS = BASE_PLACEMENT_ZONES.map((z, idx) => ({
+            id: z.id || (idx === 0 ? 'alpha' : (idx === 1 ? 'beta' : 'gamma')),
+            label: idx === 0
+                ? 'DROP-ZONE ALPHA (CENTRAL PLATEAU)'
+                : (idx === 1 ? 'DROP-ZONE BETA (WEST CANYON FLANK)' : 'DROP-ZONE GAMMA (EAST RIVER OVERLOOK)'),
+            shortLabel: (z.id || 'ALPHA').toUpperCase(),
+            x: z.x,
+            z: z.z,
+            radius: 5.5
+        }));
+    } else {
+        BASE_PLACEMENT_BARRIERS = [
+            { id: 'alpha', label: 'DROP-ZONE ALPHA (CENTRAL PLATEAU)', shortLabel: 'ALPHA', x: PLAYER_START_POS.x, z: PLAYER_START_POS.z, radius: 5.6 },
+            { id: 'beta',  label: 'DROP-ZONE BETA (WEST CANYON FLANK)', shortLabel: 'BETA', x: PLAYER_START_POS.x - 13.5, z: PLAYER_START_POS.z + 5.5, radius: 5.4 },
+            { id: 'gamma', label: 'DROP-ZONE GAMMA (EAST RIVER OVERLOOK)', shortLabel: 'GAMMA', x: PLAYER_START_POS.x + 13.5, z: PLAYER_START_POS.z + 4.5, radius: 5.4 }
+        ];
+    }
+}
+
+function buildBasePlacementBarrierMeshes() {
+    while (baseBarrierGroups.length > 0) {
+        const old = baseBarrierGroups.pop();
+        if (old && old.group && old.group.parent) old.group.parent.remove(old.group);
+    }
+    // Sync logical drop-zone coordinates without adding 3D border spawn models to the scene
+    syncBasePlacementBarriersFromZones();
+}
+buildBasePlacementBarrierMeshes();
+
+function selectBaseBarrierZone(id, autoSnap = true) {
+    selectedBaseBarrierId = id;
+    const bObj = BASE_PLACEMENT_BARRIERS.find(b => b.id === id) || BASE_PLACEMENT_BARRIERS[0];
+    if (bObj && autoSnap && !state.basePlaced) {
+        setMode('base');
+        const hy = getTerrainHeight(bObj.x, bObj.z);
+        ghostRoot.position.set(bObj.x, hy, bObj.z);
+        const evalRes = evaluateBuildSpot(new THREE.Vector3(bObj.x, hy, bObj.z));
+        ghostMesh.traverse(c => { if (c.isMesh) c.material = evalRes.ok ? matGhostOk : matGhostBad; });
+        cursorTag.innerText = evalRes.reason;
+        cursorTag.className = evalRes.ok ? 'valid' : 'invalid';
+        cursorTag.style.display = 'block';
+
+        controls.target.set(bObj.x, hy, bObj.z);
+        if (IS_MOBILE) {
+            camera.position.set(bObj.x + 6, 52, bObj.z + 46);
+        } else {
+            camera.position.set(bObj.x + 4, 38, bObj.z + 34);
+        }
+        controls.update();
+        if (window.SFX) window.SFX.playClick();
+    }
+    if (typeof window.SEND_NETWORK_ORDER === 'function' && autoSnap) {
+        window.SEND_NETWORK_ORDER({ type: 'base_barrier', barrierId: id });
+    }
+}
+window.selectBaseBarrierZone = selectBaseBarrierZone;
+
+function deployBaseAtBarrier(id = selectedBaseBarrierId) {
+    if (state.basePlaced) return false;
+    const bObj = BASE_PLACEMENT_BARRIERS.find(b => b.id === id) || BASE_PLACEMENT_BARRIERS[0];
+    if (!bObj) return false;
+    setMode('base');
+    const hy = getTerrainHeight(bObj.x, bObj.z);
+    deployStructure(new THREE.Vector3(bObj.x, hy, bObj.z));
+    return true;
+}
+window.deployBaseAtBarrier = deployBaseAtBarrier;
+
+function updateBasePlacementBarriers(_dt) {
+    if (baseBarrierGroups.length > 0) {
+        baseBarrierGroups.forEach(bg => { if (bg && bg.group) bg.group.visible = false; });
+    }
+}
+
+function rebuildGhostModel(mode) {
+    if (ghostMesh) { ghostRoot.remove(ghostMesh); ghostMesh = null; }
+    if (mode === 'select') {
+        ghostRoot.visible = false;
+        cursorTag.style.display = 'none';
+        return;
+    }
+    ghostRoot.visible = true;
+    previewRadiusRing.visible = (mode === 'base');
+    ghostMesh = createEngineeredBuilding(mode, false);
+    ghostMesh.traverse(c => { if (c.isMesh) c.material = matGhostOk; });
+    ghostRoot.add(ghostMesh);
+}
+rebuildGhostModel('base');
+
+function updateTurretWorldBadge(b) {
+    // Floating upgrade UI removed so it never interrupts gameplay view
+    if (b && b.turretBadge) {
+        b.turretBadge.remove();
+        b.turretBadge = null;
+    }
+}
+
+function syncTurretPods(b) {
+    const head = b.mesh.userData.head;
+    const mounts = b.mesh.userData.mounts;
+    let hasShield = false;
+    ['left', 'right', 'top'].forEach(slot => {
+        if (mounts[slot]) {
+            if (mounts[slot].userData.repairBeam) {
+                scene.remove(mounts[slot].userData.repairBeam);
+            }
+            if (mounts[slot].userData.mindBeam) {
+                scene.remove(mounts[slot].userData.mindBeam);
+            }
+            head.remove(mounts[slot]);
+            mounts[slot] = null;
+        }
+        const wType = b.weapons[slot];
+        if (wType === 'shield') hasShield = true;
+        if (wType !== 'none') {
+            const pod = createOrdnancePod(wType);
+            if (wType === 'drone') {
+                const rBeam = new THREE.Mesh(healBeamGeo, MAT.nanoWeldBeam);
+                rBeam.visible = false;
+                scene.add(rBeam);
+                pod.userData.repairBeam = rBeam;
+            } else if (wType === 'mindcontrol') {
+                const mBeam = new THREE.Mesh(healBeamGeo, SHARED_FX_MAT.mindControlBeam || MAT.hiveVeinGlow);
+                mBeam.visible = false;
+                scene.add(mBeam);
+                pod.userData.mindBeam = mBeam;
+            }
+            head.add(pod);
+            if (typeof window.snapModularTurretAttachment === 'function') {
+                window.snapModularTurretAttachment(b.mesh, pod, slot, b.level || 1, true);
+            } else {
+                if (slot === 'left') pod.position.set(-0.56, 0.02, 0.02);
+                if (slot === 'right') pod.position.set(0.56, 0.02, 0.02);
+                if (slot === 'top') pod.position.set(0, 0.50, 0.02);
+            }
+            mounts[slot] = pod;
+        }
+    });
+
+    // Manage 3D Forcefield Shield Dome when 'shield' weapon is installed
+    if (hasShield) {
+        if (!b.shieldDomeMesh && typeof createTurretShieldDomeMesh === 'function') {
+            b.shieldDomeMesh = createTurretShieldDomeMesh(9.5);
+            b.shieldDomeMesh.traverse(c => { c.raycast = () => {}; });
+            b.mesh.add(b.shieldDomeMesh);
+            b.maxShieldHp = 450;
+            b.shieldHp = 450;
+            b.shieldBrokenTimer = 0;
+        }
+    } else if (b.shieldDomeMesh) {
+        b.mesh.remove(b.shieldDomeMesh);
+        b.shieldDomeMesh = null;
+        b.shieldHp = 0;
+        b.maxShieldHp = 0;
+        b.shieldBrokenTimer = 0;
+    }
+
+    if (typeof updateTurretRangeVisuals === 'function') {
+        updateTurretRangeVisuals(b, state.selectedBuilding === b);
+    }
+}
+
+// HQ Emergency Repair Overload Shockwave: Instant-kills all surrounding enemies to prevent staying dead!
+function executeHQEmergencyOverloadRepair() {
+    if (!state.baseBuilding) return;
+    const hqPos = state.baseBuilding.pos;
+    const blastRadius = 28.0;
+
+    // 1. Trigger massive Thermonuclear EMP + Thermal Shockwave Visual FX
+    detonateHQOverloadBlast(hqPos);
+
+    // 2. Instant-kill all enemies around the HQ within 28m with heavy ragdoll blast impulse & limb dismemberment
+    let purgedCount = 0;
+    enemies.forEach(e => {
+        const dist = Math.hypot(e.mesh.position.x - hqPos.x, e.mesh.position.z - hqPos.z);
+        if (dist <= blastRadius && e.hp > 0) {
+            recordRagdollHitImpulse(e, hqPos, true);
+            e.hp = 0;
+            purgedCount++;
+        }
+    });
+
+    // 3. Restore HQ and nearby friendly structures
+    state.baseBuilding.hp = state.baseBuilding.maxHp;
+    buildings.forEach(b => {
+        if (b !== state.baseBuilding && b.hp > 0 && b.pos.distanceTo(hqPos) <= 18.0) {
+            b.hp = Math.min(b.maxHp, b.hp + 250);
+            spawnNanoWeldSparkFX(b.pos);
+        }
+    });
+
+    spawnNanoWeldSparkFX(hqPos);
+    spawnCombatFloat(hqPos, `OVERLOAD BLAST! (${purgedCount} HOSTILES VAPORIZED)`, '#00e5ff');
+    const ticker = document.getElementById('directive-ticker');
+    if (ticker) {
+        ticker.innerText = `HQ EMERGENCY OVERLOAD DETONATED — ${purgedCount} SURROUNDING ENEMIES VAPORIZED & HQ RESTORED TO 100%!`;
+        ticker.style.color = '#00e5ff';
+    }
+    updateHUD();
+}
+
+function upgradeTurret(b) {
+    if (!b || b.type !== 'turret') return;
+    const curLvl = b.level || 1;
+    const upgCost = curLvl === 1 ? 120 : (curLvl === 2 ? 180 : 250);
+    if (state.req < upgCost) {
+        spawnCombatFloat(b.pos, `NEED ${upgCost}M TO UPGRADE!`, '#ff2a4b');
+        return;
+    }
+    state.req -= upgCost;
+    b.level = curLvl + 1;
+    b.maxPower = (b.maxPower || 3) + 3;
+    b.maxHp += 260;
+    b.hp = Math.min(b.maxHp, b.hp + 260);
+    applyTurretUpgradeModel(b.mesh, b.level);
+    syncTurretPods(b);
+    spawnNanoWeldSparkFX(b.pos);
+    if (window.SFX) window.SFX.playBuild();
+    spawnCombatFloat(b.pos, `TURRET UPGRADED TO MK-${b.level}! (+260HP / +3⚡)`, '#ffaa00');
+    renderSC2CommandCard();
+    updateHUD();
+}
+
+// --- UNIT SELECTION & TACTICAL COMMAND HELPERS ---
+function syncUnitSelectionVisuals() {
+    units.forEach(u => {
+        const isSel = state.selectedUnits.includes(u);
+        if (u.selCircle) u.selCircle.visible = isSel;
+        if (u.hb && u.hb.root) {
+            if (isSel) u.hb.root.classList.add('selected-unit');
+            else u.hb.root.classList.remove('selected-unit');
+        }
+    });
+}
+
+function setSelectedUnits(unitList) {
+    state.selectedUnits = unitList.filter(u => u && u.hp > 0);
+    if (state.selectedUnits.length > 0) {
+        state.selectedBuilding = null;
+        selRing.visible = false;
+        buildings.forEach(bld => {
+            if (bld.type === 'turret' && typeof updateTurretRangeVisuals === 'function') {
+                updateTurretRangeVisuals(bld, false);
+            }
+        });
+        state.mode = 'select';
+        rebuildGhostModel('select');
+        if (window.SFX) window.SFX.playClick();
+    } else {
+        state.unitCommandMode = null;
+    }
+    syncUnitSelectionVisuals();
+    renderSC2CommandCard();
+    updateHUD();
+}
+
+function selectAllArmy() {
+    if (units.length === 0) return;
+    setSelectedUnits([...units]);
+}
+
+function clearAllSelection() {
+    state.selectedUnits = [];
+    state.unitCommandMode = null;
+    syncUnitSelectionVisuals();
+    selectStructure(null);
+}
+
+// --- TACTICAL SQUAD FORMATIONS (SMART CONCAVE + MELEE VANGUARD, WEDGE, LINE, BOX, SPREAD) ---
+function computeTacticalFormationPositions(squad, targetPos, formation = 'concave') {
+    if (!squad || squad.length === 0 || !targetPos) return new Map();
+
+    // Compute squad centroid to orient the formation toward the march or threat direction
+    let cx = 0, cz = 0;
+    squad.forEach(u => { cx += u.mesh.position.x; cz += u.mesh.position.z; });
+    cx /= squad.length; cz /= squad.length;
+
+    let fx = targetPos.x - cx;
+    let fz = targetPos.z - cz;
+    let fLen = Math.hypot(fx, fz);
+
+    // If reforming in place (targetPos near centroid), orient toward nearest enemy or Enemy Hive
+    if (fLen < 2.2) {
+        let threatX = ENEMY_BASE_POS.x, threatZ = ENEMY_BASE_POS.z;
+        let bestThreatDist = Infinity;
+        enemies.forEach(e => {
+            if (e && e.hp > 0 && e.mesh) {
+                const d = Math.hypot(e.mesh.position.x - cx, e.mesh.position.z - cz);
+                if (d < bestThreatDist) {
+                    bestThreatDist = d;
+                    threatX = e.mesh.position.x;
+                    threatZ = e.mesh.position.z;
+                }
+            }
+        });
+        fx = threatX - cx;
+        fz = threatZ - cz;
+        fLen = Math.hypot(fx, fz);
+    }
+    if (fLen > 0.01) { fx /= fLen; fz /= fLen; }
+    else { fx = 0; fz = -1; }
+
+    // Right perpendicular vector
+    const rx = -fz, rz = fx;
+    const results = new Map();
+
+    // Smart Combat-Efficient 'Form Squad' Concave + Front-Line Melee Formation
+    if (formation === 'concave' || state.formSquadEnabled) {
+        const meleeScreen = [];
+        const rangedArc = [];
+        const supportRear = [];
+
+        squad.forEach(u => {
+            if (['grunt', 'reaper', 'tank', 'skitterer', 'crusher', 'behemoth', 'zealot'].includes(u.type) || (u.type === 'valkyrie' && u.mechMode)) {
+                meleeScreen.push(u);
+            } else if (['medic', 'transport'].includes(u.type)) {
+                supportRear.push(u);
+            } else {
+                rangedArc.push(u);
+            }
+        });
+
+        // 1. Front-Line Melee & Heavy Vanguard Screen (tight slightly curved vanguard line in front)
+        const mCount = meleeScreen.length;
+        meleeScreen.forEach((u, idx) => {
+            const sp = u.type === 'tank' ? 2.35 : 1.50;
+            const normIdx = mCount > 1 ? (idx - (mCount - 1) * 0.5) : 0;
+            const localRight = normIdx * sp;
+            // Slight forward bow/screen
+            const localForward = 1.45 - Math.abs(normIdx) * 0.18;
+            let wx = targetPos.x + rx * localRight + fx * localForward;
+            let wz = targetPos.z + rz * localRight + fz * localForward;
+            if (!u.isAir && typeof isPointWalkableForUnit === 'function' && !isPointWalkableForUnit(wx, wz, u.radius || 0.52)) {
+                wx = targetPos.x; wz = targetPos.z;
+            }
+            results.set(u, new THREE.Vector3(wx, getSurfaceHeightWithBridges(wx, wz), wz));
+        });
+
+        // 2. Ranged Concave Firing Arc (parabolic crescent behind melee line so all ranged units focus fire inward without blocking each other)
+        const rCount = rangedArc.length;
+        const maxPerRank = 7;
+        rangedArc.forEach((u, idx) => {
+            const rankIdx = Math.floor(idx / maxPerRank);
+            const idxInRank = idx % maxPerRank;
+            const countInRank = Math.min(maxPerRank, rCount - rankIdx * maxPerRank);
+            const norm = countInRank > 1 ? (idxInRank / (countInRank - 1)) * 2.0 - 1.0 : 0.0; // -1 to +1
+            const arcRadius = Math.max(2.6, countInRank * 0.92) + rankIdx * 1.65;
+            const maxAngle = Math.min(Math.PI * 0.42, 0.30 + countInRank * 0.09);
+            const theta = norm * maxAngle;
+
+            // Concave crescent: wings curve forward toward the target while center stays behind melee screen
+            const baseBack = (mCount > 0 ? 1.55 : 0.25) + rankIdx * 1.55;
+            const localRight = Math.sin(theta) * arcRadius;
+            const localBack = baseBack + (Math.cos(theta) - 1.0) * (arcRadius * 0.55);
+
+            let wx = targetPos.x + rx * localRight - fx * localBack;
+            let wz = targetPos.z + rz * localRight - fz * localBack;
+            if (!u.isAir && typeof isPointWalkableForUnit === 'function' && !isPointWalkableForUnit(wx, wz, u.radius || 0.48)) {
+                wx = targetPos.x; wz = targetPos.z;
+            }
+            results.set(u, new THREE.Vector3(wx, getSurfaceHeightWithBridges(wx, wz), wz));
+        });
+
+        // 3. Support Medics & Transports tucked safely in the rear pocket of the concave
+        const sCount = supportRear.length;
+        supportRear.forEach((u, idx) => {
+            const normIdx = sCount > 1 ? (idx - (sCount - 1) * 0.5) : 0;
+            const localRight = normIdx * 1.65;
+            const localBack = (mCount > 0 ? 2.85 : 1.75) + (rCount > 0 ? 1.45 : 0);
+            let wx = targetPos.x + rx * localRight - fx * localBack;
+            let wz = targetPos.z + rz * localRight - fz * localBack;
+            if (!u.isAir && typeof isPointWalkableForUnit === 'function' && !isPointWalkableForUnit(wx, wz, u.radius || 0.48)) {
+                wx = targetPos.x; wz = targetPos.z;
+            }
+            results.set(u, new THREE.Vector3(wx, getSurfaceHeightWithBridges(wx, wz), wz));
+        });
+
+        return results;
+    }
+
+    // Sort units by tactical combat role: Heavy Armor/Melee Vanguard first, Ranged Core middle, Support Medics rear
+    const rolePriority = { tank: 0, grunt: 1, reaper: 1, crusher: 1, behemoth: 1, skitterer: 1, hero: 2, ranger: 3, rocketman: 3, spitter: 3, heli: 4, valkyrie: 4, mutalisk: 4, medic: 5, transport: 6 };
+    const sorted = [...squad].sort((a, b) => (rolePriority[a.type] ?? 3) - (rolePriority[b.type] ?? 3));
+
+    const n = sorted.length;
+    sorted.forEach((u, idx) => {
+        let localRight = 0, localBack = 0;
+        const spacing = u.type === 'tank' ? 2.4 : 1.55;
+
+        if (formation === 'wedge') {
+            if (idx === 0) {
+                localRight = 0; localBack = 0;
+            } else {
+                const rank = Math.ceil(idx / 2);
+                const side = (idx % 2 === 1) ? 1 : -1;
+                localRight = side * rank * spacing * 0.92;
+                localBack = rank * spacing * 0.85;
+            }
+        } else if (formation === 'line') {
+            const cols = Math.max(3, Math.ceil(Math.sqrt(n * 2.2)));
+            const row = Math.floor(idx / cols);
+            const col = (idx % cols) - (Math.min(cols, n - row * cols) - 1) * 0.5;
+            localRight = col * spacing * 1.05;
+            localBack = row * spacing * 1.15;
+        } else if (formation === 'box') {
+            if (n <= 4) {
+                const col = (idx % 2) - 0.5;
+                const row = Math.floor(idx / 2) - 0.5;
+                localRight = col * spacing * 1.2;
+                localBack = row * spacing * 1.2;
+            } else {
+                const ang = (idx / n) * Math.PI * 2;
+                const rad = u.type === 'medic' ? 0.5 : Math.max(1.8, n * 0.28);
+                localRight = Math.sin(ang) * rad;
+                localBack = Math.cos(ang) * rad;
+            }
+        } else {
+            const cols = Math.ceil(Math.sqrt(n));
+            const row = Math.floor(idx / cols);
+            const col = (idx % cols) - (cols - 1) * 0.5;
+            localRight = col * spacing * 1.75;
+            localBack = row * spacing * 1.75;
+        }
+
+        const wx = targetPos.x + rx * localRight - fx * localBack;
+        const wz = targetPos.z + rz * localRight - fz * localBack;
+        results.set(u, new THREE.Vector3(wx, getSurfaceHeightWithBridges(wx, wz), wz));
+    });
+    return results;
+}
+
+function formSquadImmediately() {
+    if (state.selectedUnits.length === 0) return;
+    state.formSquadEnabled = true;
+    state.squadFormation = 'concave';
+    let cx = 0, cz = 0;
+    state.selectedUnits.forEach(u => { cx += u.mesh.position.x; cz += u.mesh.position.z; });
+    cx /= state.selectedUnits.length;
+    cz /= state.selectedUnits.length;
+    const centerPt = new THREE.Vector3(cx, getSurfaceHeightWithBridges(cx, cz), cz);
+    issueSquadOrder('attack_move', centerPt);
+    spawnCombatFloat(centerPt, 'SQUAD FORMED: MELEE FRONT + RANGED CONCAVE!', '#00ff66');
+    syncFormSquadButtonUI();
+}
+window.formSquadNow = formSquadImmediately;
+
+function toggleFormSquadMode() {
+    state.formSquadEnabled = !state.formSquadEnabled;
+    if (state.formSquadEnabled) {
+        state.squadFormation = 'concave';
+        formSquadImmediately();
+    } else {
+        state.squadFormation = 'wedge';
+        syncFormSquadButtonUI();
+        renderSC2CommandCard();
+    }
+}
+window.toggleFormSquad = toggleFormSquadMode;
+
+function syncFormSquadButtonUI() {
+    const btn = document.getElementById('btn-form-squad');
+    const lbl = document.getElementById('form-squad-label');
+    if (btn) {
+        if (state.formSquadEnabled) btn.classList.add('active');
+        else btn.classList.remove('active');
+    }
+    if (lbl) {
+        lbl.innerText = state.formSquadEnabled
+            ? 'FORM SQUAD: ON (CONCAVE)'
+            : `FORM SQUAD: ${state.squadFormation.toUpperCase()}`;
+    }
+}
+
+function cycleSquadFormation() {
+    const order = ['concave', 'wedge', 'line', 'box', 'spread'];
+    const nextIdx = (order.indexOf(state.squadFormation) + 1) % order.length;
+    state.squadFormation = order[nextIdx];
+    state.formSquadEnabled = (state.squadFormation === 'concave');
+    syncFormSquadButtonUI();
+    if (state.selectedUnits.length > 0) {
+        let cx = 0, cz = 0;
+        state.selectedUnits.forEach(u => { cx += u.mesh.position.x; cz += u.mesh.position.z; });
+        cx /= state.selectedUnits.length; cz /= state.selectedUnits.length;
+        issueSquadOrder('attack_move', new THREE.Vector3(cx, getSurfaceHeightWithBridges(cx, cz), cz));
+    }
+    renderSC2CommandCard();
+}
+
+// ============================================================================
+// SQUAD INTELLIGENCE SYSTEM (AUTO DEFENSIVE PHALANX vs AGGRESSIVE HUNT)
+// & FACTION LAB UPGRADES (ARMS & ARMOR LV.1-LV.3 WITH 3D VISUAL ATTACHMENTS)
+// ============================================================================
+function syncSquadIntelButtonUI() {
+    const btn = document.getElementById('btn-squad-intel');
+    if (!btn) return;
+    if (!state.squadIntelligence) {
+        btn.innerText = '🧠 SQUAD AI: MANUAL';
+        btn.style.borderColor = 'rgba(148,163,184,0.45)';
+        btn.style.color = '#94a3b8';
+    } else if (state.squadPosture === 'HUNTING') {
+        btn.innerText = '🧠 SQUAD AI: HUNTING';
+        btn.style.borderColor = '#ffaa00';
+        btn.style.color = '#fde047';
+    } else {
+        btn.innerText = '🧠 SQUAD AI: DEFENSIVE';
+        btn.style.borderColor = '#00e5ff';
+        btn.style.color = '#67e8f9';
+    }
+}
+
+window.toggleSquadIntelligence = function() {
+    state.squadIntelligence = !state.squadIntelligence;
+    if (window.SFX) window.SFX.playClick();
+    syncSquadIntelButtonUI();
+    renderSC2CommandCard();
+};
+
+function updateSquadIntelligence(dt) {
+    if (!state.basePlaced || state.missionWon || !state.squadIntelligence) return;
+    state.squadIntelTimer = (state.squadIntelTimer || 0.45) - dt;
+    if (state.squadIntelTimer > 0) return;
+    state.squadIntelTimer = 0.75;
+
+    const autoSquad = units.filter(u =>
+        u && u.hp > 0 && u.order === 'auto' &&
+        u.type !== 'transport' && !(u.type === 'siege_tank' && u.siegeMode) && !u.tankTacticalRetreat
+    );
+    if (autoSquad.length === 0) return;
+
+    const hqPos = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+    let squadCx = 0, squadCz = 0;
+    for (let i = 0; i < autoSquad.length; i++) {
+        squadCx += autoSquad[i].mesh.position.x;
+        squadCz += autoSquad[i].mesh.position.z;
+    }
+    squadCx /= autoSquad.length;
+    squadCz /= autoSquad.length;
+
+    // Evaluate nearby/detected enemy Zerg clusters (ignore unspotted enemies far away so defensive posture never rotates in circles around hidden units!)
+    let nearSquadEnemies = 0;
+    let nearHqEnemies = 0;
+    let nearestClusterCenter = null;
+    let bestClusterScore = -Infinity;
+
+    for (let i = 0; i < enemies.length; i++) {
+        const e = enemies[i];
+        if (!e || e.hp <= 0 || !e.mesh) continue;
+        const ex = e.mesh.position.x, ez = e.mesh.position.z;
+        const dSquad = Math.hypot(ex - squadCx, ez - squadCz);
+        const dHq = Math.hypot(ex - hqPos.x, ez - hqPos.z);
+        if (dSquad <= 26.0) nearSquadEnemies++;
+        if (dHq <= 34.0) nearHqEnemies++;
+
+        const isKnownEnemy = state.isEndless || dHq <= 36.0 || dSquad <= 30.0 || (typeof isWorldPosVisible === 'function' && isWorldPosVisible(ex, ez));
+        if (!isKnownEnemy) continue;
+
+        // Measure local Zerg cluster density around enemy `e`
+        let neighbors = 1;
+        for (let j = 0; j < enemies.length; j++) {
+            if (i === j || !enemies[j] || enemies[j].hp <= 0) continue;
+            if (Math.hypot(enemies[j].mesh.position.x - ex, enemies[j].mesh.position.z - ez) <= 11.5) {
+                neighbors++;
+            }
+        }
+        const score = neighbors * 18.0 - dSquad * 0.65 - dHq * 0.45;
+        if (score > bestClusterScore) {
+            bestClusterScore = score;
+            nearestClusterCenter = e.mesh.position.clone();
+        }
+    }
+
+    const highZergThreatNear = (nearHqEnemies >= 2) || (nearSquadEnemies >= 4 && nearSquadEnemies > autoSquad.length);
+    const canAggressiveHunt = !highZergThreatNear && (enemies.length > 0 || enemyBuildings.length > 0);
+
+    const prevPosture = state.squadPosture;
+    state.squadPosture = canAggressiveHunt ? 'HUNTING' : 'DEFENSIVE';
+    if (prevPosture !== state.squadPosture) {
+        syncSquadIntelButtonUI();
+    }
+
+    if (state.squadPosture === 'DEFENSIVE' && highZergThreatNear && nearestClusterCenter) {
+        // DEFENSIVE FORMATION: Form a protective concave screen ONLY when enemies are actually threatening HQ or the squad!
+        const toThreatX = nearestClusterCenter.x - hqPos.x;
+        const toThreatZ = nearestClusterCenter.z - hqPos.z;
+        const toThreatLen = Math.hypot(toThreatX, toThreatZ) || 1;
+        const defStandDist = nearHqEnemies > 0 ? 11.5 : 15.5;
+        const defAnchorX = THREE.MathUtils.clamp(hqPos.x + (toThreatX / toThreatLen) * defStandDist, -98, 98);
+        const defAnchorZ = THREE.MathUtils.clamp(hqPos.z + (toThreatZ / toThreatLen) * defStandDist, -98, 98);
+        const defAnchor = new THREE.Vector3(defAnchorX, getTerrainHeight(defAnchorX, defAnchorZ), defAnchorZ);
+        const formMap = computeTacticalFormationPositions(autoSquad, defAnchor, 'concave');
+        autoSquad.forEach(u => {
+            if (formMap && formMap.has(u)) {
+                u.patrolTarget = formMap.get(u);
+            }
+        });
+    } else if (state.squadPosture === 'HUNTING' && nearestClusterCenter) {
+        // AGGRESSIVE HUNTING BEHAVIOR: Coordinate pack hunting toward the detected enemy cluster!
+        autoSquad.forEach(u => {
+            u.patrolTarget = nearestClusterCenter.clone();
+        });
+    }
+    // When no nearby cluster is detected, do NOT overwrite u.patrolTarget so units smoothly advance along their scouting path toward ENEMY_BASE_POS!
+}
+
+function applyFactionTechToExistingUnits(factionKey) {
+    const upg = (state.upgrades && state.upgrades[factionKey]) ? state.upgrades[factionKey] : { weapons: 0, armor: 0 };
+    const wMult = 1.0 + (upg.weapons || 0) * 0.20;
+    const aMult = 1.0 + (upg.armor || 0) * 0.20;
+
+    if (factionKey === 'zerg') {
+        enemies.forEach(e => {
+            if (!e || e.hp <= 0) return;
+            if (!e.baseMaxHp) e.baseMaxHp = e.maxHp;
+            if (!e.baseDamage) e.baseDamage = e.damage;
+            const prevMax = e.maxHp;
+            e.maxHp = Math.round(e.baseMaxHp * aMult);
+            if (e.maxHp > prevMax) e.hp = Math.min(e.maxHp, e.hp + (e.maxHp - prevMax));
+            e.damage = Math.round(e.baseDamage * wMult);
+            e.armorBonus = (upg.armor || 0) * 2;
+            if (typeof window.applyUnitUpgradeVisuals === 'function') {
+                window.applyUnitUpgradeVisuals(e, upg.weapons || 0, upg.armor || 0, 'zerg');
+            }
+        });
+        return;
+    }
+
+    units.forEach(u => {
+        if (!u || u.hp <= 0) return;
+        const isSolUnit = ['zealot', 'stalker', 'archon'].includes(u.type);
+        const unitFac = u.isMindControlled ? 'zerg' : (isSolUnit ? 'solaris' : 'terran');
+        if (unitFac !== factionKey) return;
+        if (!u.baseMaxHp) u.baseMaxHp = u.maxHp;
+        if (!u.baseDamage) u.baseDamage = u.damage;
+        const prevMax = u.maxHp;
+        u.maxHp = Math.round(u.baseMaxHp * aMult);
+        if (u.maxHp > prevMax) u.hp = Math.min(u.maxHp, u.hp + (u.maxHp - prevMax));
+        if (u.baseDamage > 0) {
+            u.damage = Math.round(u.baseDamage * wMult);
+        }
+        u.armorBonus = (upg.armor || 0) * 2;
+        if (typeof window.applyUnitUpgradeVisuals === 'function') {
+            window.applyUnitUpgradeVisuals(u, upg.weapons || 0, upg.armor || 0, factionKey);
+        }
+    });
+}
+
+window.upgradeFactionTech = function(category = 'weapons', factionKey = null, useGems = false) {
+    const fac = factionKey || (state.playerFaction === 'solaris' ? 'solaris' : 'terran');
+    if (!state.upgrades) {
+        state.upgrades = { terran: { weapons: 0, armor: 0 }, solaris: { weapons: 0, armor: 0 }, zerg: { weapons: 0, armor: 0 } };
+    }
+    const upg = state.upgrades[fac] || (state.upgrades[fac] = { weapons: 0, armor: 0 });
+    const curLvl = upg[category] || 0;
+    if (curLvl >= 3) return false;
+
+    const costMinerals = curLvl === 0 ? 120 : (curLvl === 1 ? 180 : 250);
+    const costGems = 20;
+
+    if (useGems) {
+        if ((state.gems || 0) < costGems) return false;
+        state.gems -= costGems;
+    } else {
+        if (state.req < costMinerals) return false;
+        state.req -= costMinerals;
+    }
+
+    upg[category] = curLvl + 1;
+    applyFactionTechToExistingUnits(fac);
+
+    if (state.selectedBuilding && state.selectedBuilding.pos && typeof spawnNanoWeldSparkFX === 'function') {
+        spawnNanoWeldSparkFX(state.selectedBuilding.pos);
+    }
+    if (window.SFX) window.SFX.playBuild();
+    renderSC2CommandCard();
+    updateHUD(true);
+    return true;
+};
+
+function issueSquadOrder(orderType, targetWorldPos = null, keepCommandMode = false) {
+    if (state.selectedUnits.length === 0) return;
+
+    let resolvedTarget = targetWorldPos ? targetWorldPos.clone() : null;
+    if (!resolvedTarget && orderType === 'retreat') {
+        const hqAnchor = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+        resolvedTarget = new THREE.Vector3(hqAnchor.x, getTerrainHeight(hqAnchor.x, hqAnchor.z + 4.5), hqAnchor.z + 4.5);
+    }
+
+    const activeFormation = state.formSquadEnabled ? 'concave' : state.squadFormation;
+    const formMap = resolvedTarget
+        ? computeTacticalFormationPositions(state.selectedUnits, resolvedTarget, activeFormation)
+        : null;
+
+    state.selectedUnits.forEach((u) => {
+        u.order = orderType;
+        u.spawnRallyTimer = 0;
+        if (resolvedTarget && formMap && formMap.has(u)) {
+            u.orderTarget = formMap.get(u);
+        } else if (resolvedTarget) {
+            u.orderTarget = resolvedTarget.clone();
+        } else {
+            u.orderTarget = null;
+        }
+    });
+
+    const leadPos = state.selectedUnits[0].mesh.position;
+    const orderLabelMap = {
+        move: state.formSquadEnabled && state.selectedUnits.length > 1 ? 'MOVING IN COMBAT CONCAVE' : 'MOVING SQUAD',
+        attack_move: state.formSquadEnabled && state.selectedUnits.length > 1 ? 'CONCAVE ATTACK-MOVE' : 'ATTACK-MOVE ENGAGED',
+        hold: 'HOLDING POSITION',
+        auto: 'AUTO SEEK & DESTROY',
+        retreat: 'RETURNING TO MAIN BASE'
+    };
+    if (orderLabelMap[orderType]) {
+        spawnCombatFloat(
+            resolvedTarget || leadPos,
+            orderLabelMap[orderType],
+            orderType === 'attack_move' ? '#ff2a4b' : (orderType === 'hold' || orderType === 'retreat' ? '#00e5ff' : '#00ff66')
+        );
+    }
+
+    if (resolvedTarget) {
+        spawnTacticalOrderWaypointFX(resolvedTarget, orderType);
+    }
+
+    if (!keepCommandMode) {
+        state.unitCommandMode = null;
+    }
+    if (window.SFX) window.SFX.playClick();
+    renderSC2CommandCard();
+    updateHUD();
+}
+
+const tacticalWaypoints = [];
+let _waypointChevronGeo = null;
+let _waypointSpireGeo = null;
+function spawnTacticalOrderWaypointFX(targetPos, orderType = 'move') {
+    if (!targetPos) return;
+    if (!_waypointChevronGeo) {
+        // Sculpted 3D angled tactical chevron bracket (zero basic circles/shockwaves)
+        const shape = new THREE.Shape();
+        shape.moveTo(0, 0.22);
+        shape.lineTo(0.18, -0.06);
+        shape.lineTo(0.11, -0.12);
+        shape.lineTo(0, 0.06);
+        shape.lineTo(-0.11, -0.12);
+        shape.lineTo(-0.18, -0.06);
+        shape.closePath();
+        _waypointChevronGeo = new THREE.ExtrudeGeometry(shape, {
+            depth: 0.045,
+            bevelEnabled: true,
+            bevelThickness: 0.012,
+            bevelSize: 0.012,
+            bevelSegments: 1
+        });
+        _waypointChevronGeo.rotateX(Math.PI / 2);
+        _waypointSpireGeo = createSculptedFacetedCrystalGeo(0.09, 0);
+    }
+
+    const isAttack = (orderType === 'attack_move');
+    const isHoldOrRetreat = (orderType === 'hold' || orderType === 'retreat');
+    const hexColor = isAttack ? 0xff3b5c : (isHoldOrRetreat ? 0x00e5ff : 0x10b981);
+
+    const mat = new THREE.MeshBasicMaterial({
+        color: hexColor,
+        transparent: true,
+        opacity: 0.95,
+        depthWrite: false
+    });
+
+    const root = new THREE.Group();
+    const surfH = typeof getSurfaceHeightWithBridges === 'function' ? getSurfaceHeightWithBridges : getTerrainHeight;
+    const gy = surfH(targetPos.x, targetPos.z) + 0.12;
+    root.position.set(targetPos.x, gy, targetPos.z);
+
+    // 4 converging 3D tactical chevron brackets pointing inward toward the target coordinate
+    const chevrons = [];
+    for (let i = 0; i < 4; i++) {
+        const ang = (i * Math.PI) / 2 + Math.PI / 4;
+        const chev = new THREE.Mesh(_waypointChevronGeo, mat);
+        chev.rotation.y = -ang + Math.PI;
+        chev.position.set(Math.sin(ang) * 0.85, 0.04, Math.cos(ang) * 0.85);
+        root.add(chev);
+        chevrons.push({ mesh: chev, ang });
+    }
+
+    // Descending 3D Diamond Beacon Pin that locks into the center point
+    const beaconPin = new THREE.Mesh(_waypointSpireGeo, mat);
+    beaconPin.scale.set(0.85, 2.4, 0.85);
+    beaconPin.position.y = 0.95;
+    root.add(beaconPin);
+
+    scene.add(root);
+    if (tacticalWaypoints.length >= 16) {
+        const old = tacticalWaypoints.shift();
+        scene.remove(old.root);
+        if (old.mat) old.mat.dispose();
+    }
+    tacticalWaypoints.push({
+        root,
+        chevrons,
+        beaconPin,
+        mat,
+        age: 0,
+        maxLife: 0.58
+    });
+}
+
+function recallAllFriendlyUnitsToMainBase() {
+    if (units.length === 0) return;
+    // If any enemies are alive on the map, do not recall units to the main base — let them hunt the remaining enemies!
+    const hasActiveEnemies = enemies.some(e => e && e.hp > 0);
+    if (hasActiveEnemies) return;
+
+    const mainBasePos = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+    const rawRallyX = mainBasePos.x;
+    const rawRallyZ = mainBasePos.z - 6.8;
+    const clearRally = typeof findClearSpawnPoint === 'function'
+        ? findClearSpawnPoint(rawRallyX, rawRallyZ, ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, 0.85, buildings, enemyBuildings, [])
+        : { x: rawRallyX, z: rawRallyZ };
+    const rallyCenter = new THREE.Vector3(clearRally.x, getTerrainHeight(clearRally.x, clearRally.z), clearRally.z);
+    const formMap = computeTacticalFormationPositions(units, rallyCenter, state.squadFormation || 'concave');
+    units.forEach(u => {
+        u.order = 'retreat';
+        u.isAutoRecall = true;
+        u.spawnRallyTimer = 0;
+        u.orderTarget = (formMap && formMap.has(u)) ? formMap.get(u) : rallyCenter.clone();
+    });
+    spawnCombatFloat(rallyCenter, 'HIVE DESTROYED — ALL UNITS RETURNING TO MAIN BASE!', '#00e5ff');
+}
+
+// --- STARCRAFT 1:1 3x3 COMMAND CARD & CENTER CONSOLE RENDERER ---
+function updateCommPortrait(key, customQuote = null) {
+    const avatarEl = document.getElementById('portrait-avatar-svg');
+    const quoteEl = document.getElementById('portrait-quote');
+    if (avatarEl) avatarEl.innerHTML = getPortraitAvatarSvg(key);
+    const meta = UNIT_CONSOLE_META[key] || BUILDING_CONSOLE_META[key] || BUILDING_CONSOLE_META.base;
+    if (quoteEl) quoteEl.innerText = customQuote || meta.quote;
+    if (window.PORTRAIT_3D_VIEWER && typeof window.PORTRAIT_3D_VIEWER.setRole === 'function') {
+        window.PORTRAIT_3D_VIEWER.setRole(key);
+    }
+}
+
+function renderSC2CommandCard() {
+    const grid = document.getElementById('command-grid');
+    const titleEl = document.getElementById('cmd-card-title');
+    const pwrEl = document.getElementById('cmd-power-tag');
+    const prodPanel = document.getElementById('prod-queue-panel');
+    const singleView = document.getElementById('single-selection-view');
+    const multiView = document.getElementById('multi-selection-view');
+    const statsStrip = document.getElementById('unit-stats-strip');
+    const turretSlotBar = document.getElementById('turret-slot-bar');
+    if (turretSlotBar) turretSlotBar.style.display = 'none';
+
+    grid.innerHTML = '';
+    pwrEl.innerText = '';
+
+    // 1. FRIENDLY UNITS SELECTED (VIA CLICK-AND-DRAG / MOBILE HOLD SELECTION BOX OR TAP)
+    if (state.selectedUnits.length > 0) {
+        titleEl.innerText = 'TACTICAL ORDERS';
+        pwrEl.innerText = `${state.selectedUnits.length} UNIT${state.selectedUnits.length > 1 ? 'S' : ''}`;
+        prodPanel.style.display = 'none';
+
+        const leadUnit = state.selectedUnits[0];
+        updateCommPortrait(leadUnit.type);
+
+        if (state.selectedUnits.length === 1) {
+            singleView.style.display = 'flex';
+            multiView.style.display = 'none';
+            if (statsStrip) statsStrip.style.display = 'grid';
+
+            const meta = UNIT_CONSOLE_META[leadUnit.type] || UNIT_CONSOLE_META.ranger;
+            const roleClass = leadUnit.type === 'valkyrie'
+                ? (leadUnit.mechMode ? 'MECH GND-ONLY' : 'AIR AA-ONLY')
+                : (leadUnit.type === 'siege_tank'
+                    ? (leadUnit.siegeMode ? 'ARTILLERY (28.5m)' : 'MOBILE TANK (14m)')
+                    : (leadUnit.isMindControlled ? 'PSIONIC THRALL (MAX 3)' : (leadUnit.isMechanical ? 'MECHANICAL' : 'BIOLOGICAL')));
+            document.getElementById('sel-title').innerText = leadUnit.type === 'valkyrie'
+                ? (leadUnit.mechMode ? 'VALKYRIE (SEMI-MECH WALKER)' : 'VALKYRIE (FLIGHT INTERCEPTOR)')
+                : (leadUnit.type === 'siege_tank'
+                    ? (leadUnit.siegeMode ? 'SIEGE TANK (ARTILLERY MODE)' : 'SIEGE TANK (MOBILE TANK)')
+                    : meta.title);
+            document.getElementById('sel-rank-tag').innerText = meta.rank;
+            const typeTag = document.getElementById('sel-type-tag');
+            if (typeTag) typeTag.innerText = roleClass;
+            const wfRoleTag = document.getElementById('wireframe-role-tag');
+            if (wfRoleTag) wfRoleTag.innerText = roleClass;
+            document.getElementById('sel-subtitle').innerText = leadUnit.type === 'valkyrie'
+                ? (leadUnit.mechMode
+                    ? 'Semi-Mech Walker Mode: Walks on terrain & targets GROUND units/structures only. Press [T] for Flight Mode.'
+                    : 'Flight Interceptor Mode: Flies at altitude & targets AIR enemies only. Press [T] for Semi-Mech Ground Mode.')
+                : (leadUnit.type === 'siege_tank'
+                    ? (leadUnit.siegeMode
+                        ? 'Anchored Artillery Mode (28.5m range, 145 DMG splash): Auto-unsieges when moving or out of targets. Press [T] to Unsiege.'
+                        : 'Mobile Tank Mode (14.0m range, 85 DMG): Automatically deploys hydraulic outriggers into Artillery Mode when enemies enter 28.5m range!')
+                    : 'Right-click / tap ground to order, or select tactical directive on Command Card.');
+            document.getElementById('stat-weapon').innerText = leadUnit.type === 'valkyrie'
+                ? (leadUnit.mechMode ? 'DUAL 35MM MECH CANNON' : 'TWIN HALO AA PODS')
+                : (leadUnit.type === 'siege_tank'
+                    ? (leadUnit.siegeMode ? '180MM MJOLNIR ARTILLERY' : 'TWIN 120MM SHOCK CANNON')
+                    : meta.weapon);
+            document.getElementById('stat-dmg').innerText = leadUnit.type === 'transport' ? 'TROOP BAY' : leadUnit.damage;
+            document.getElementById('stat-rng').innerText = `${leadUnit.range}m`;
+            document.getElementById('stat-order').innerText = (leadUnit.order || 'auto').toUpperCase();
+            document.getElementById('wireframe-shield-tag').innerText = meta.armor;
+        } else {
+            singleView.style.display = 'none';
+            multiView.style.display = 'flex';
+            renderMultiUnitSelectionGrid();
+        }
+
+        setCmdTooltip(
+            state.unitCommandMode
+                ? `TARGETING [${state.unitCommandMode.toUpperCase()}]: Tap/Click anywhere on terrain or minimap to dispatch squad!`
+                : 'Issue squad tactical orders [M: Move, A: Attack-Move, H: Hold, S: Auto, F: Charge, G: Guard HQ, V: Formation, T: Mode]'
+        );
+
+        const selectedValkyries = state.selectedUnits.filter(u => u.type === 'valkyrie');
+        const anyMechValk = selectedValkyries.some(u => u.mechMode);
+        const selectedSiegeTanks = state.selectedUnits.filter(u => u.type === 'siege_tank');
+        const anySiegedTank = selectedSiegeTanks.some(u => u.siegeMode);
+
+        const unitCmds = [
+            {
+                key: 'M', name: 'Move Squad', cost: 'ORDER', icon: 'move',
+                desc: 'Move [M]: Tap/click terrain or minimap to march selected squad directly to target coordinates.',
+                active: state.unitCommandMode === 'move' || state.selectedUnits.every(u => u.order === 'move'),
+                fn: () => {
+                    state.unitCommandMode = state.unitCommandMode === 'move' ? null : 'move';
+                    if (window.SFX) window.SFX.playClick();
+                    renderSC2CommandCard();
+                }
+            },
+            {
+                key: 'A', name: 'Attack-Move', cost: 'ENGAGE', icon: 'attack',
+                desc: 'Attack-Move [A]: Immediately advance toward hostiles, or tap/click terrain to set custom Attack-Move destination.',
+                active: state.unitCommandMode === 'attack_move' || state.selectedUnits.every(u => u.order === 'attack_move'),
+                fn: () => {
+                    let defaultDest = enemyBuildings.length > 0
+                        ? enemyBuildings[0].pos
+                        : (enemies.length > 0 ? enemies[0].mesh.position : (state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS));
+                    state.unitCommandMode = 'attack_move';
+                    issueSquadOrder('attack_move', defaultDest, true);
+                }
+            },
+            {
+                key: 'H', name: 'Hold Ground', cost: 'DEFEND', icon: 'hold',
+                desc: 'Hold Position [H]: Stand ground at current coordinates and fire at enemies entering weapon range.',
+                active: state.selectedUnits.every(u => u.order === 'hold'),
+                fn: () => issueSquadOrder('hold', null)
+            },
+            {
+                key: 'S', name: 'Auto Assault', cost: 'AI', icon: 'hero',
+                desc: 'Autonomous Seek & Destroy [S]: Automatically engage enemies or return to Main Base when sector is clear.',
+                active: state.selectedUnits.every(u => !u.order || u.order === 'auto'),
+                fn: () => issueSquadOrder('auto', null)
+            },
+            {
+                key: 'F', name: 'Charge Hive', cost: 'SIEGE', icon: 'attack',
+                desc: 'All-Out Hive Siege [F]: Order selected squad to assault the Zerg Hive Cluster.',
+                active: false,
+                fn: () => {
+                    const hiveTarget = enemyBuildings.length > 0
+                        ? enemyBuildings[0].pos
+                        : (enemies.length > 0 ? enemies[0].mesh.position : ENEMY_BASE_POS);
+                    issueSquadOrder('attack_move', hiveTarget);
+                }
+            },
+            {
+                key: 'G', name: 'Guard HQ', cost: 'RALLY', icon: 'base',
+                desc: 'Recall to Command HQ [G]: Immediately disengage and return to defend the Main Base perimeter.',
+                active: state.selectedUnits.every(u => u.order === 'retreat'),
+                fn: () => issueSquadOrder('retreat', state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS)
+            },
+            {
+                key: 'V', name: state.formSquadEnabled ? 'Form: CONCAVE' : `Form: ${state.squadFormation.toUpperCase()}`, cost: 'FORM SQUAD', icon: 'turret',
+                desc: 'Form Squad [V]: Positions melee in a protective front-line vanguard and ranged units in a combat-efficient concave firing arc.',
+                active: state.formSquadEnabled,
+                fn: () => formSquadImmediately()
+            },
+            selectedValkyries.length > 0 ? {
+                key: 'T',
+                name: anyMechValk ? 'Flight Mode' : 'Mech Walker',
+                cost: anyMechValk ? 'TARGET AIR' : 'TARGET GND',
+                icon: 'factory',
+                desc: 'Transform Valkyrie [T]: Toggle between Flight Interceptor (targets AIR enemies only) and Semi-Mech Ground Walker (targets GROUND units & buildings only)!',
+                active: anyMechValk,
+                fn: () => toggleSelectedValkyrieMode()
+            } : (selectedSiegeTanks.length > 0 ? {
+                key: 'T',
+                name: anySiegedTank ? 'Tank Mode' : 'Siege Mode',
+                cost: (selectedSiegeTanks[0].siegeSwitchCooldown || 0) > 0
+                    ? `CD ${selectedSiegeTanks[0].siegeSwitchCooldown.toFixed(1)}s`
+                    : (anySiegedTank ? '14m MOBILE' : '6.5-28.5m ARTY'),
+                icon: 'factory',
+                desc: 'Transform Siege Tank [T] (4.5s Cooldown): Toggle between Mobile Tank (14m range) and Anchored Mjolnir Artillery Siege Mode (6.5m–28.5m range, 145 DMG splash — cannot fire inside 6.5m minimum range deadzone)!',
+                active: anySiegedTank,
+                fn: () => toggleSelectedSiegeTankMode()
+            } : null),
+            {
+                key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base',
+                desc: 'Return to Terran Construction Command Card [ESC].',
+                active: false,
+                fn: () => clearAllSelection()
+            }
+        ];
+
+        unitCmds.forEach(uc => {
+            const btn = document.createElement('button');
+            if (!uc) {
+                btn.className = 'cmd-cell'; btn.disabled = true;
+                grid.appendChild(btn);
+                return;
+            }
+            btn.className = 'cmd-cell' + (uc.active ? ' active' : '');
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${uc.key}</span>${getCmdIconSvg(uc.icon)}</div><span class="cmd-name">${uc.name}</span><span class="cmd-cost">${uc.cost}</span>`;
+            btn.onmouseenter = () => setCmdTooltip(uc.desc);
+            btn.onclick = uc.fn;
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    singleView.style.display = 'flex';
+    multiView.style.display = 'none';
+
+    const sel = state.selectedBuilding;
+
+    // 2. MODULAR TURRET SELECTED (WITH ROCKET POD, SHIELD DOME, MIND CONTROL, PLASMA, SNIPER, DRONE & UPGRADES)
+    if (sel && sel.type === 'turret') {
+        const maxPwr = sel.maxPower || 9;
+        const leftW = sel.weapons.left || 'none';
+        const topW = sel.weapons.top || 'none';
+        const rightW = sel.weapons.right || 'none';
+        const used = (WEAPON_COSTS[leftW] || 0) + (WEAPON_COSTS[rightW] || 0) + (WEAPON_COSTS[topW] || 0);
+        const free = maxPwr - used;
+        const curLvl = sel.level || 1;
+        const upgCost = curLvl === 1 ? 120 : (curLvl === 2 ? 180 : 250);
+        const thrallCount = units.filter(u => u && u.isMindControlled && u.hp > 0).length;
+
+        titleEl.innerText = `TURRET LV.${curLvl}`;
+        pwrEl.innerText = `${free}/${maxPwr} ⚡`;
+        prodPanel.style.display = 'none';
+        if (statsStrip) statsStrip.style.display = 'none';
+
+        updateCommPortrait('turret');
+        document.getElementById('sel-title').innerText = `MODULAR TURRET MK-${curLvl}`;
+        document.getElementById('sel-rank-tag').innerText = `${maxPwr}⚡ CORE`;
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = 'DEFENSE';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = `MK-${curLvl} BUNKER`;
+        document.getElementById('sel-subtitle').innerText = `Select hardpoint [Q: Left / W: Top / E: Right], then click any gun [1–9] to attach!`;
+        setCmdTooltip(`Slot [${state.activeTurretSlot.toUpperCase()}]: ${free}⚡ free of ${maxPwr}⚡ · Click [Q/W/E] to switch slot or [1–9] to mount weapon`);
+
+        const curSlot = state.activeTurretSlot || 'left';
+        const curW = sel.weapons[curSlot] || 'none';
+        const curCost = WEAPON_COSTS[curW] || 0;
+        const curLabel = WEAPON_LABELS[curW] || curW;
+
+        const weaponDmgText = {
+            none: '0', mg: '16', flame: '9/t', plasma: '42 SPL', rocket: '55x2 MIS',
+            shield: '450 DOME', sniper: '125 AP', drone: '+38 BLD/s', mortar: '70 AOE', mindcontrol: `${thrallCount}/3 MAX`
+        }[curW] || '16';
+        const weaponRngText = {
+            none: '-', mg: '14m', flame: '7.5m', plasma: '16.5m', rocket: '20.0m',
+            shield: '9.5m DOME', sniper: '22.0m', drone: '18m BLD', mortar: '18.0m', mindcontrol: '19.0m PSI'
+        }[curW] || '18m';
+
+        document.getElementById('stat-weapon').innerText = `${curSlot.toUpperCase()}: ${curLabel.toUpperCase()}`;
+        document.getElementById('stat-dmg').innerText = weaponDmgText;
+        document.getElementById('stat-rng').innerText = weaponRngText;
+        document.getElementById('stat-order').innerText = `${used}/${maxPwr}⚡`;
+        document.getElementById('wireframe-shield-tag').innerText = sel.maxShieldHp ? `SHIELD: ${Math.ceil(sel.shieldHp)}/${sel.maxShieldHp}` : `LV.${curLvl} BUNKER`;
+
+        // Render interactive 3-slot selector bar + UPGRADE BANNER + WEAPON RANGE VISUALIZER LEGEND in center console
+        if (turretSlotBar) {
+            turretSlotBar.style.display = 'grid';
+            turretSlotBar.innerHTML = '';
+            [
+                { key: 'Q', label: 'LEFT', slot: 'left' },
+                { key: 'W', label: 'TOP', slot: 'top' },
+                { key: 'E', label: 'RIGHT', slot: 'right' }
+            ].forEach(sd => {
+                const pill = document.createElement('button');
+                const wInSlot = sel.weapons[sd.slot] || 'none';
+                const wLbl = WEAPON_LABELS[wInSlot] || wInSlot;
+                const wCst = WEAPON_COSTS[wInSlot] || 0;
+                pill.className = 'turret-slot-pill' + (state.activeTurretSlot === sd.slot ? ' active' : '');
+                pill.innerHTML = `<span class="ts-key">[${sd.key}] ${sd.label} MOUNT</span><span class="ts-val">${wLbl} (${wCst}⚡)</span>`;
+                pill.onclick = () => { state.activeTurretSlot = sd.slot; renderSC2CommandCard(); };
+                turretSlotBar.appendChild(pill);
+            });
+
+            // Upgrade Button + Strip Slot Button inside the Turret Console
+            const upgBanner = document.createElement('button');
+            upgBanner.className = 'turret-upgrade-banner';
+            upgBanner.disabled = state.req < upgCost;
+            upgBanner.title = `Upgrade Turret to MK-${curLvl + 1} [Hotkey: U] — Increases Max HP by +260, adds +3⚡ Energy Capacity!`;
+            upgBanner.innerHTML = `
+                <span class="tub-left">⬆ UPGRADE MK-${curLvl + 1} (+260 HP &amp; +3⚡) &nbsp;|&nbsp; [Z] STRIP SLOT</span>
+                <span class="tub-cost">[U] ${upgCost} MINERALS</span>
+            `;
+            upgBanner.onclick = () => upgradeTurret(sel);
+            turretSlotBar.appendChild(upgBanner);
+
+            // Live 3D Firing Range Legend for Equipped Guns
+            const rangeLegend = document.createElement('div');
+            rangeLegend.className = 'turret-range-legend';
+            const rangeMeta = {
+                mg:          { label: 'GATLING 14m',     col: '#ffaa00' },
+                flame:       { label: 'NAPALM 7.5m',     col: '#ff4500' },
+                plasma:      { label: 'PLASMA 16.5m',    col: '#00e5ff' },
+                rocket:      { label: 'ROCKETS 20m',     col: '#ff2a4b' },
+                shield:      { label: 'SHIELD DOME 9.5m',col: '#38bdf8' },
+                mortar:      { label: 'HOWITZER 18m',    col: '#ff8800' },
+                drone:       { label: 'FIX DRONE 18m',   col: '#38bdf8' },
+                sniper:      { label: 'SNIPER 22m',      col: '#00ff66' },
+                mindcontrol: { label: `MIND CTRL 19m (${thrallCount}/3 MAX)`, col: '#d946ef' }
+            };
+            const equippedSet = Array.from(new Set([leftW, topW, rightW].filter(w => w && w !== 'none')));
+            if (equippedSet.length === 0) {
+                rangeLegend.innerHTML = `<span style="color:#ff5400;">NO WEAPONS EQUIPPED — SELECT [1–9] TO MOUNT ORDNANCE</span>`;
+            } else {
+                rangeLegend.innerHTML = `<span style="color:#9cb8d9;margin-right:2px;">SELECTED TURRET RADIUS:</span>` + equippedSet.map(wKey => {
+                    const rm = rangeMeta[wKey] || { label: wKey.toUpperCase(), col: '#00e5ff' };
+                    return `<span class="trl-tag" style="color:${rm.col};border-color:${rm.col};"><span class="trl-dot" style="background:${rm.col};"></span>${rm.label}</span>`;
+                }).join('');
+            }
+            turretSlotBar.appendChild(rangeLegend);
+        }
+
+        const wDefs = [
+            { key: '1', w: 'mg',          name: 'Gatling',      cost: 1, icon: 'attack',  desc: 'Rotary Gatling [1]: 1⚡ · Rapid-fire 16 DMG ballistic suppression (14m amber radius).' },
+            { key: '2', w: 'flame',       name: 'Napalm',       cost: 2, icon: 'attack',  desc: 'Hellfire Napalm [2]: 2⚡ · Continuous close-range thermal stream (7.5m red radius).' },
+            { key: '3', w: 'plasma',      name: 'Plasma Gun',   cost: 2, icon: 'turret',  desc: 'Plasma Accelerator [3]: 2⚡ · 42 DMG ionized splash bolt (16.5m cyan radius).' },
+            { key: '4', w: 'rocket',      name: 'Rocket Pod',   cost: 2, icon: 'attack',  desc: 'Swarm Rocket Missile Pod [4]: 2⚡ · Fires twin 55 DMG high-explosive missiles at Air & Ground (20m crimson radius).' },
+            { key: '5', w: 'shield',      name: 'Shield Dome',  cost: 2, icon: 'hold',    desc: 'Aegis Shield Generator [5]: 2⚡ · Projects a crystal-clear 9.5m 450-HP energy forcefield dome with hit ripples.' },
+            { key: '6', w: 'sniper',      name: 'Sniper Gun',   cost: 3, icon: 'attack',  desc: 'Railgun Sniper [6]: 3⚡ · 125 CRIT armor-piercing round + Laser Sight (22m green radius).' },
+            { key: '7', w: 'drone',       name: 'Fixing Drone', cost: 3, icon: 'hold',    desc: 'Nano-Weld Fixing Drone [7]: 3⚡ · Autonomously repairs friendly BUILDINGS within 18m.' },
+            { key: '8', w: 'mortar',      name: 'Howitzer',     cost: 3, icon: 'factory', desc: 'Siege Howitzer [8]: 3⚡ · 70 DMG artillery shells that leave craters (18m orange radius).' },
+            { key: '9', w: 'mindcontrol', name: 'Mind Control', cost: 3, icon: 'hero',    desc: `Psionic Mind Control Emitter [9]: 3⚡ · Dominates enemy Zerg units within 19m (Max 3 Controlled Units — Active: ${thrallCount}/3).` }
+        ];
+        wDefs.forEach(wd => {
+            const btn = document.createElement('button');
+            btn.onmouseenter = () => setCmdTooltip(wd.desc);
+            const fits = (used - curCost + wd.cost) <= maxPwr;
+            btn.className = 'cmd-cell' + (curW === wd.w ? ' equipped' : '');
+            btn.disabled = !fits;
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${wd.key}</span>${getCmdIconSvg(wd.icon)}</div><span class="cmd-name">${wd.name}</span><span class="cmd-cost">${wd.cost}⚡</span>`;
+            btn.onclick = () => {
+                sel.weapons[curSlot] = wd.w;
+                // Auto-advance activeTurretSlot to the next empty mount ('left' -> 'top' -> 'right') so attaching 3 weapons in a row is effortless!
+                const nextEmpty = ['left', 'top', 'right'].find(s => !sel.weapons[s] || sel.weapons[s] === 'none');
+                if (nextEmpty) state.activeTurretSlot = nextEmpty;
+                syncTurretPods(sel);
+                if (window.SFX) window.SFX.playClick();
+                renderSC2CommandCard();
+                updateHUD();
+            };
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    // 3. BARRACKS, WAR FACTORY, OR SOLARIS ROBOTICS BAY SELECTED
+    if (sel && (sel.type === 'barracks' || sel.type === 'factory' || sel.type === 'solaris_robotics')) {
+        const isBarracks = sel.type === 'barracks';
+        const isSolRobotics = sel.type === 'solaris_robotics';
+        const hasBarracksBuilt = buildings.some(b => (b.type === 'barracks' || b.type === 'solaris_gate') && b.hp > 0);
+        titleEl.innerText = isBarracks ? 'BARRACKS QUEUE' : (isSolRobotics ? 'ROBOTICS QUEUE' : 'FACTORY QUEUE');
+        prodPanel.style.display = 'block';
+        if (statsStrip) statsStrip.style.display = 'none';
+
+        updateCommPortrait(sel.type);
+        document.getElementById('sel-title').innerText = isBarracks ? 'INFANTRY BARRACKS (BIO)' : (isSolRobotics ? 'SOLARIS ROBOTICS BAY' : 'WAR FACTORY (MECH)');
+        document.getElementById('sel-rank-tag').innerText = isBarracks ? 'GARRISON' : (isSolRobotics ? 'WARP FOUNDRY' : 'FOUNDRY');
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = sel.buildProgress < 1.0 ? `BUILDING (${Math.round(sel.buildProgress * 100)}%)` : 'PRODUCTION';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = isBarracks ? 'BIO GARRISON' : (isSolRobotics ? 'WARP FOUNDRY' : 'MECH FOUNDRY');
+        document.getElementById('sel-subtitle').innerText = sel.buildProgress < 1.0
+            ? `Constructing structure (${Math.round(sel.buildProgress * 100)}%) — Unit training begins automatically as soon as construction finishes!`
+            : (isBarracks
+                ? 'Trains Shock Troopers, Marksmen, Medics, Rocket Men, Reapers, Pyro-Firebats & Bio-Marauders.'
+                : 'Fabricates Tanks, Siege Tanks (Auto-Siege Artillery), Gunship Helis, Dropships & Valkyrie Semi-Mechs!');
+        setCmdTooltip(isBarracks ? 'Select active Bio-Factory production line [Q, W, E, R, T, Y, U]' : 'Select active Vehicle assembly line [Q, W, E, R, T]');
+
+        const options = isBarracks
+            ? [
+                { key: 'Q', u: 'grunt',     name: 'Shock Trooper', tag: 'BIO MELEE', locked: false, desc: 'CMC-660 Shock Trooper [Q]: Heavy melee vanguard with Plasma Broadsword & Riot Shield.' },
+                { key: 'W', u: 'ranger',    name: 'Marksman',      tag: 'BIO RIFLE', locked: false, desc: 'C-14 Gauss Marksman [W]: Ranged biological marine effective against Ground & Air.' },
+                { key: 'E', u: 'medic',     name: 'Combat Medic',  tag: 'HEAL BIO',  locked: false, desc: 'Field Combat Medic [E]: Restores HP of injured Biological infantry with Caduceus Nano-Beam.' },
+                { key: 'R', u: 'rocketman', name: 'Rocket Man',    tag: 'AT/AA MIS', locked: false, desc: 'Heavy Rocket Trooper [R]: Shoulder-mounted Twin Javelin Missile Launcher; deals heavy splash damage to Ground & Air!' },
+                { key: 'T', u: 'reaper',    name: 'Reaper Raider', tag: 'JUMP-JET',  locked: false, desc: 'Dominion Jump-Jet Reaper [T]: Ultra-fast raider with Dual P-45 Gauss Pistols and rapid-fire burst across Ground & Air!' },
+                { key: 'Y', u: 'firebat',   name: 'Pyro-Firebat',  tag: 'CONE FLAME',locked: false, desc: 'CMC-660 Pyro-Firebat [Y]: Heavy thermal trooper with twin Perdition Flamethrowers that incinerate swarms!' },
+                { key: 'U', u: 'marauder',  name: 'Bio-Marauder',  tag: 'SLOW GREN', locked: false, desc: 'CMC-700 Concussive Marauder [U]: Heavy armored bio-juggernaut with dual Punisher Grenade Launchers that hit Ground & Air!' }
+              ]
+            : [
+                { key: 'Q', u: 'tank',       name: 'Tank',          tag: 'MECH GND',   locked: false, desc: 'M80 Grizzly Tank [Q]: Heavy Chobham armor & 120mm APFSDS ground-only battle cannon.' },
+                { key: 'W', u: 'heli',       name: 'Gunship Heli',  tag: 'MECH AIR',   locked: false, desc: 'AH-99 Hunter Gunship [W]: Fast attack helicopter with 360° under-belly minigun turret & Hydra rockets.' },
+                { key: 'E', u: 'transport',  name: 'Dropship APC',  tag: hasBarracksBuilt ? 'DROP APC' : 'NEED BARRACKS', locked: !hasBarracksBuilt, desc: 'Hercules Dropship APC [E]: VTOL carrier that air-drops infantry squads near enemy territory (Requires Barracks).' },
+                { key: 'R', u: 'valkyrie',   name: 'Valkyrie Mech', tag: 'AERO-MECH',  locked: false, desc: 'Valkyrie Transformable Semi-Mech [R]: Flies to intercept Air enemies with Halo Missiles; unfolds Walker Legs to engage Ground units!' },
+                { key: 'T', u: 'siege_tank', name: 'Siege Tank',    tag: 'AUTO-SIEGE', locked: false, desc: 'Crucio Siege Tank [T]: Heavy tank with rotating turret head & auto-siege hydraulic outriggers that transform into 28.5m long-range artillery!' }
+              ];
+
+        const spawnTimes = {
+            grunt: 9.0, ranger: 10.0, medic: 10.5, rocketman: 11.5, reaper: 10.0, firebat: 11.0, marauder: 12.5,
+            tank: 15.5, siege_tank: 18.0, heli: 14.0, transport: 14.0, valkyrie: 16.5
+        };
+
+        for (let i = 0; i < 9; i++) {
+            const btn = document.createElement('button');
+            if (i < options.length) {
+                const opt = options[i];
+                btn.className = 'cmd-cell' + (sel.unitType === opt.u ? ' equipped' : '');
+                btn.disabled = !!opt.locked;
+                btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${opt.key}</span>${getCmdIconSvg(isBarracks ? 'barracks' : 'factory')}</div><span class="cmd-name">${opt.name}</span><span class="cmd-cost">${opt.tag}</span>`;
+                btn.onmouseenter = () => setCmdTooltip(opt.desc);
+                btn.onclick = () => {
+                    if (opt.locked) {
+                        spawnCombatFloat(sel.pos, 'BUILD BARRACKS FIRST!', '#ff2a4b');
+                        return;
+                    }
+                    if (sel.unitType !== opt.u) {
+                        sel.unitType = opt.u;
+                        sel.spawnDuration = spawnTimes[opt.u] || 6.0;
+                        sel.spawnTimer = sel.spawnDuration; // Reset progress back to 0% when switching unit type!
+                        spawnCombatFloat(sel.pos, `QUEUED: ${opt.name.toUpperCase()}`, '#00e5ff');
+                    }
+                    renderSC2CommandCard();
+                    updateHUD();
+                };
+            } else if (i === 8) {
+                btn.className = 'cmd-cell';
+                btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">ESC</span>${getCmdIconSvg('base')}</div><span class="cmd-name">Back</span><span class="cmd-cost">BUILD</span>`;
+                btn.onmouseenter = () => setCmdTooltip('Return to Construction Command Card [ESC].');
+                btn.onclick = () => selectStructure(null);
+            } else {
+                btn.className = 'cmd-cell'; btn.disabled = true;
+            }
+            grid.appendChild(btn);
+        }
+        return;
+    }
+
+    // 3A-PYLON. SOLARIS KHAYDARIN POWER PYLON SELECTED
+    if (sel && sel.type === 'solaris_pylon') {
+        titleEl.innerText = 'KHAYDARIN PYLON';
+        prodPanel.style.display = 'none';
+        if (statsStrip) statsStrip.style.display = 'grid';
+
+        updateCommPortrait('solaris_pylon');
+        document.getElementById('sel-title').innerText = 'KHAYDARIN POWER PYLON';
+        document.getElementById('sel-rank-tag').innerText = 'PSIONIC MATRIX';
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = sel.buildProgress < 1.0 ? `WARPING (${Math.round(sel.buildProgress * 100)}%)` : 'POWER SOURCE';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = 'PSI MATRIX';
+        document.getElementById('sel-subtitle').innerText = sel.buildProgress < 1.0
+            ? `Warping in Khaydarin Power Pylon (${Math.round(sel.buildProgress * 100)}%) — Projects a 20m Psionic Power Field once complete!`
+            : 'Projects a 20m Psionic Power Matrix required to power Protoss Warp Gates, Robotics Bays & Defense Turrets!';
+        document.getElementById('stat-weapon').innerText = 'PSIONIC MATRIX';
+        document.getElementById('stat-dmg').innerText = '20m POWER';
+        document.getElementById('stat-rng').innerText = '20.0m';
+        document.getElementById('stat-order').innerText = sel.buildProgress < 1.0 ? 'WARPING' : 'ENERGIZED';
+        document.getElementById('wireframe-shield-tag').innerText = `SHIELD: ${Math.ceil(sel.shield || 0)}/${sel.maxShield || 400}`;
+        setCmdTooltip('Khaydarin Power Pylon energizes nearby Protoss structures within 20m.');
+
+        const pylonCmds = [
+            { key: '2', name: 'Warp Gate', cost: '150M', icon: 'solaris_gate', desc: 'Build Solaris Warp Gate [2]: 150M · Requires Pylon Power Field.', fn: () => setMode('solaris_gate') },
+            { key: '3', name: 'Robotics Bay', cost: '200M', icon: 'solaris_robotics', desc: 'Build Solaris Robotics Bay [3]: 200M · Requires Pylon Power Field.', fn: () => setMode('solaris_robotics') },
+            { key: '5', name: 'Photon Turret', cost: '75M', icon: 'turret', desc: 'Build Defense Turret [5]: 75M · Requires Pylon Power Field.', fn: () => setMode('turret') },
+            { key: '7', name: 'New Pylon', cost: '75M', icon: 'solaris_pylon', desc: 'Build another Khaydarin Power Pylon [7]: 75M · Extends Protoss psionic power matrix.', fn: () => setMode('solaris_pylon') },
+            null, null, null, null,
+            { key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base', desc: 'Return to Construction Command Card [ESC].', fn: () => selectStructure(null) }
+        ];
+        pylonCmds.forEach(pc => {
+            const btn = document.createElement('button');
+            if (!pc) { btn.className = 'cmd-cell'; btn.disabled = true; grid.appendChild(btn); return; }
+            btn.className = 'cmd-cell';
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${pc.key}</span>${getCmdIconSvg(pc.icon)}</div><span class="cmd-name">${pc.name}</span><span class="cmd-cost">${pc.cost}</span>`;
+            btn.onmouseenter = () => setCmdTooltip(pc.desc);
+            btn.onclick = pc.fn;
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    // 3A-SOLARIS. SOLARIS ASTRAL WARP GATE SELECTED (3RD FACTION: THE SOLARIS CHRONO-SYNOD)
+    if (sel && sel.type === 'solaris_gate') {
+        titleEl.innerText = 'SOLARIS WARP GATE';
+        prodPanel.style.display = 'block';
+        if (statsStrip) statsStrip.style.display = 'none';
+
+        updateCommPortrait('solaris_gate');
+        document.getElementById('sel-title').innerText = 'SOLARIS ASTRAL WARP GATE';
+        document.getElementById('sel-rank-tag').innerText = 'CHRONO-SYNOD';
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = sel.buildProgress < 1.0 ? `WARPING (${Math.round(sel.buildProgress * 100)}%)` : '3RD FACTION';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = 'SOLARIS SYNOD';
+        document.getElementById('sel-subtitle').innerText = sel.buildProgress < 1.0
+            ? `Dimensional Warp-In in progress (${Math.round(sel.buildProgress * 100)}%) — Unit warp-in begins once complete!`
+            : 'Chrono-Synod Warp Matrix: Continuously warps in Zealot Templars, Prism Stalkers & Aether Archons!';
+        setCmdTooltip('Select active Solaris Chrono-Synod warp-in unit [Q: Zealot, W: Stalker, E: Archon]');
+
+        const solarisOpts = [
+            { key: 'Q', u: 'zealot',  name: 'Chrono-Zealot', tag: 'PSI GLAIVES', desc: 'Chrono-Zealot Templar [Q]: Fast golden-armored melee templar with twin Solar Psi-Glaives.' },
+            { key: 'W', u: 'stalker', name: 'Prism Stalker', tag: 'ANTI-AIR/GND', desc: 'Solaris Prism Stalker [W]: Quad-legged golden-obsidian walker that fires Phase Particle Disruptors at Ground & Air!' },
+            { key: 'E', u: 'archon',  name: 'Aether Archon', tag: 'AOE PSIONIC',  desc: 'Aether Archon Sovereign [E]: Levitating psionic entity that unleashes devastating solar lightning against Ground & Air!' }
+        ];
+        const solarisTimes = { zealot: 10.0, stalker: 12.0, archon: 15.5 };
+
+        for (let i = 0; i < 9; i++) {
+            const btn = document.createElement('button');
+            if (i < solarisOpts.length) {
+                const opt = solarisOpts[i];
+                btn.className = 'cmd-cell' + (sel.unitType === opt.u ? ' equipped' : '');
+                btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${opt.key}</span>${getCmdIconSvg('solaris_gate')}</div><span class="cmd-name">${opt.name}</span><span class="cmd-cost">${opt.tag}</span>`;
+                btn.onmouseenter = () => setCmdTooltip(opt.desc);
+                btn.onclick = () => {
+                    if (sel.unitType !== opt.u) {
+                        sel.unitType = opt.u;
+                        sel.spawnDuration = solarisTimes[opt.u] || 5.5;
+                        sel.spawnTimer = sel.spawnDuration;
+                        spawnCombatFloat(sel.pos, `WARP MATRIX: ${opt.name.toUpperCase()}`, '#f5b932');
+                    }
+                    renderSC2CommandCard();
+                    updateHUD();
+                };
+            } else if (i === 8) {
+                btn.className = 'cmd-cell';
+                btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">ESC</span>${getCmdIconSvg('base')}</div><span class="cmd-name">Back</span><span class="cmd-cost">BUILD</span>`;
+                btn.onmouseenter = () => setCmdTooltip('Return to Construction Command Card [ESC].');
+                btn.onclick = () => selectStructure(null);
+            } else {
+                btn.className = 'cmd-cell'; btn.disabled = true;
+            }
+            grid.appendChild(btn);
+        }
+        return;
+    }
+
+    // 3A-LAB. ENGINEERING & WEAPONS LAB (TERRAN) OR SOLARIS CYBERNETICS FORGE (PROTOSS) SELECTED
+    if (sel && (sel.type === 'tech_lab' || sel.type === 'solaris_cyber_lab')) {
+        const isSolLab = sel.type === 'solaris_cyber_lab';
+        const facKey = isSolLab ? 'solaris' : 'terran';
+        const upg = (state.upgrades && state.upgrades[facKey]) ? state.upgrades[facKey] : { weapons: 0, armor: 0 };
+        const wLvl = upg.weapons || 0;
+        const aLvl = upg.armor || 0;
+        const wCost = wLvl === 0 ? 120 : (wLvl === 1 ? 180 : 250);
+        const aCost = aLvl === 0 ? 120 : (aLvl === 1 ? 180 : 250);
+
+        titleEl.innerText = isSolLab ? 'CYBERNETICS FORGE' : 'WEAPONS & ARMOR LAB';
+        pwrEl.innerText = `W:${wLvl}/3 · A:${aLvl}/3`;
+        prodPanel.style.display = 'none';
+        if (statsStrip) statsStrip.style.display = 'grid';
+
+        updateCommPortrait(sel.type);
+        document.getElementById('sel-title').innerText = isSolLab ? 'SOLARIS CYBERNETICS FORGE' : 'ENGINEERING & WEAPONS LAB';
+        document.getElementById('sel-rank-tag').innerText = `ARMS LV.${wLvl} · ARMOR LV.${aLvl}`;
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = sel.buildProgress < 1.0 ? `BUILDING (${Math.round(sel.buildProgress * 100)}%)` : 'TECH UPGRADES';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = isSolLab ? 'SOLARIS FORGE' : 'TECH LAB';
+        document.getElementById('sel-subtitle').innerText = sel.buildProgress < 1.0
+            ? `Constructing Lab (${Math.round(sel.buildProgress * 100)}%) — Unlocks Lv.1–Lv.3 Arms & Armor Upgrades with 3D Visual Unit Enhancements!`
+            : `Upgrade ${isSolLab ? 'Solaris' : 'Terran'} Arms (+20% DMG & 3D Weapon Barrels/Glaives) and Armor (+20% HP & 3D Shoulder/Hull Plating)!`;
+        document.getElementById('stat-weapon').innerText = `ARMS LV.${wLvl} (+${wLvl * 20}% DMG)`;
+        document.getElementById('stat-dmg').innerText = `ARMOR LV.${aLvl} (+${aLvl * 20}% HP)`;
+        document.getElementById('stat-rng').innerText = `SQUAD AI: ${state.squadPosture}`;
+        document.getElementById('stat-order').innerText = sel.buildProgress < 1.0 ? 'BUILDING' : 'RESEARCH READY';
+        document.getElementById('wireframe-shield-tag').innerText = `W:LV.${wLvl} / A:LV.${aLvl}`;
+        setCmdTooltip('Research Arms [Q] or Armor [W] upgrades (Lv.1–Lv.3) to boost unit stats and visually upgrade unit weapons & armor!');
+
+        const isBuildingLab = (sel.buildProgress !== undefined && sel.buildProgress < 1.0);
+        const labCmds = [
+            {
+                key: 'Q',
+                name: wLvl >= 3 ? 'Arms MAX (Lv.3)' : `Upgrade Arms Lv.${wLvl + 1}`,
+                cost: wLvl >= 3 ? 'MAXED' : `${wCost}M`,
+                icon: 'attack',
+                locked: isBuildingLab || wLvl >= 3 || state.req < wCost,
+                desc: `Upgrade ${isSolLab ? 'Solaris' : 'Terran'} Arms Lv.${wLvl + 1} [Q]: ${wCost}M · +20% Weapon Damage & attaches 3D upgraded weapon barrels/glaives on all units!`,
+                fn: () => window.upgradeFactionTech('weapons', facKey, false)
+            },
+            {
+                key: 'W',
+                name: aLvl >= 3 ? 'Armor MAX (Lv.3)' : `Upgrade Armor Lv.${aLvl + 1}`,
+                cost: aLvl >= 3 ? 'MAXED' : `${aCost}M`,
+                icon: 'hold',
+                locked: isBuildingLab || aLvl >= 3 || state.req < aCost,
+                desc: `Upgrade ${isSolLab ? 'Solaris' : 'Terran'} Armor Lv.${aLvl + 1} [W]: ${aCost}M · +20% Max HP, +2 Armor & attaches 3D reactive pauldrons/hull plating on all units!`,
+                fn: () => window.upgradeFactionTech('armor', facKey, false)
+            },
+            {
+                key: 'E',
+                name: wLvl >= 3 ? 'Gem Arms MAX' : `Gem Arms Lv.${wLvl + 1}`,
+                cost: wLvl >= 3 ? 'MAXED' : '20 GEMS',
+                icon: 'mine_drill',
+                locked: isBuildingLab || wLvl >= 3 || (state.gems || 0) < 20,
+                desc: `Gem Instant Arms Upgrade [E]: Spend 20 Mined Khaydarin Gems to immediately unlock Arms Lv.${wLvl + 1}!`,
+                fn: () => window.upgradeFactionTech('weapons', facKey, true)
+            },
+            {
+                key: 'R',
+                name: aLvl >= 3 ? 'Gem Armor MAX' : `Gem Armor Lv.${aLvl + 1}`,
+                cost: aLvl >= 3 ? 'MAXED' : '20 GEMS',
+                icon: 'mine_drill',
+                locked: isBuildingLab || aLvl >= 3 || (state.gems || 0) < 20,
+                desc: `Gem Instant Armor Upgrade [R]: Spend 20 Mined Khaydarin Gems to immediately unlock Armor Lv.${aLvl + 1}!`,
+                fn: () => window.upgradeFactionTech('armor', facKey, true)
+            },
+            {
+                key: 'T',
+                name: state.squadIntelligence ? `Squad AI: ${state.squadPosture}` : 'Squad AI: OFF',
+                cost: 'TOGGLE AI',
+                icon: 'hero',
+                locked: false,
+                desc: 'Toggle Squad Intelligence [T]: Automatically switches friendly squads between Defensive Phalanx and Aggressive Hunting based on Zerg cluster proximity!',
+                fn: () => window.toggleSquadIntelligence()
+            },
+            null, null, null,
+            {
+                key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base',
+                locked: false,
+                desc: 'Return to Construction Command Card [ESC].',
+                fn: () => selectStructure(null)
+            }
+        ];
+
+        labCmds.forEach(lc => {
+            const btn = document.createElement('button');
+            if (!lc) { btn.className = 'cmd-cell'; btn.disabled = true; grid.appendChild(btn); return; }
+            btn.className = 'cmd-cell';
+            btn.disabled = !!lc.locked;
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${lc.key}</span>${getCmdIconSvg(lc.icon)}</div><span class="cmd-name">${lc.name}</span><span class="cmd-cost">${lc.cost}</span>`;
+            btn.onmouseenter = () => setCmdTooltip(lc.desc);
+            btn.onclick = lc.fn;
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    // 3A-DRILL. DEEP-CORE MINE DRILL SELECTED (MINERALS & GEM CRATER EXCAVATOR)
+    if (sel && sel.type === 'mine_drill') {
+        titleEl.innerText = 'MINE DRILL RIG';
+        prodPanel.style.display = 'none';
+        if (statsStrip) statsStrip.style.display = 'grid';
+
+        const crater = sel.linkedCrater;
+        const isRichCrater = !!(crater && !crater.isEmpty && crater.gemsRemaining > 0);
+        const isEmptyCrater = !!(crater && (crater.isEmpty || crater.gemsRemaining <= 0));
+
+        updateCommPortrait('mine_drill');
+        document.getElementById('sel-title').innerText = 'DEEP-CORE MINE DRILL';
+        document.getElementById('sel-rank-tag').innerText = isRichCrater ? 'GEM VEIN ACTIVE' : (isEmptyCrater ? 'EMPTY CRATER' : 'MINERAL SEAM');
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = sel.buildProgress < 1.0 ? `BUILDING (${Math.round(sel.buildProgress * 100)}%)` : 'EXCAVATOR';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = 'AUGER DRILL';
+        document.getElementById('sel-subtitle').innerText = isRichCrater
+            ? `Locked onto Rich Gem Crater (${crater.gemsRemaining} Gems remaining) — Extracting +14M & +15 Gems every 2.6s!`
+            : (isEmptyCrater
+                ? 'This Gem Crater is EMPTY! Still mining +14M/2.6s — Use [R] Scan Next Crater to find more Gem Craters!'
+                : 'Mining +14 Minerals every 2.6s. Build a Mine Drill [8] on a glowing Gem Crater to mine Khaydarin Gems!');
+        document.getElementById('stat-weapon').innerText = 'TUNGSTEN AUGER';
+        document.getElementById('stat-dmg').innerText = isRichCrater ? '+14M / +15♦' : '+14M / 2.6s';
+        document.getElementById('stat-rng').innerText = `${state.gems} GEMS`;
+        document.getElementById('stat-order').innerText = isRichCrater ? `${crater.gemsRemaining}♦ LEFT` : (isEmptyCrater ? 'EMPTY CRATER' : 'DRILLING');
+        document.getElementById('wireframe-shield-tag').innerText = `GEMS: ${state.gems}`;
+        setCmdTooltip('Use Mined Gems [Q/W/E] to warp in Troops, instant Turrets, or Mineral Overdrive! Press [R] to locate Gem Craters.');
+
+        const drillCmds = [
+            {
+                key: 'Q', name: 'Gem Troop Drop', cost: '30 GEMS', icon: 'barracks',
+                locked: state.gems < 30,
+                desc: 'Gem Reinforcement Drop [Q]: Spend 30 Mined Gems to warp in 2 Shock Troopers + 1 Siege Tank immediately!',
+                fn: () => {
+                    if (state.gems < 30) {
+                        spawnCombatFloat(sel.pos, 'NEED 30 MINED GEMS!', '#f0abfc');
+                        return;
+                    }
+                    state.gems -= 30;
+                    const dropOrigin = state.baseBuilding ? state.baseBuilding.pos : sel.pos;
+                    spawnAlliedUnit('grunt', dropOrigin);
+                    spawnAlliedUnit('ranger', dropOrigin);
+                    spawnAlliedUnit('siege_tank', dropOrigin);
+                    spawnCombatFloat(dropOrigin, 'GEM REINFORCEMENT SQUAD WARPED IN!', '#f0abfc');
+                    if (window.SFX) window.SFX.playBuild();
+                    renderSC2CommandCard();
+                    updateHUD(true);
+                }
+            },
+            {
+                key: 'W', name: 'Gem Instant Build', cost: '25 GEMS', icon: 'turret',
+                locked: state.gems < 25,
+                desc: 'Gem Instant Defense Build [W]: Spend 25 Mined Gems to instantly construct a Modular Ball Turret near this Drill + +120M!',
+                fn: () => {
+                    if (state.gems < 25) {
+                        spawnCombatFloat(sel.pos, 'NEED 25 MINED GEMS!', '#f0abfc');
+                        return;
+                    }
+                    state.gems -= 25;
+                    state.req += 120;
+                    const prevMode = state.mode;
+                    state.mode = 'turret';
+                    const angle = Math.random() * Math.PI * 2;
+                    const tPos = new THREE.Vector3(sel.pos.x + Math.cos(angle) * 4.8, getTerrainHeight(sel.pos.x + Math.cos(angle) * 4.8, sel.pos.z + Math.sin(angle) * 4.8), sel.pos.z + Math.sin(angle) * 4.8);
+                    state.req += COSTS.turret;
+                    deployStructure(tPos);
+                    state.mode = prevMode;
+                    spawnCombatFloat(sel.pos, 'GEM INSTANT TURRET + 120M DEPLOYED!', '#00e5ff');
+                    renderSC2CommandCard();
+                    updateHUD(true);
+                }
+            },
+            {
+                key: 'E', name: 'Gem -> Minerals', cost: '20 GEMS', icon: 'mine_drill',
+                locked: state.gems < 20,
+                desc: 'Deep-Core Gem Overdrive [E]: Spend 20 Mined Gems to refine +240 Minerals immediately!',
+                fn: () => {
+                    if (state.gems < 20) {
+                        spawnCombatFloat(sel.pos, 'NEED 20 MINED GEMS!', '#f0abfc');
+                        return;
+                    }
+                    state.gems -= 20;
+                    state.req += 240;
+                    spawnCombatFloat(sel.pos, '+240 MINERALS REFINED!', '#00ff66');
+                    if (window.SFX) window.SFX.playBuild();
+                    renderSC2CommandCard();
+                    updateHUD(true);
+                }
+            },
+            {
+                key: 'R', name: 'Find Gem Crater', cost: 'SCAN', icon: 'move',
+                locked: false,
+                desc: 'Scan Sector for Gem Craters [R]: Pans camera to the next unmined Gem Crater across the battlefield (some craters may be empty!).',
+                fn: () => {
+                    const craters = window.GEM_CRATERS || [];
+                    if (craters.length === 0) return;
+                    window._craterScanIdx = ((window._craterScanIdx || 0) + 1) % craters.length;
+                    const targetCrater = craters[window._craterScanIdx];
+                    if (targetCrater) {
+                        const offset = camera.position.clone().sub(controls.target);
+                        controls.target.set(targetCrater.x, getTerrainHeight(targetCrater.x, targetCrater.z), targetCrater.z);
+                        camera.position.copy(controls.target).add(offset);
+                        controls.update();
+                        const statusTxt = (targetCrater.isEmpty || targetCrater.gemsRemaining <= 0)
+                            ? 'SURVEY: EMPTY CRATER (NO GEMS — KEEP SEARCHING!)'
+                            : `SURVEY: RICH GEM CRATER (${targetCrater.gemsRemaining} GEMS) — BUILD MINE DRILL [8]!`;
+                        spawnCombatFloat(new THREE.Vector3(targetCrater.x, targetCrater.y + 1.2, targetCrater.z), statusTxt, targetCrater.isEmpty ? '#94a3b8' : '#f0abfc');
+                        if (window.SFX) window.SFX.playClick();
+                    }
+                }
+            },
+            {
+                key: '8', name: 'New Mine Drill', cost: '120M', icon: 'mine_drill',
+                locked: state.req < 120,
+                desc: 'Build Another Deep-Core Mine Drill [8]: 120M · Place on any ground or inside a Gem Crater.',
+                fn: () => setMode('mine_drill')
+            },
+            null,
+            null,
+            null,
+            {
+                key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base',
+                locked: false,
+                desc: 'Return to Construction Command Card [ESC].',
+                fn: () => selectStructure(null)
+            }
+        ];
+
+        drillCmds.forEach(dc => {
+            const btn = document.createElement('button');
+            if (!dc) {
+                btn.className = 'cmd-cell'; btn.disabled = true;
+                grid.appendChild(btn);
+                return;
+            }
+            btn.className = 'cmd-cell';
+            btn.disabled = !!dc.locked;
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${dc.key}</span>${getCmdIconSvg(dc.icon)}</div><span class="cmd-name">${dc.name}</span><span class="cmd-cost">${dc.cost}</span>`;
+            btn.onmouseenter = () => setCmdTooltip(dc.desc);
+            btn.onclick = dc.fn;
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    // 3B. MAIN BASE (ORBITAL COMMAND CITADEL HQ OR SOLARIS CHRONO NEXUS) SELECTED — POWER GRID & CONSTRUCTION COMMAND
+    if (sel && sel.type === 'base') {
+        const isSolPlayer = (state.playerFaction === 'solaris');
+        titleEl.innerText = isSolPlayer ? 'SOLARIS NEXUS' : 'COMMAND HQ';
+        prodPanel.style.display = 'none';
+        if (statsStrip) statsStrip.style.display = 'grid';
+
+        updateCommPortrait(isSolPlayer ? 'solaris_nexus' : 'base');
+        document.getElementById('sel-title').innerText = isSolPlayer ? 'SOLARIS CHRONO NEXUS' : 'ORBITAL COMMAND HQ';
+        document.getElementById('sel-rank-tag').innerText = 'MAIN BASE';
+        const typeTag = document.getElementById('sel-type-tag');
+        if (typeTag) typeTag.innerText = 'COMMAND HQ';
+        const wfRoleTag = document.getElementById('wireframe-role-tag');
+        if (wfRoleTag) wfRoleTag.innerText = isSolPlayer ? 'PROTOSS HQ' : 'TERRAN HQ';
+        document.getElementById('sel-subtitle').innerText = isSolPlayer
+            ? 'Solaris Nexus online with Protoss Probes! Build a Khaydarin Pylon [7] first to power Warp Gates [2] & Robotics Bays [3]!'
+            : 'Projects the 36m Terran power grid. Build Barracks [2], War Factories [3] & Mine Drills [8] to harvest Minerals & Gems!';
+        document.getElementById('stat-weapon').innerText = isSolPlayer ? 'PSIONIC CORE' : 'ORBITAL RELAY';
+        document.getElementById('stat-dmg').innerText = `${units.length} ACTIVE`;
+        document.getElementById('stat-rng').innerText = `${POWER_RADIUS}m GRID`;
+        document.getElementById('stat-order').innerText = 'ONLINE';
+        document.getElementById('wireframe-shield-tag').innerText = isSolPlayer ? 'ARMOR: AURELIAN' : 'ARMOR: CITADEL';
+        setCmdTooltip(isSolPlayer
+            ? 'Deploy Khaydarin Pylon [7] to power Warp Gates [2] & Robotics Bays [3], or Mine Drill [8]'
+            : 'Deploy Barracks [2], War Factory [3], or Mine Drill [8] on Gem Craters, or trigger HQ Overload [O]');
+
+        const baseCmds = isSolPlayer
+            ? [
+                {
+                    key: '7', name: 'Khaydarin Pylon', cost: '75M', icon: 'solaris_pylon',
+                    desc: 'Build Khaydarin Power Pylon [7]: 75M · Projects a 20m Psionic Power Matrix required for Protoss structures!',
+                    fn: () => setMode('solaris_pylon')
+                },
+                {
+                    key: '2', name: 'Warp Gate', cost: '150M', icon: 'solaris_gate',
+                    desc: 'Build Solaris Astral Warp Gate [2]: 150M · Warps in Chrono-Zealots, Prism Stalkers & Aether Archons (Requires Pylon Power).',
+                    fn: () => setMode('solaris_gate')
+                },
+                {
+                    key: '3', name: 'Robotics Bay', cost: '200M', icon: 'solaris_robotics',
+                    desc: 'Build Solaris Robotics Bay [3]: 200M · Warps in Heavy Armor, Siege Artillery & Airships (Requires Pylon Power).',
+                    fn: () => setMode('solaris_robotics')
+                },
+                {
+                    key: '4', name: 'Vanguard Pad', cost: '150M', icon: 'hero',
+                    locked: state.heroPlaced,
+                    desc: 'Build Solaris Ascendant Beacon [4]: 150M · Warps in the elite Vanguard Marshal (Requires Pylon Power).',
+                    fn: () => setMode('hero')
+                },
+                {
+                    key: '5', name: 'Photon Turret', cost: '75M', icon: 'turret',
+                    desc: 'Build Modular Photon Turret [5]: 75M · 3-Slot hardpoint defense bunker (Requires Pylon Power).',
+                    fn: () => setMode('turret')
+                },
+                {
+                    key: '8', name: 'Mine Drill', cost: '120M', icon: 'mine_drill',
+                    desc: 'Build Deep-Core Mine Drill [8]: 120M · Continuously mines +14 Minerals/2.6s & extracts Khaydarin Gems from Gem Craters!',
+                    fn: () => setMode('mine_drill')
+                },
+                {
+                    key: '6', name: 'Box / Select', cost: 'TOOL', icon: 'move',
+                    desc: 'Tactical Selection Tool [6]: Click structures or drag a box to command squads.',
+                    fn: () => setMode('select')
+                },
+                {
+                    key: 'O', name: 'Nexus Overload', cost: '150M BLAST', icon: 'hold',
+                    locked: state.req < 150,
+                    desc: 'Emergency Nexus Overload [O]: 150M · Vaporizes surrounding enemies & restores Nexus to 100% HP!',
+                    fn: () => {
+                        if (state.req >= 150) {
+                            state.req -= 150;
+                            executeHQEmergencyOverloadRepair();
+                        }
+                    }
+                },
+                {
+                    key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base',
+                    desc: 'Return to Construction Command Card [ESC].',
+                    fn: () => selectStructure(null)
+                }
+            ]
+            : [
+                {
+                    key: '2', name: 'Barracks', cost: '100M', icon: 'barracks',
+                    desc: 'Build Infantry Barracks [2]: 100M · Trains Shock Troopers, Marksmen, Medics, Rocket Men & Reapers.',
+                    fn: () => setMode('barracks')
+                },
+                {
+                    key: '3', name: 'War Factory', cost: '200M', icon: 'factory',
+                    desc: 'Build Heavy War Factory [3]: 200M · Assembles Siege Tanks, Gunships, Dropships & Valkyrie Semi-Mechs.',
+                    fn: () => setMode('factory')
+                },
+                {
+                    key: '4', name: 'Vanguard Pad', cost: '150M', icon: 'hero',
+                    locked: state.heroPlaced,
+                    desc: 'Build Vanguard Beacon Pad [4]: 150M · Warps in the elite Vanguard Marshal.',
+                    fn: () => setMode('hero')
+                },
+                {
+                    key: '5', name: 'Ball Turret', cost: '75M', icon: 'turret',
+                    desc: 'Build Modular Ball Turret [5]: 75M · 3-Slot hardpoint defense bunker.',
+                    fn: () => setMode('turret')
+                },
+                {
+                    key: '8', name: 'Mine Drill', cost: '120M', icon: 'mine_drill',
+                    desc: 'Build Deep-Core Mine Drill [8]: 120M · Continuously mines +14 Minerals/2.6s. Place on a Gem Crater to extract Gems for bonus Troops & Builds!',
+                    fn: () => setMode('mine_drill')
+                },
+                {
+                    key: '6', name: 'Box / Select', cost: 'TOOL', icon: 'move',
+                    desc: 'Tactical Selection Tool [6]: Click structures or drag a box to command squads.',
+                    fn: () => setMode('select')
+                },
+                {
+                    key: 'F2', name: 'Select Army', cost: `${units.length}U`, icon: 'attack',
+                    locked: units.length === 0,
+                    desc: 'Select All Combat Units [F2]: Selects every friendly unit on the battlefield.',
+                    fn: () => selectAllArmy()
+                },
+                {
+                    key: 'O', name: 'HQ Overload', cost: '150M BLAST', icon: 'hold',
+                    locked: state.req < 150,
+                    desc: 'Emergency HQ Overload [O]: 150M · Vaporizes surrounding enemies & restores HQ to 100% HP!',
+                    fn: () => {
+                        if (state.req >= 150) {
+                            state.req -= 150;
+                            executeHQEmergencyOverloadRepair();
+                        }
+                    }
+                },
+                {
+                    key: 'ESC', name: 'Build Menu', cost: 'BACK', icon: 'base',
+                    desc: 'Return to Terran Construction Command Card [ESC].',
+                    fn: () => selectStructure(null)
+                }
+            ];
+
+        baseCmds.forEach(bc => {
+            const btn = document.createElement('button');
+            if (!bc) {
+                btn.className = 'cmd-cell'; btn.disabled = true;
+                grid.appendChild(btn);
+                return;
+            }
+            btn.className = 'cmd-cell' + (bc.equipped ? ' equipped' : '');
+            btn.disabled = !!bc.locked;
+            btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${bc.key}</span>${getCmdIconSvg(bc.icon)}</div><span class="cmd-name">${bc.name}</span><span class="cmd-cost">${bc.cost}</span>`;
+            btn.onmouseenter = () => setCmdTooltip(bc.desc);
+            btn.onclick = bc.fn;
+            grid.appendChild(btn);
+        });
+        return;
+    }
+
+    // 4. DEFAULT TERRAN (OR SOLARIS IF FACTION CHANGED) CONSTRUCTION COMMAND CARD
+    titleEl.innerText = 'COMMAND CARD';
+    prodPanel.style.display = 'none';
+    if (statsStrip) statsStrip.style.display = 'grid';
+
+    updateCommPortrait(state.playerFaction === 'solaris' ? 'solaris_nexus' : 'base');
+    document.getElementById('sel-title').innerText = state.playerFaction === 'solaris' ? 'SOLARIS PROTOSS COMMAND' : 'TERRAN DOMINION COMMAND';
+    document.getElementById('sel-rank-tag').innerText = HAS_RAVINE_BRIDGES ? `BRIDGES: ${BRIDGES.length}` : 'OPEN VALLEY';
+    const typeTag = document.getElementById('sel-type-tag');
+    if (typeTag) typeTag.innerText = 'COMMAND';
+    const wfRoleTag = document.getElementById('wireframe-role-tag');
+    if (wfRoleTag) wfRoleTag.innerText = 'COMMAND GRID';
+    document.getElementById('sel-subtitle').innerText = state.playerFaction === 'solaris'
+        ? 'Solaris Protoss Faction Active: Build Khaydarin Pylon [7] to power Warp Gates [2], Robotics Bay [3] & Turrets [5]!'
+        : 'Terran Dominion Active: Deploy Barracks [2], War Factory [3], Turrets [5] & Mine Drills [8] on Gem Craters!';
+    document.getElementById('stat-weapon').innerText = state.playerFaction === 'solaris' ? 'PSIONIC MATRIX' : 'ORBITAL RELAY';
+    document.getElementById('stat-dmg').innerText = `${units.length} ACTIVE`;
+    document.getElementById('stat-rng').innerText = `${POWER_RADIUS}m GRID`;
+    document.getElementById('stat-order').innerText = state.mode.toUpperCase();
+    document.getElementById('wireframe-shield-tag').innerText = `GEMS: ${state.gems}`;
+    setCmdTooltip(state.playerFaction === 'solaris'
+        ? 'Deploy Nexus [1], Khaydarin Power Pylon [7], Warp Gate [2], Robotics Bay [3], Turret [5], or Mine Drill [8]'
+        : 'Select a structure to deploy [1–5, 8: Mine Drill] or Box-Select units [6 / F2]');
+
+    const buildCells = state.playerFaction === 'solaris'
+        ? [
+            { key: '1', m: 'base', name: 'Solaris Nexus', cost: 'FREE', icon: 'solaris_nexus', locked: state.basePlaced, desc: 'Deploy Solaris Astral Nexus HQ [1]: Establishes Nexus and dispatches Protoss Mining Probes.' },
+            { key: '7', m: 'solaris_pylon', name: 'Khaydarin Pylon', cost: '75M', icon: 'solaris_pylon', locked: !state.basePlaced, desc: 'Khaydarin Power Pylon [7]: 75M · Projects a 20m Psionic Power Matrix required to power Protoss structures!' },
+            { key: '2', m: 'solaris_gate', name: 'Warp Gate', cost: '150M', icon: 'solaris_gate', locked: !state.basePlaced, desc: 'Solaris Astral Warp Gate [2]: 150M · Warps in Chrono-Zealots, Prism Stalkers & Aether Archons (Requires Pylon Power)!' },
+            { key: '3', m: 'solaris_robotics', name: 'Robotics Bay', cost: '200M', icon: 'solaris_robotics', locked: !state.basePlaced, desc: 'Solaris Robotics & Fleet Bay [3]: 200M · Warps in Heavy Armor, Siege Artillery & Airships (Requires Pylon Power)!' },
+            { key: '9', m: 'solaris_cyber_lab', name: 'Cyber Forge Lab', cost: '150M', icon: 'solaris_cyber_lab', locked: !state.basePlaced, desc: 'Solaris Cybernetics Forge Lab [9]: 150M · Researches Lv.1–Lv.3 Arms & Armor Upgrades with 3D Visual Unit Enhancements!' },
+            { key: '5', m: 'turret', name: 'Photon Turret', cost: '75M', icon: 'turret', locked: !state.basePlaced, desc: 'Modular Defense Turret [5]: 75M · 3-Slot hardpoint defense matrix (Requires Pylon Power).' },
+            { key: '8', m: 'mine_drill', name: 'Mine Drill', cost: '120M', icon: 'mine_drill', locked: !state.basePlaced, desc: 'Deep-Core Mine Drill [8]: 120M · Mines +14 Minerals/2.6s & extracts Khaydarin Gems from Gem Craters!' },
+            { key: '4', m: 'hero', name: 'Vanguard Pad', cost: '150M', icon: 'hero', locked: !state.basePlaced || state.heroPlaced, desc: 'Solaris Ascendant Beacon [4]: 150M · Warps in the elite Vanguard Marshal (Requires Pylon Power).' },
+            { key: '6', m: 'select', name: 'Box / Select', cost: 'TOOL', icon: 'move', locked: !state.basePlaced, desc: 'Tactical Selection Tool [6]: Click structures to configure or drag box to command squads.' }
+        ]
+        : [
+            { key: '1', m: 'base', name: 'Command HQ', cost: 'FREE', icon: 'base', locked: state.basePlaced, desc: 'Deploy Orbital Command Citadel HQ [1]: Establishes power grid and tactical radar.' },
+            { key: '2', m: 'barracks', name: 'Barracks', cost: '100M', icon: 'barracks', locked: !state.basePlaced, desc: 'Infantry Barracks [2]: 100M · Continuously trains Shock Troopers, Marksmen, Medics, Rocket Men, Reapers, Firebats & Marauders.' },
+            { key: '3', m: 'factory', name: 'War Factory', cost: '200M', icon: 'factory', locked: !state.basePlaced, desc: 'Heavy War Factory [3]: 200M · Assembles Tanks, Siege Tanks, Gunships, Dropships & Transformable Valkyrie Semi-Mechs.' },
+            { key: '9', m: 'tech_lab', name: 'Weapons Lab', cost: '150M', icon: 'tech_lab', locked: !state.basePlaced, desc: 'Engineering & Weapons Lab [9]: 150M · Upgrades unit Arms & Armor (Lv.1–Lv.3) and visually upgrades unit 3D models!' },
+            { key: '5', m: 'turret', name: 'Ball Turret', cost: '75M', icon: 'turret', locked: !state.basePlaced, desc: 'Modular Ball Turret [5]: 75M · 3-Slot hardpoint bunker (Gatling, Plasma, Rocket, Shield, Sniper, Drone, Mortar, Mind Ctrl).' },
+            { key: '8', m: 'mine_drill', name: 'Mine Drill', cost: '120M', icon: 'mine_drill', locked: !state.basePlaced, desc: 'Deep-Core Mine Drill [8]: 120M · Mines +14 Minerals/2.6s & extracts Khaydarin Gems from Gem Craters for Troops/Builds!' },
+            { key: '4', m: 'hero', name: 'Vanguard Pad', cost: '150M', icon: 'hero', locked: !state.basePlaced || state.heroPlaced, desc: 'Vanguard Beacon Pad [4]: 150M · Warps in the elite Vanguard Marshal with Aegis-X9 Sunlance Rail-Cannon.' },
+            { key: '6', m: 'select', name: 'Box / Select', cost: 'TOOL', icon: 'move', locked: !state.basePlaced, desc: 'Tactical Selection Tool [6]: Click structures to configure or drag box to command squads.' },
+            { key: 'O', m: 'overload', name: 'HQ Overload', cost: '150M BLAST', icon: 'hold', locked: !state.basePlaced || state.req < 150, desc: 'Emergency HQ Overload [O]: 150M · Detonates EMP shockwave killing surrounding enemies & restoring HQ!' }
+        ];
+
+    buildCells.forEach(bc => {
+        const btn = document.createElement('button');
+        if (!bc) {
+            btn.className = 'cmd-cell'; btn.disabled = true;
+            grid.appendChild(btn);
+            return;
+        }
+        btn.className = 'cmd-cell' + (state.mode === bc.m ? ' active' : '');
+        btn.disabled = bc.locked;
+        btn.innerHTML = `<div class="cmd-top-row"><span class="cmd-hotkey">${bc.key}</span>${getCmdIconSvg(bc.icon)}</div><span class="cmd-name">${bc.name}</span><span class="cmd-cost">${bc.cost}</span>`;
+        btn.onmouseenter = () => setCmdTooltip(bc.desc);
+        btn.onclick = () => {
+            if (bc.m === 'army') selectAllArmy();
+            else if (bc.m === 'overload') {
+                if (state.req >= 150) {
+                    state.req -= 150;
+                    executeHQEmergencyOverloadRepair();
+                }
+            }
+            else setMode(bc.m);
+        };
+        grid.appendChild(btn);
+    });
+}
+
+function setSiegeTankMode(u, toSiegeMode, isManual = false) {
+    if (!u || u.type !== 'siege_tank') return false;
+    const nextMode = !!toSiegeMode;
+    if (u.siegeMode === nextMode) return false;
+    if ((u.siegeSwitchCooldown || 0) > 0 || (u.siegeTransitionTimer || 0) > 0) {
+        if (isManual) {
+            const rem = Math.max(u.siegeSwitchCooldown || 0, u.siegeTransitionTimer || 0);
+            spawnCombatFloat(u.mesh.position, `SIEGE COOLDOWN (${rem.toFixed(1)}s)`, '#ffaa00');
+        }
+        return false;
+    }
+    u.siegeMode = nextMode;
+    // Full hydraulic Siege / Unsiege transformation completes in 3.6 seconds (strictly under 5 seconds!); turret CANNOT fire until finished!
+    u.siegeTransitionTimer = 3.6;
+    u.siegeSwitchCooldown = 4.2;
+    u.siegeCooldown = 4.2;
+    if (u.mesh && u.mesh.userData) {
+        u.mesh.userData.siegeMode = u.siegeMode;
+    }
+    const facKey = 'terran';
+    const wLvl = (state.upgrades && state.upgrades[facKey]) ? (state.upgrades[facKey].weapons || 0) : 0;
+    const wMult = 1.0 + wLvl * 0.20;
+    if (u.siegeMode) {
+        // Anchored Mjolnir Artillery Mode: Hydraulic outriggers planted, tank body 100% locked in place (only turret head rotates)!
+        u.speed = 0;
+        u.range = 28.5;
+        u.minRange = 7.5;
+        u.baseDamage = 145;
+        u.damage = Math.round(145 * wMult);
+        u.fireRate = 2.45;
+        u.spawnRallyTimer = 0;
+        u.anchoredPos = u.mesh.position.clone();
+        u.anchoredYaw = (u.mesh && u.mesh.userData && u.mesh.userData.smoothYaw !== undefined)
+            ? u.mesh.userData.smoothYaw
+            : (u.currentYaw !== undefined ? u.currentYaw : u.mesh.rotation.y);
+        if (u.mesh && u.mesh.userData) {
+            u.mesh.userData.smoothYaw = u.anchoredYaw;
+        }
+        if (isManual) spawnCombatFloat(u.mesh.position, 'SIEGE ARTILLERY MODE (ANCHORED)', '#ffaa00');
+    } else {
+        // Mobile Tank Mode: 14.0m range, 85 DMG cannon, no minimum range deadzone
+        u.speed = 2.6;
+        u.range = 14.0;
+        u.minRange = 0;
+        u.baseDamage = 85;
+        u.damage = Math.round(85 * wMult);
+        u.fireRate = 1.85;
+        u.anchoredPos = null;
+        if (isManual) spawnCombatFloat(u.mesh.position, 'MOBILE TANK MODE', '#00e5ff');
+    }
+    if (isManual) {
+        u.manualSiegeLockTimer = 9.0;
+    }
+    return true;
+}
+
+function toggleSelectedSiegeTankMode() {
+    const sTanks = state.selectedUnits.filter(u => u && u.type === 'siege_tank' && u.hp > 0);
+    if (sTanks.length === 0) return;
+    const readyTanks = sTanks.filter(u => (u.siegeSwitchCooldown || 0) <= 0);
+    if (readyTanks.length === 0) {
+        const minCd = Math.min(...sTanks.map(u => u.siegeSwitchCooldown || 0));
+        spawnCombatFloat(sTanks[0].mesh.position, `SIEGE HYDRAULICS COOLING (${minCd.toFixed(1)}s)`, '#ffaa00');
+        return;
+    }
+    const nextSiege = !readyTanks.some(u => u.siegeMode);
+    readyTanks.forEach(u => setSiegeTankMode(u, nextSiege, true));
+    if (window.SFX) window.SFX.playClick();
+    renderSC2CommandCard();
+    updateHUD(true);
+}
+
+function setValkyrieCombatMode(u, toMechMode, isManual = false) {
+    if (!u || u.type !== 'valkyrie') return;
+    u.mechMode = !!toMechMode;
+    u.isAir = !u.mechMode;
+    u.transformTimer = 3.0; // Full 3.0-second Land / Fly transformation sequence
+    u.modeSwitchCooldown = 3.4;
+    if (u.mesh && u.mesh.userData) {
+        u.mesh.userData.mechMode = u.mechMode;
+    }
+    if (u.mechMode) {
+        // Semi-Mech Ground Walker Mode: lands over 3.0s on reverse-jointed hydraulic legs & engages ground targets
+        u.speed = 4.6;
+        u.range = 13.5;
+        u.fireRate = 0.42;
+        u.damage = 28;
+        if (u.selCircle) u.selCircle.position.y = 0.08;
+    } else {
+        // Supersonic Strike-Fighter Mode: lifts off over 3.0s & intercepts air threats
+        u.speed = 7.6;
+        u.range = 17.5;
+        u.fireRate = 1.05;
+        u.damage = 42;
+        if (u.selCircle) u.selCircle.position.y = -5.8;
+    }
+    if (isManual) {
+        u.manualModeLockTimer = 9.0; // Respect manual mode toggle before auto-transforming
+    }
+}
+
+function toggleSelectedValkyrieMode() {
+    const valks = state.selectedUnits.filter(u => u && u.type === 'valkyrie' && u.hp > 0);
+    if (valks.length === 0) return;
+    const nextMech = !valks.some(u => u.mechMode);
+    valks.forEach(u => setValkyrieCombatMode(u, nextMech, true));
+    if (window.SFX) window.SFX.playClick();
+    renderSC2CommandCard();
+    updateHUD(true);
+}
+
+function renderMultiUnitSelectionGrid() {
+    const titleEl = document.getElementById('multi-sel-title');
+    const tabsEl = document.getElementById('multi-subgroup-tabs');
+    const gridEl = document.getElementById('multi-unit-grid');
+    if (!titleEl || !gridEl) return;
+
+    titleEl.innerText = `SQUAD (${state.selectedUnits.length})`;
+    gridEl.innerHTML = '';
+    syncFormSquadButtonUI();
+
+    // Render StarCraft II Subgroup Filter Tabs (ALL + per-unit-type counts)
+    if (tabsEl) {
+        tabsEl.innerHTML = '';
+        const counts = {};
+        state.selectedUnits.forEach(u => { counts[u.type] = (counts[u.type] || 0) + 1; });
+        const types = Object.keys(counts);
+        if (types.length > 1) {
+            types.forEach(t => {
+                const tab = document.createElement('button');
+                tab.className = 'sc-subgroup-tab';
+                tab.innerText = `${t.toUpperCase()} (${counts[t]})`;
+                tab.title = `Isolate all ${t.toUpperCase()} units in squad`;
+                tab.onclick = () => setSelectedUnits(state.selectedUnits.filter(u => u.type === t));
+                tabsEl.appendChild(tab);
+            });
+        }
+    }
+
+    state.selectedUnits.slice(0, 16).forEach(u => {
+        const ratio = Math.max(0, Math.min(1, u.hp / u.maxHp));
+        const col = ratio > 0.6 ? '#00ff66' : (ratio > 0.3 ? '#ffaa00' : '#ff2a4b');
+        const tile = document.createElement('div');
+        tile.className = 'sc-unit-tile';
+        tile.title = `Click to isolate ${u.type.toUpperCase()} (${Math.ceil(u.hp)}/${u.maxHp} HP)`;
+        tile.innerHTML = `
+            ${getWireframeSvgMarkup(u.type, col)}
+            <span class="sc-unit-tile-name">${u.type}</span>
+            <div class="sc-unit-tile-hp">
+                <div class="sc-unit-tile-hp-fill" style="width:${Math.round(ratio * 100)}%;background:${col};"></div>
+            </div>
+        `;
+        tile.onclick = () => setSelectedUnits([u]);
+        gridEl.appendChild(tile);
+    });
+}
+
+function setMode(m) {
+    if (m === 'base' && state.basePlaced) return;
+    if (m !== 'base' && !state.basePlaced) return;
+    if (m === 'hero' && state.heroPlaced) return;
+
+    if (window.SFX) window.SFX.playClick();
+    state.selectedBuilding = null;
+    state.selectedUnits = [];
+    state.unitCommandMode = null;
+    syncUnitSelectionVisuals();
+    buildings.forEach(bld => {
+        if (bld.type === 'turret' && typeof updateTurretRangeVisuals === 'function') {
+            updateTurretRangeVisuals(bld, false);
+        }
+    });
+    selRing.visible = false;
+    state.mode = m;
+    rebuildGhostModel(m);
+    renderSC2CommandCard();
+}
+
+function selectStructure(b) {
+    if (window.SFX) window.SFX.playClick();
+    state.selectedUnits = [];
+    state.unitCommandMode = null;
+    syncUnitSelectionVisuals();
+    state.selectedBuilding = b;
+    buildings.forEach(bld => {
+        if (bld.type === 'turret' && typeof updateTurretRangeVisuals === 'function') {
+            updateTurretRangeVisuals(bld, bld === b);
+        }
+    });
+    if (b) {
+        state.mode = 'select';
+        rebuildGhostModel('select');
+        selRing.position.set(b.pos.x, b.pos.y + 0.14, b.pos.z);
+        selRing.visible = true;
+    } else {
+        selRing.visible = false;
+    }
+    renderSC2CommandCard();
+    updateHUD();
+}
+
+// --- INTERACTIVE TACTICAL RADAR MINIMAP VIEWER ---
+const minimapCanvas = document.getElementById('minimap-canvas');
+const minimapCtx = minimapCanvas.getContext('2d');
+let isMinimapDragging = false;
+
+function handleMinimapPointerInput(e, isInitialDown = false) {
+    const rect = minimapCanvas.getBoundingClientRect();
+    const nx = THREE.MathUtils.clamp((e.clientX - rect.left) / Math.max(1, rect.width), 0.02, 0.98);
+    const ny = THREE.MathUtils.clamp((e.clientY - rect.top) / Math.max(1, rect.height), 0.02, 0.98);
+    const wx = (nx - 0.5) * MAP_SIZE;
+    const wz = (ny - 0.5) * MAP_SIZE;
+
+    if (isInitialDown && state.selectedUnits.length > 0 && (e.button === 2 || state.unitCommandMode)) {
+        const orderToIssue = state.unitCommandMode || 'attack_move';
+        issueSquadOrder(orderToIssue, new THREE.Vector3(wx, getTerrainHeight(wx, wz), wz));
+        return;
+    }
+
+    const offset = camera.position.clone().sub(controls.target);
+    controls.target.set(wx, getTerrainHeight(wx, wz), wz);
+    camera.position.copy(controls.target).add(offset);
+    controls.update();
+    renderTacticalMinimap();
+}
+
+minimapCanvas.addEventListener('contextmenu', e => e.preventDefault());
+minimapCanvas.addEventListener('pointerdown', e => {
+    e.stopPropagation();
+    if (e.button === 0 && !state.unitCommandMode) {
+        isMinimapDragging = true;
+        if (minimapCanvas.setPointerCapture) {
+            try { minimapCanvas.setPointerCapture(e.pointerId); } catch (_) {}
+        }
+    }
+    handleMinimapPointerInput(e, true);
+});
+minimapCanvas.addEventListener('pointermove', e => {
+    if (!isMinimapDragging) return;
+    e.stopPropagation();
+    handleMinimapPointerInput(e, false);
+});
+minimapCanvas.addEventListener('pointerup', e => {
+    if (isMinimapDragging) {
+        isMinimapDragging = false;
+        if (minimapCanvas.releasePointerCapture) {
+            try { minimapCanvas.releasePointerCapture(e.pointerId); } catch (_) {}
+        }
+    }
+});
+
+window.focusCameraOnSector = function(sector) {
+    let targetPt = PLAYER_START_POS;
+    if (sector === 'hq') {
+        targetPt = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+    } else if (sector === 'hive') {
+        targetPt = ENEMY_BASE_POS;
+    } else if (sector === 'solaris' && typeof SOLARIS_BASE_POS !== 'undefined') {
+        targetPt = SOLARIS_BASE_POS;
+    }
+    const offset = camera.position.clone().sub(controls.target);
+    const ty = getTerrainHeight(targetPt.x, targetPt.z);
+    controls.target.set(targetPt.x, ty, targetPt.z);
+    camera.position.copy(controls.target).add(offset);
+    controls.update();
+    renderTacticalMinimap();
+    if (window.SFX) window.SFX.playClick();
+};
+
+window.toggleMinimapExpand = function() {
+    const wing = document.getElementById('minimap-wing');
+    const btn = document.getElementById('btn-minimap-expand');
+    if (!wing) return;
+    const expanded = wing.classList.toggle('minimap-expanded');
+    if (btn) btn.innerText = expanded ? '⤡' : '⤢';
+    if (window.SFX) window.SFX.playClick();
+    renderTacticalMinimap();
+};
+
+let _minimapTerrainCache = null;
+let _minimapTerrainSeed = null;
+
+function renderTacticalMinimap() {
+    if (!minimapCanvas || !minimapCtx) return;
+    const w = minimapCanvas.width, h = minimapCanvas.height;
+    minimapCtx.fillStyle = '#050a11';
+    minimapCtx.fillRect(0, 0, w, h);
+
+    if (!_minimapTerrainCache || _minimapTerrainSeed !== window.ACTIVE_MAP_SEED) {
+        _minimapTerrainSeed = window.ACTIVE_MAP_SEED;
+        _minimapTerrainCache = new Uint8Array((FOW_RES / 2) * (FOW_RES / 2));
+        let cIdx = 0;
+        for (let gy = 0; gy < FOW_RES; gy += 2) {
+            for (let gx = 0; gx < FOW_RES; gx += 2) {
+                const wx = ((gx / FOW_RES) - 0.5) * MAP_SIZE;
+                const wz = ((gy / FOW_RES) - 0.5) * MAP_SIZE;
+                const rDist = typeof getRiverDist === 'function' ? getRiverDist(wx, wz) : Math.abs(getRavineSignedDist(wx, wz));
+                const onBridge = typeof isOnRiverBridge === 'function' ? isOnRiverBridge(wx, wz, 0.3) : (getBridgeFactor(wx, wz) > 0.65);
+                const roadFac = typeof getSupplyRoadFactor === 'function' ? getSupplyRoadFactor(wx, wz) : 0;
+                if (onBridge && rDist < 6.0) _minimapTerrainCache[cIdx] = 1;
+                else if (rDist < 3.6) _minimapTerrainCache[cIdx] = 2;
+                else if (roadFac > 0.25) _minimapTerrainCache[cIdx] = 3;
+                else _minimapTerrainCache[cIdx] = 0;
+                cIdx++;
+            }
+        }
+    }
+
+    let cIdx = 0;
+    for (let gy = 0; gy < FOW_RES; gy += 2) {
+        for (let gx = 0; gx < FOW_RES; gx += 2) {
+            const idx = gy * FOW_RES + gx;
+            const isVis = !!fowVisible[idx] || !!window.fowRevealAll;
+            const isExp = !!fowExplored[idx] || isVis;
+            const tType = _minimapTerrainCache[cIdx++];
+
+            if (tType === 1) {
+                minimapCtx.fillStyle = isVis ? '#cbd5e1' : (isExp ? '#94a3b8' : '#64748b');
+            } else if (tType === 2) {
+                minimapCtx.fillStyle = isVis ? '#0ea5e9' : (isExp ? '#0369a1' : '#082f49');
+            } else if (tType === 3) {
+                minimapCtx.fillStyle = isVis ? '#786854' : (isExp ? '#4a3f33' : '#29231c');
+            } else {
+                minimapCtx.fillStyle = isVis ? '#2f4b2b' : (isExp ? '#1b2c19' : '#0f1910');
+            }
+            minimapCtx.fillRect((gx / FOW_RES) * w, (gy / FOW_RES) * h, 3, 3);
+        }
+    }
+
+    // Subtle radar grid lines
+    minimapCtx.strokeStyle = 'rgba(0, 229, 255, 0.14)';
+    minimapCtx.lineWidth = 1;
+    minimapCtx.beginPath();
+    minimapCtx.moveTo(w * 0.5, 0); minimapCtx.lineTo(w * 0.5, h);
+    minimapCtx.moveTo(0, h * 0.5); minimapCtx.lineTo(w, h * 0.5);
+    minimapCtx.stroke();
+
+    // Zerg Creep Zone Overlay on Tactical Minimap (Organic Pulsing Violet-Purple Zone)
+    if (typeof creepRadius !== 'undefined' && creepRadius > 0.5 && typeof ENEMY_BASE_POS !== 'undefined') {
+        const cx = ((ENEMY_BASE_POS.x / MAP_SIZE) + 0.5) * w;
+        const cy = ((ENEMY_BASE_POS.z / MAP_SIZE) + 0.5) * h;
+        const cr = (creepRadius / MAP_SIZE) * w;
+        const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.004);
+        const grad = minimapCtx.createRadialGradient(cx, cy, cr * 0.1, cx, cy, cr);
+        grad.addColorStop(0, `rgba(168, 85, 247, ${0.42 + pulse * 0.14})`);
+        grad.addColorStop(0.7, `rgba(126, 34, 206, ${0.28 + pulse * 0.10})`);
+        grad.addColorStop(1, 'rgba(88, 28, 135, 0)');
+        minimapCtx.fillStyle = grad;
+        minimapCtx.beginPath();
+        minimapCtx.arc(cx, cy, cr, 0, Math.PI * 2);
+        minimapCtx.fill();
+
+        minimapCtx.strokeStyle = `rgba(216, 180, 254, ${0.45 + pulse * 0.25})`;
+        minimapCtx.lineWidth = 1.2;
+        minimapCtx.beginPath();
+        minimapCtx.arc(cx, cy, cr * (0.92 + pulse * 0.06), 0, Math.PI * 2);
+        minimapCtx.stroke();
+    }
+
+    // Solaris Chrono-Synod Enclave Structures (Gold-Cyan Diamonds)
+    solarisBuildings.forEach(sb => {
+        if (!sb || sb.hp <= 0) return;
+        const mx = ((sb.pos.x / MAP_SIZE) + 0.5) * w;
+        const my = ((sb.pos.z / MAP_SIZE) + 0.5) * h;
+        minimapCtx.fillStyle = '#f5b932';
+        minimapCtx.fillRect(mx - 3, my - 3, 6, 6);
+        minimapCtx.strokeStyle = '#38bdf8';
+        minimapCtx.strokeRect(mx - 3.5, my - 3.5, 7, 7);
+    });
+
+    // Gem Craters on Tactical Minimap (Glowing Magenta Diamonds for Rich Craters, Grey for Empty Craters)
+    if (Array.isArray(window.GEM_CRATERS)) {
+        window.GEM_CRATERS.forEach(gc => {
+            if (!gc) return;
+            const mx = ((gc.x / MAP_SIZE) + 0.5) * w;
+            const my = ((gc.z / MAP_SIZE) + 0.5) * h;
+            const rich = !gc.isEmpty && gc.gemsRemaining > 0;
+            minimapCtx.fillStyle = rich ? '#e879f9' : '#64748b';
+            minimapCtx.beginPath();
+            minimapCtx.moveTo(mx, my - 3.5);
+            minimapCtx.lineTo(mx + 3.5, my);
+            minimapCtx.lineTo(mx, my + 3.5);
+            minimapCtx.lineTo(mx - 3.5, my);
+            minimapCtx.closePath();
+            minimapCtx.fill();
+        });
+    }
+
+    buildings.forEach(b => {
+        const mx = ((b.pos.x / MAP_SIZE) + 0.5) * w;
+        const my = ((b.pos.z / MAP_SIZE) + 0.5) * h;
+        minimapCtx.fillStyle = b.type === 'solaris_gate' ? '#f5b932' : (b.type === 'mine_drill' ? '#e879f9' : '#00e5ff');
+        minimapCtx.fillRect(mx - 2.5, my - 2.5, 5, 5);
+    });
+    units.forEach(u => {
+        const mx = ((u.mesh.position.x / MAP_SIZE) + 0.5) * w;
+        const my = ((u.mesh.position.z / MAP_SIZE) + 0.5) * h;
+        const isSolarisUnit = (u.type === 'zealot' || u.type === 'stalker' || u.type === 'archon');
+        minimapCtx.fillStyle = state.selectedUnits.includes(u) ? '#ffffff' : (isSolarisUnit ? '#f5b932' : '#00ff66');
+        minimapCtx.fillRect(mx - 1.75, my - 1.75, 3.5, 3.5);
+    });
+
+    enemyBuildings.forEach(eb => {
+        const mx = ((eb.pos.x / MAP_SIZE) + 0.5) * w;
+        const my = ((eb.pos.z / MAP_SIZE) + 0.5) * h;
+        minimapCtx.fillStyle = '#9333ea';
+        minimapCtx.fillRect(mx - 3.5, my - 3.5, 7, 7);
+        minimapCtx.fillStyle = '#ff2a4b';
+        minimapCtx.fillRect(mx - 2.25, my - 2.25, 4.5, 4.5);
+    });
+    enemies.forEach(e => {
+        if (!e.mesh.visible) return;
+        const mx = ((e.mesh.position.x / MAP_SIZE) + 0.5) * w;
+        const my = ((e.mesh.position.z / MAP_SIZE) + 0.5) * h;
+        minimapCtx.fillStyle = e.isSolarisHostile ? '#f5b932' : '#ff2a4b';
+        minimapCtx.fillRect(mx - 1.5, my - 1.5, 3, 3);
+    });
+
+    const camX = ((controls.target.x / MAP_SIZE) + 0.5) * w;
+    const camY = ((controls.target.z / MAP_SIZE) + 0.5) * h;
+    minimapCtx.strokeStyle = '#ffffff';
+    minimapCtx.lineWidth = 1.2;
+    minimapCtx.strokeRect(camX - 13, camY - 10, 26, 20);
+}
+
+// ============================================================================
+// CLICK-AND-DRAG SELECTION BOX OVERLAY & RAYCASTING SYSTEM
+// ============================================================================
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+const selectionBoxEl = document.getElementById('selection-box');
+const selectionBoxCountEl = document.getElementById('selection-box-count');
+const touchHoldRingEl = document.getElementById('touch-hold-ring');
+let cursorWorldPos = null;
+let pointerDownXY = { x: 0, y: 0 };
+let rightPointerDownXY = { x: 0, y: 0 };
+let isLeftMouseDown = false;
+let isBoxDragging = false;
+let isTouchPointer = false;
+let touchHoldTimer = null;
+let isTouchHoldSelectActive = false;
+let activeTouchPointers = 0;
+
+function clearTouchHoldState() {
+    if (touchHoldTimer) {
+        clearTimeout(touchHoldTimer);
+        touchHoldTimer = null;
+    }
+    isTouchHoldSelectActive = false;
+    if (touchHoldRingEl) {
+        touchHoldRingEl.style.display = 'none';
+    }
+    controls.enabled = true;
+}
+
+const _groundFallbackPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const _groundFallbackPt = new THREE.Vector3();
+
+function updateMouseRay(clientX, clientY) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+    const hits = raycaster.intersectObject(terrainMesh);
+    if (hits.length > 0) {
+        cursorWorldPos = hits[0].point;
+    } else if (raycaster.ray.intersectPlane(_groundFallbackPlane, _groundFallbackPt)) {
+        const cx = THREE.MathUtils.clamp(_groundFallbackPt.x, -110, 110);
+        const cz = THREE.MathUtils.clamp(_groundFallbackPt.z, -110, 110);
+        cursorWorldPos = new THREE.Vector3(cx, getTerrainHeight(cx, cz), cz);
+    } else {
+        cursorWorldPos = null;
+    }
+}
+
+function getFriendlyUnitsInScreenBox(x1, y1, x2, y2, extraPad = 12) {
+    const minX = Math.min(x1, x2);
+    const maxX = Math.max(x1, x2);
+    const minY = Math.min(y1, y2);
+    const maxY = Math.max(y1, y2);
+    const rect = renderer.domElement.getBoundingClientRect();
+    const matched = [];
+    const projVec = new THREE.Vector3();
+
+    units.forEach(u => {
+        if (u.hp <= 0) return;
+        projVec.copy(u.mesh.position);
+        projVec.y += 0.6;
+        projVec.project(camera);
+        if (projVec.z > 1) return;
+
+        const sx = (projVec.x * 0.5 + 0.5) * rect.width + rect.left;
+        const sy = (-(projVec.y * 0.5) + 0.5) * rect.height + rect.top;
+
+        if (sx >= minX - extraPad && sx <= maxX + extraPad && sy >= minY - extraPad && sy <= maxY + extraPad) {
+            matched.push(u);
+        }
+    });
+    return matched;
+}
+
+window.addEventListener('pointermove', e => {
+    if (isLeftMouseDown) {
+        const dragDist = Math.hypot(e.clientX - pointerDownXY.x, e.clientY - pointerDownXY.y);
+
+        // On mobile/touch: if finger moves > 12px BEFORE the hold timer completes, cancel hold-select and let OrbitControls pan/orbit
+        if (isTouchPointer && !isTouchHoldSelectActive && dragDist > 12) {
+            clearTouchHoldState();
+            isLeftMouseDown = false;
+            return;
+        }
+
+        // Desktop left-drag OR Mobile after holding for 260ms activates selection box (only when not actively placing a building)
+        const canBoxSelect = isTouchPointer ? isTouchHoldSelectActive : (dragDist > 9 && state.basePlaced && state.mode === 'select');
+        if (canBoxSelect) {
+            isBoxDragging = true;
+            ghostRoot.visible = false;
+            cursorTag.style.display = 'none';
+            if (touchHoldRingEl) touchHoldRingEl.style.display = 'none';
+
+            const left = Math.min(pointerDownXY.x, e.clientX);
+            const top = Math.min(pointerDownXY.y, e.clientY);
+            const width = Math.max(18, Math.abs(e.clientX - pointerDownXY.x));
+            const height = Math.max(18, Math.abs(e.clientY - pointerDownXY.y));
+
+            selectionBoxEl.style.display = 'block';
+            selectionBoxEl.style.left = `${left}px`;
+            selectionBoxEl.style.top = `${top}px`;
+            selectionBoxEl.style.width = `${width}px`;
+            selectionBoxEl.style.height = `${height}px`;
+
+            const insideUnits = getFriendlyUnitsInScreenBox(
+                pointerDownXY.x, pointerDownXY.y, e.clientX, e.clientY,
+                isTouchPointer ? 22 : 12
+            );
+            selectionBoxCountEl.innerText = insideUnits.length > 0 ? `${insideUnits.length} UNIT${insideUnits.length > 1 ? 'S' : ''}` : 'HOLD & DRAG';
+
+            units.forEach(u => {
+                if (u.selCircle) {
+                    u.selCircle.visible = insideUnits.includes(u) || state.selectedUnits.includes(u);
+                }
+            });
+            return;
+        }
+    }
+
+    if (e.target !== renderer.domElement) {
+        cursorTag.style.display = 'none';
+        return;
+    }
+    updateMouseRay(e.clientX, e.clientY);
+
+    if (state.unitCommandMode && cursorWorldPos) {
+        cursorTag.style.display = 'block';
+        cursorTag.style.left = `${e.clientX}px`;
+        cursorTag.style.top = `${e.clientY}px`;
+        const isAtk = state.unitCommandMode === 'attack_move';
+        cursorTag.innerText = isAtk ? 'CLICK TO ATTACK-MOVE SQUAD' : 'CLICK TO MOVE SQUAD';
+        cursorTag.style.borderColor = isAtk ? '#ff2a4b' : '#00ff66';
+        cursorTag.style.color = isAtk ? '#ff2a4b' : '#00ff66';
+        return;
+    }
+
+    if (state.mode !== 'select' && cursorWorldPos) {
+        // Find the closest friendly structure to the cursor (never blocked by overlapping turret shield domes!)
+        let hoveredBld = null;
+        let bestHoverDist = 2.25;
+        buildings.forEach(b => {
+            if (!b || b.hp <= 0) return;
+            const d = Math.hypot(b.pos.x - cursorWorldPos.x, b.pos.z - cursorWorldPos.z);
+            if (d < bestHoverDist) {
+                bestHoverDist = d;
+                hoveredBld = b;
+            }
+        });
+        if (hoveredBld && (hoveredBld.type === 'turret' || hoveredBld.type === 'barracks' || hoveredBld.type === 'factory')) {
+            ghostRoot.visible = false;
+            cursorTag.style.display = 'block';
+            cursorTag.style.left = `${e.clientX}px`;
+            cursorTag.style.top = `${e.clientY}px`;
+            cursorTag.innerText = hoveredBld.type === 'turret'
+                ? `CLICK TURRET TO EQUIP GUNS & UPGRADE [MK-${hoveredBld.level || 1}]`
+                : `CLICK ${hoveredBld.type.toUpperCase()} TO CONFIGURE QUEUE`;
+            cursorTag.style.borderColor = '#ffaa00';
+            cursorTag.style.color = '#ffaa00';
+            return;
+        }
+
+        ghostRoot.visible = true;
+        const check = evaluateBuildSpot(cursorWorldPos);
+        const displayPos = check.snappedPos || cursorWorldPos;
+        ghostRoot.position.copy(displayPos);
+        if (state.mode === 'barrier') {
+            // Auto-orient Blast Barrier perpendicular to the threat/Enemy Hive axis
+            const angToThreat = Math.atan2(ENEMY_BASE_POS.x - displayPos.x, ENEMY_BASE_POS.z - displayPos.z);
+            ghostRoot.rotation.y = angToThreat;
+        } else {
+            ghostRoot.rotation.y = 0;
+        }
+        cursorTag.style.display = 'block';
+        cursorTag.style.left = `${e.clientX}px`;
+        cursorTag.style.top = `${e.clientY}px`;
+        cursorTag.innerText = check.reason;
+        cursorTag.style.borderColor = check.ok ? '#00ff66' : '#ff2a4b';
+        cursorTag.style.color = check.ok ? '#00ff66' : '#ff2a4b';
+
+        if (ghostMesh) {
+            ghostMesh.traverse(c => { if (c.isMesh) c.material = check.ok ? matGhostOk : matGhostBad; });
+        }
+    } else {
+        cursorTag.style.display = 'none';
+    }
+});
+
+renderer.domElement.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'touch') {
+        activeTouchPointers++;
+        if (activeTouchPointers > 1) {
+            // Multi-touch pinch/pan: cancel hold-to-select
+            clearTouchHoldState();
+            isLeftMouseDown = false;
+            isBoxDragging = false;
+            selectionBoxEl.style.display = 'none';
+            return;
+        }
+    }
+
+    if (e.button === 0) {
+        isLeftMouseDown = true;
+        isBoxDragging = false;
+        isTouchPointer = (e.pointerType === 'touch' || IS_MOBILE);
+        pointerDownXY = { x: e.clientX, y: e.clientY };
+
+        // Mobile Hold-to-Select: require holding 1 finger for 260ms before activating unit selection (skip if waiting for a target click in unitCommandMode!)
+        if (isTouchPointer && state.basePlaced && !state.unitCommandMode) {
+            clearTouchHoldState();
+            if (touchHoldRingEl) {
+                touchHoldRingEl.style.display = 'block';
+                touchHoldRingEl.style.left = `${e.clientX}px`;
+                touchHoldRingEl.style.top = `${e.clientY}px`;
+                touchHoldRingEl.style.borderStyle = 'dashed';
+            }
+            touchHoldTimer = setTimeout(() => {
+                if (!isLeftMouseDown || activeTouchPointers > 1 || state.unitCommandMode) return;
+                isTouchHoldSelectActive = true;
+                controls.enabled = false; // Lock camera orbit while dragging unit selection box on mobile
+                if (touchHoldRingEl) {
+                    touchHoldRingEl.style.borderStyle = 'solid';
+                }
+                if (window.SFX) window.SFX.playClick();
+
+                // Immediately preview any friendly units under the held finger
+                const heldUnits = getFriendlyUnitsInScreenBox(
+                    pointerDownXY.x - 32, pointerDownXY.y - 32,
+                    pointerDownXY.x + 32, pointerDownXY.y + 32, 16
+                );
+                units.forEach(u => {
+                    if (u.selCircle) u.selCircle.visible = heldUnits.includes(u) || state.selectedUnits.includes(u);
+                });
+            }, 260);
+        }
+    } else if (e.button === 2) {
+        rightPointerDownXY = { x: e.clientX, y: e.clientY };
+    }
+});
+
+window.addEventListener('pointercancel', e => {
+    if (e.pointerType === 'touch') activeTouchPointers = Math.max(0, activeTouchPointers - 1);
+    clearTouchHoldState();
+    isLeftMouseDown = false;
+    isBoxDragging = false;
+    selectionBoxEl.style.display = 'none';
+});
+
+window.addEventListener('pointerup', e => {
+    if (e.pointerType === 'touch') {
+        activeTouchPointers = Math.max(0, activeTouchPointers - 1);
+    }
+
+    // Right-Click quick order when friendly units are selected (and user didn't drag-orbit camera)
+    if (e.button === 2 && state.selectedUnits.length > 0 && e.target === renderer.domElement) {
+        if (Math.hypot(e.clientX - rightPointerDownXY.x, e.clientY - rightPointerDownXY.y) < 12) {
+            updateMouseRay(e.clientX, e.clientY);
+            if (cursorWorldPos) {
+                issueSquadOrder(state.unitCommandMode || 'attack_move', cursorWorldPos);
+            }
+        }
+        return;
+    }
+
+    if (e.button !== 0) return;
+
+    const wasTouchHoldActive = isTouchHoldSelectActive;
+    clearTouchHoldState();
+
+    // If waiting for Move / Attack-Move target tap/click from Command Card, execute it on tap/click release!
+    if (state.unitCommandMode && state.selectedUnits.length > 0 && e.target === renderer.domElement && !isBoxDragging) {
+        isLeftMouseDown = false;
+        if (Math.hypot(e.clientX - pointerDownXY.x, e.clientY - pointerDownXY.y) <= 22) {
+            updateMouseRay(e.clientX, e.clientY);
+            if (cursorWorldPos) {
+                issueSquadOrder(state.unitCommandMode, cursorWorldPos);
+                return;
+            }
+        }
+    }
+
+    // Complete Click-and-Drag OR Mobile Hold-to-Select Box
+    if (isBoxDragging || wasTouchHoldActive) {
+        isLeftMouseDown = false;
+        isBoxDragging = false;
+        selectionBoxEl.style.display = 'none';
+
+        const pad = isTouchPointer ? 28 : 12;
+        const boxedUnits = getFriendlyUnitsInScreenBox(pointerDownXY.x, pointerDownXY.y, e.clientX, e.clientY, pad);
+        if (e.shiftKey && state.selectedUnits.length > 0) {
+            const combined = [...state.selectedUnits];
+            boxedUnits.forEach(u => { if (!combined.includes(u)) combined.push(u); });
+            setSelectedUnits(combined);
+        } else if (boxedUnits.length > 0) {
+            setSelectedUnits(boxedUnits);
+        } else {
+            syncUnitSelectionVisuals();
+            if (state.mode !== 'select') rebuildGhostModel(state.mode);
+        }
+        return;
+    }
+
+    isLeftMouseDown = false;
+    if (e.target !== renderer.domElement) return;
+    const maxClickDrift = state.mode !== 'select' ? 36 : 16;
+    if (Math.hypot(e.clientX - pointerDownXY.x, e.clientY - pointerDownXY.y) > maxClickDrift) return;
+
+    if (window.RAID_MUSIC && !window.RAID_MUSIC.playing && !window.RAID_MUSIC.muted) {
+        window.RAID_MUSIC.start();
+    }
+
+    updateMouseRay(e.clientX, e.clientY);
+
+    // If waiting for Move / Attack-Move target tap/click from Command Card
+    if (state.unitCommandMode && state.selectedUnits.length > 0 && cursorWorldPos) {
+        issueSquadOrder(state.unitCommandMode, cursorWorldPos);
+        return;
+    }
+
+    // Helper to resolve which specific building was clicked/tapped (ignores shield domes & picks closest building!)
+    const bldMeshes = buildings.map(b => b.mesh);
+    const rawHitsB = raycaster.intersectObjects(bldMeshes, true).filter(hit => {
+        let cur = hit.object;
+        while (cur) {
+            if (cur.userData && cur.userData.isShieldDome) return false;
+            if (cur.parent && cur.parent.userData && cur.parent.userData.rangeGroup === cur) return false;
+            cur = cur.parent;
+        }
+        return true;
+    });
+
+    let clickedBld = null;
+    if (cursorWorldPos) {
+        let bestGroundDist = Infinity;
+        buildings.forEach(b => {
+            if (!b || b.hp <= 0) return;
+            const pickRad = Math.max(2.05, (b.footprintRadius || BUILDING_FOOTPRINT_RADII[b.type] || 1.85) + 0.25);
+            const d = Math.hypot(b.pos.x - cursorWorldPos.x, b.pos.z - cursorWorldPos.z);
+            if (d <= pickRad && d < bestGroundDist) {
+                bestGroundDist = d;
+                clickedBld = b;
+            }
+        });
+    }
+    if (rawHitsB.length > 0) {
+        let obj = rawHitsB[0].object;
+        while (obj.parent && obj.parent !== scene) obj = obj.parent;
+        const rayBld = buildings.find(b => b.mesh === obj);
+        if (rayBld) {
+            if (!clickedBld || !cursorWorldPos) {
+                clickedBld = rayBld;
+            } else {
+                const dRay = Math.hypot(rayBld.pos.x - cursorWorldPos.x, rayBld.pos.z - cursorWorldPos.z);
+                const dGround = Math.hypot(clickedBld.pos.x - cursorWorldPos.x, clickedBld.pos.z - cursorWorldPos.z);
+                if (dRay <= dGround + 0.65) clickedBld = rayBld;
+            }
+        }
+    }
+
+    // On Mobile, a quick tap when units are already selected issues an Attack-Move command to the tapped ground (unless tapping a building)
+    if (isTouchPointer && state.selectedUnits.length > 0 && !clickedBld && cursorWorldPos) {
+        issueSquadOrder('attack_move', cursorWorldPos);
+        return;
+    }
+
+    // Desktop only: single click on a friendly unit selects it (Mobile requires Hold to select units!)
+    if (!isTouchPointer) {
+        const unitMeshes = units.map(u => u.mesh);
+        const hitU = raycaster.intersectObjects(unitMeshes, true);
+        if (hitU.length > 0 && (state.mode === 'select' || state.selectedUnits.length > 0)) {
+            let obj = hitU[0].object;
+            while (obj.parent && obj.parent !== scene) obj = obj.parent;
+            const foundUnit = units.find(u => u.mesh === obj);
+            if (foundUnit) {
+                if (e.shiftKey) {
+                    const exists = state.selectedUnits.includes(foundUnit);
+                    const next = exists
+                        ? state.selectedUnits.filter(u => u !== foundUnit)
+                        : [...state.selectedUnits, foundUnit];
+                    setSelectedUnits(next);
+                } else {
+                    setSelectedUnits([foundUnit]);
+                }
+                return;
+            }
+        }
+    }
+
+    // If in build mode and cursor is at a valid build spot, deploy the structure first so nearby buildings don't intercept placement clicks!
+    if (state.mode !== 'select' && cursorWorldPos) {
+        const check = evaluateBuildSpot(cursorWorldPos);
+        if (check.ok) {
+            deployStructure(check.snappedPos || cursorWorldPos);
+            return;
+        }
+    }
+
+    if (clickedBld && state.basePlaced) {
+        selectStructure(clickedBld);
+        return;
+    }
+    if (state.mode === 'select') {
+        clearAllSelection();
+        return;
+    }
+});
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (e.key === 'F2') {
+        e.preventDefault();
+        selectAllArmy();
+        return;
+    }
+    if (state.selectedBuilding && state.selectedBuilding.type === 'turret') {
+        const sel = state.selectedBuilding;
+        if (k === 'q') { state.activeTurretSlot = 'left'; renderSC2CommandCard(); return; }
+        if (k === 'w') { state.activeTurretSlot = 'top'; renderSC2CommandCard(); return; }
+        if (k === 'e') { state.activeTurretSlot = 'right'; renderSC2CommandCard(); return; }
+        if (k === 'u') { upgradeTurret(sel); return; }
+        const slotMap = { '1': 'mg', '2': 'flame', '3': 'plasma', '4': 'rocket', '5': 'shield', '6': 'sniper', '7': 'drone', '8': 'mortar', '9': 'mindcontrol', 'z': 'none' };
+        if (slotMap[k] !== undefined) {
+            const w = slotMap[k];
+            const maxPwr = sel.maxPower || 9;
+            const used = (WEAPON_COSTS[sel.weapons.left] || 0) + (WEAPON_COSTS[sel.weapons.right] || 0) + (WEAPON_COSTS[sel.weapons.top] || 0);
+            const curCost = WEAPON_COSTS[sel.weapons[state.activeTurretSlot]] || 0;
+            if (used - curCost + (WEAPON_COSTS[w] || 0) <= maxPwr) {
+                sel.weapons[state.activeTurretSlot] = w;
+                const nextEmpty = ['left', 'top', 'right'].find(s => !sel.weapons[s] || sel.weapons[s] === 'none');
+                if (nextEmpty && w !== 'none') state.activeTurretSlot = nextEmpty;
+                syncTurretPods(sel);
+                if (window.SFX) window.SFX.playClick();
+                renderSC2CommandCard();
+                updateHUD();
+            }
+            return;
+        }
+    }
+    if (state.selectedBuilding && (state.selectedBuilding.type === 'barracks' || state.selectedBuilding.type === 'factory' || state.selectedBuilding.type === 'solaris_gate' || state.selectedBuilding.type === 'solaris_robotics')) {
+        const sel = state.selectedBuilding;
+        const isB = sel.type === 'barracks';
+        const isSol = sel.type === 'solaris_gate';
+        const targetU = isSol
+            ? (k === 'q' ? 'zealot' : (k === 'w' ? 'stalker' : (k === 'e' ? 'archon' : null)))
+            : (isB
+                ? (k === 'q' ? 'grunt' : (k === 'w' ? 'ranger' : (k === 'e' ? 'medic' : (k === 'r' ? 'rocketman' : (k === 't' ? 'reaper' : (k === 'y' ? 'firebat' : (k === 'u' ? 'marauder' : null)))))))
+                : (k === 'q' ? 'tank' : (k === 'w' ? 'heli' : (k === 'e' ? 'transport' : (k === 'r' ? 'valkyrie' : (k === 't' ? 'siege_tank' : null))))));
+        if (targetU && targetU !== sel.unitType) {
+            if (targetU === 'transport' && !buildings.some(b => (b.type === 'barracks' || b.type === 'solaris_gate') && b.hp > 0)) {
+                spawnCombatFloat(sel.pos, 'BUILD INFANTRY BAY FIRST!', '#ff2a4b');
+            } else {
+                const spawnTimes = {
+                    grunt: 9.0, ranger: 10.0, medic: 10.5, rocketman: 11.5, reaper: 10.0, firebat: 11.0, marauder: 12.5,
+                    tank: 15.5, siege_tank: 18.0, heli: 14.0, transport: 14.0, valkyrie: 16.5,
+                    zealot: 10.0, stalker: 12.0, archon: 15.5
+                };
+                sel.unitType = targetU;
+                sel.spawnDuration = spawnTimes[targetU] || 10.0;
+                sel.spawnTimer = sel.spawnDuration; // Reset progress on hotkey switch!
+                spawnCombatFloat(sel.pos, `QUEUED: ${targetU.toUpperCase()}`, (isSol || sel.type === 'solaris_robotics') ? '#f5b932' : '#00e5ff');
+                renderSC2CommandCard();
+                updateHUD();
+            }
+            return;
+        }
+    }
+    if (state.selectedUnits.length > 0) {
+        if (k === 'm' || k === '1') { state.unitCommandMode = state.unitCommandMode === 'move' ? null : 'move'; renderSC2CommandCard(); return; }
+        if (k === 'a' || k === '2') {
+            const defaultDest = enemyBuildings.length > 0 ? enemyBuildings[0].pos : (enemies.length > 0 ? enemies[0].mesh.position : (state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS));
+            state.unitCommandMode = 'attack_move';
+            issueSquadOrder('attack_move', defaultDest, true);
+            return;
+        }
+        if (k === 'h' || k === '3') { issueSquadOrder('hold', null); return; }
+        if (k === 's' || k === '4') { issueSquadOrder('auto', null); return; }
+        if (k === 'f' || k === '5') {
+            if (state.selectedUnits.length > 1) {
+                formSquadImmediately();
+            } else {
+                const hiveTarget = enemyBuildings.length > 0 ? enemyBuildings[0].pos : (enemies.length > 0 ? enemies[0].mesh.position : ENEMY_BASE_POS);
+                issueSquadOrder('attack_move', hiveTarget);
+            }
+            return;
+        }
+        if (k === 'g' || k === '6') { issueSquadOrder('retreat', state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS); return; }
+        if (k === 'v' || k === '7') { cycleSquadFormation(); return; }
+        if (k === 't' || k === '8') {
+            if (state.selectedUnits.some(u => u && u.type === 'valkyrie')) toggleSelectedValkyrieMode();
+            else if (state.selectedUnits.some(u => u && u.type === 'siege_tank')) toggleSelectedSiegeTankMode();
+            return;
+        }
+        if (e.key === 'Escape') { clearAllSelection(); return; }
+    }
+    if (state.selectedBuilding && (state.selectedBuilding.type === 'tech_lab' || state.selectedBuilding.type === 'solaris_cyber_lab')) {
+        const facKey = state.selectedBuilding.type === 'solaris_cyber_lab' ? 'solaris' : 'terran';
+        if (k === 'q') { window.upgradeFactionTech('weapons', facKey, false); return; }
+        if (k === 'w') { window.upgradeFactionTech('armor', facKey, false); return; }
+        if (k === 'e') { window.upgradeFactionTech('weapons', facKey, true); return; }
+        if (k === 'r') { window.upgradeFactionTech('armor', facKey, true); return; }
+        if (k === 't') { window.toggleSquadIntelligence(); return; }
+    }
+    const isSolPlayer = (state.playerFaction === 'solaris');
+    if (k === '1' && !state.basePlaced) setMode('base');
+    if (k === '2' && state.basePlaced) setMode(isSolPlayer ? 'solaris_gate' : 'barracks');
+    if (k === '3' && state.basePlaced) setMode(isSolPlayer ? 'solaris_robotics' : 'factory');
+    if (k === '4' && state.basePlaced && !state.heroPlaced) setMode('hero');
+    if (k === '5' && state.basePlaced) setMode('turret');
+    if (k === '6' && state.basePlaced) setMode('select');
+    if (k === '7' && state.basePlaced) setMode(isSolPlayer ? 'solaris_pylon' : 'solaris_gate');
+    if (k === '8' && state.basePlaced) setMode('mine_drill');
+    if (k === '9' && state.basePlaced) setMode(isSolPlayer ? 'solaris_cyber_lab' : 'tech_lab');
+    if (e.key === 'Escape') clearAllSelection();
+});
+
+const BUILDING_FOOTPRINT_RADII = {
+    base: 3.15,
+    solaris_nexus: 3.15,
+    factory: 2.25,
+    solaris_robotics: 2.35,
+    barracks: 2.05,
+    solaris_gate: 2.15,
+    tech_lab: 2.05,
+    solaris_cyber_lab: 2.05,
+    solaris_pylon: 1.65,
+    solaris_spire: 1.48,
+    mine_drill: 1.90,
+    hero: 1.85,
+    turret: 1.32,
+    barrier: 1.05
+};
+
+// Evaluates a single candidate coordinate (x, z) for building placement (enforces Unit & Tank Pathway Exclusion Radius & Ramp Clearance!)
+function checkSingleBuildCandidate(cx, cz, mode, bRad) {
+    const isBase = (mode === 'base');
+    const isTurret = (mode === 'turret' || mode === 'solaris_pylon');
+    const isProdBuilding = (mode === 'barracks' || mode === 'factory' || mode === 'solaris_gate' || mode === 'solaris_robotics' || mode === 'base');
+    const h = getTerrainHeight(cx, cz);
+
+    // Allow building on any land, semi-flat map areas, valleys, craters & foothills (floor automatically flattens on placement), never in deep water
+    if (h < -0.24 || h > (isBase ? 10.5 : 8.5)) {
+        return { ok: false, reason: 'CANNOT BUILD IN DEEP WATER OR SHEER PEAK' };
+    }
+
+    // River & Oasis Pond exclusion
+    const riverMargin = isBase ? 0.25 : (isTurret ? 0.15 : (bRad * 0.42));
+    if (typeof isPointInValleyRiver === 'function' && isPointInValleyRiver(cx, cz, riverMargin)) {
+        return { ok: false, reason: 'CANNOT BUILD IN RIVER CHANNEL' };
+    }
+    if (typeof isPointInWaterPond === 'function' && isPointInWaterPond(cx, cz, isBase ? 0.25 : (isTurret ? 0.15 : (bRad * 0.40)))) {
+        return { ok: false, reason: 'CANNOT BUILD IN WATER POND' };
+    }
+    if (typeof isOnRiverBridge === 'function' && isOnRiverBridge(cx, cz, 0.2)) {
+        return { ok: false, reason: 'CANNOT BUILD ON RIVER BRIDGE DECK' };
+    }
+    if (getBridgeFactor(cx, cz) > 0.35 && Math.abs(getRavineSignedDist(cx, cz)) < 9.5) {
+        return { ok: false, reason: 'CANNOT BLOCK BRIDGE CAUSEWAY' };
+    }
+
+    // Bridge Walkway & Ramp Collision Exclusion Zone (for non-base structures):
+    if (!isBase) {
+        const bridgeClearMargin = isTurret ? -0.45 : (bRad * 0.35);
+        if (typeof isSpotUnderOrBlockingBridge === 'function' && isSpotUnderOrBlockingBridge(cx, cz, bridgeClearMargin)) {
+            return { ok: false, reason: 'BRIDGE WALKWAY & RAMP EXCLUSION ZONE' };
+        }
+
+        // Prevent building on Base Ramps or Merged Second Ramp Platforms so units and tanks always have an open ramp thoroughfare!
+        if (Array.isArray(window.BASE_TERRAIN_ZONES) && typeof getBaseZoneRampMetrics === 'function') {
+            for (let zIdx = 0; zIdx < window.BASE_TERRAIN_ZONES.length; zIdx++) {
+                const bz = window.BASE_TERRAIN_ZONES[zIdx];
+                if (!bz || bz.mode === 'no_ramp') continue;
+                const zm = getBaseZoneRampMetrics(bz, cx, cz);
+                if (zm.inRampAngle || zm.rampBlend > 0.22 || zm.mergedPlatformBlend > 0.28) {
+                    return { ok: false, reason: 'CANNOT BLOCK BASE RAMP / TERRACE PATHWAY' };
+                }
+            }
+        }
+    }
+
+    // Check 8 perimeter points around inner footprint so building center doesn't sit inside deep water
+    const perimRad = isBase ? (bRad * 0.35) : (isTurret ? (bRad * 0.48) : (bRad * 0.58));
+    for (let i = 0; i < 8; i++) {
+        const ang = (i / 8) * Math.PI * 2;
+        const px = cx + Math.cos(ang) * perimRad;
+        const pz = cz + Math.sin(ang) * perimRad;
+        if (getTerrainHeight(px, pz) < -0.28) {
+            return { ok: false, reason: 'FOOTPRINT EDGE OVERLAPS DEEP WATER' };
+        }
+        if (typeof isPointInValleyRiver === 'function' && isPointInValleyRiver(px, pz, 0.05)) {
+            return { ok: false, reason: 'FOOTPRINT EDGE OVERLAPS RIVER CHANNEL' };
+        }
+        if (!isBase && !isTurret && typeof isSpotUnderOrBlockingBridge === 'function' && isSpotUnderOrBlockingBridge(px, pz, -0.15)) {
+            return { ok: false, reason: 'BUILDING CORNER BLOCKS BRIDGE WALKWAY' };
+        }
+    }
+
+    if (Math.max(Math.abs(cx), Math.abs(cz)) > 103.5) return { ok: false, reason: 'OUTSIDE SECTOR BOUNDARY' };
+    if (isPointOnZergCreep(cx, cz)) return { ok: false, reason: 'INFESTED BY ZERG CREEP!' };
+
+    // Building-to-Building Anti-Merge + Unit & Tank Pathway Exclusion Radius Check:
+    // Production buildings (Barracks, War Factory, Warp Gate, Robotics Bay, Command HQ) require a wide >= 3.2m pathway corridor around them
+    // so heavy tanks and squads can always navigate cleanly between buildings without getting wedged!
+    for (let i = 0; i < buildings.length; i++) {
+        const b = buildings[i];
+        if (!b || b.hp <= 0) continue;
+        const otherRad = b.footprintRadius || BUILDING_FOOTPRINT_RADII[b.type] || 2.05;
+        const otherIsProd = (b.type === 'barracks' || b.type === 'factory' || b.type === 'solaris_gate' || b.type === 'solaris_robotics' || b.type === 'base');
+        let pathwayRadius = 1.45;
+        if (isProdBuilding && otherIsProd) {
+            pathwayRadius = 3.35; // Wide tank & squad thoroughfare between production structures!
+        } else if (isProdBuilding || otherIsProd) {
+            pathwayRadius = isTurret ? 2.25 : 2.85;
+        } else if (isTurret && (b.type === 'turret' || b.type === 'solaris_pylon')) {
+            pathwayRadius = 0.95;
+        }
+        const minClearance = bRad + otherRad + pathwayRadius;
+        if (Math.hypot(b.pos.x - cx, b.pos.z - cz) < minClearance) {
+            return {
+                ok: false,
+                reason: (isProdBuilding || otherIsProd)
+                    ? 'CANNOT OVERLAP — UNIT & TANK PATHWAY CLEARANCE REQUIRED'
+                    : 'CANNOT BUILD ON SAME PLACE — TOO CLOSE TO EXISTING STRUCTURE'
+            };
+        }
+    }
+
+    // Also maintain tank pathway clearance around Allied Solaris structures
+    if (typeof solarisBuildings !== 'undefined') {
+        for (let i = 0; i < solarisBuildings.length; i++) {
+            const sb = solarisBuildings[i];
+            if (!sb || sb.hp <= 0) continue;
+            const sbRad = sb.footprintRadius || 2.2;
+            if (Math.hypot(sb.pos.x - cx, sb.pos.z - cz) < bRad + sbRad + 2.4) {
+                return { ok: false, reason: 'CANNOT OVERLAP ALLIED SOLARIS STRUCTURE' };
+            }
+        }
+    }
+
+    // Enemy Structure Anti-Overlap Check
+    for (let i = 0; i < enemyBuildings.length; i++) {
+        const eb = enemyBuildings[i];
+        if (!eb || eb.hp <= 0) continue;
+        const ebRad = eb.footprintRadius || 2.6;
+        if (Math.hypot(eb.pos.x - cx, eb.pos.z - cz) < bRad + ebRad + 1.5) {
+            return { ok: false, reason: 'BLOCKED BY HOSTILE STRUCTURE' };
+        }
+    }
+
+    // Neutral Map Structure Anti-Overlap Check (Military Command Posts, Towns, Cargo Yards, Minivan Houses, Evacuation Camps)
+    if (!isBase && Array.isArray(window.REGISTERED_MAP_STRUCTURES)) {
+        for (let i = 0; i < window.REGISTERED_MAP_STRUCTURES.length; i++) {
+            const ms = window.REGISTERED_MAP_STRUCTURES[i];
+            if (!ms) continue;
+            if (Math.hypot(ms.x - cx, ms.z - cz) < bRad + (ms.r || 3.5) + 0.65) {
+                return { ok: false, reason: 'CANNOT OVERLAP COLONY / MILITARY BUILDING' };
+            }
+        }
+    }
+
+    // For non-Base buildings, check major impassable landmarks (Main Base and Mine Drill on Gem Craters clear/bypass mineral landmarks)
+    if (!isBase && mode !== 'mine_drill') {
+        const majorObstacleTypes = new Set(['pond', 'mineral', 'geyser', 'waterwall']);
+        const hitMajorObstacle = obstacles.some(o => {
+            if (!majorObstacleTypes.has(o.type)) return false;
+            const reqClear = o.r + (isTurret ? bRad * 0.35 : bRad * 0.55);
+            return Math.hypot(o.x - cx, o.z - cz) < reqClear;
+        });
+        if (hitMajorObstacle) {
+            return { ok: false, reason: 'BLOCKED BY MINERAL / WATER LANDMARK' };
+        }
+    }
+
+    return { ok: true };
+}
+
+function findNearestGemCrater(x, z, maxDist = 9.5) {
+    if (!Array.isArray(window.GEM_CRATERS)) return null;
+    let best = null;
+    let bestD = maxDist;
+    for (let i = 0; i < window.GEM_CRATERS.length; i++) {
+        const gc = window.GEM_CRATERS[i];
+        if (!gc) continue;
+        const d = Math.hypot(gc.x - x, gc.z - z);
+        if (d <= bestD) {
+            bestD = d;
+            best = gc;
+        }
+    }
+    return best;
+}
+
+function evaluateBuildSpot(pt) {
+    if (!pt) return { ok: false, reason: 'INVALID TARGET' };
+    const mode = state.mode;
+    const bRad = BUILDING_FOOTPRINT_RADII[mode] || 2.05;
+    const nearCrater = (mode === 'mine_drill') ? findNearestGemCrater(pt.x, pt.z, 9.5) : null;
+
+    // 1. Pre-Checks for Main Base vs Secondary Structures
+    if (mode === 'base') {
+        if (state.basePlaced) return { ok: false, reason: 'HQ ALREADY DEPLOYED' };
+        // Update closest drop-zone highlight indicator without force-locking the cursor!
+        for (let i = 0; i < BASE_PLACEMENT_BARRIERS.length; i++) {
+            const bar = BASE_PLACEMENT_BARRIERS[i];
+            if (Math.hypot(pt.x - bar.x, pt.z - bar.z) <= bar.radius + 1.5) {
+                selectedBaseBarrierId = bar.id;
+                break;
+            }
+        }
+    } else {
+        if (!state.basePlaced) return { ok: false, reason: 'DEPLOY COMMAND HQ FIRST' };
+        if (mode === 'hero' && state.heroPlaced) return { ok: false, reason: 'HERO PAD ACTIVE' };
+        if (state.req < (COSTS[mode] || 0)) return { ok: false, reason: `NEED ${COSTS[mode]} MINERALS` };
+
+        // PROTOSS KHAYDARIN PYLON POWER SOURCE REQUIREMENT:
+        // When playing as Solaris Protoss (or building Protoss structures), Warp Gates, Robotics Bays, Cyber Labs, Cannon Spires & Hero Pads
+        // MUST be placed inside the 20m psionic power matrix of an active Khaydarin Pylon (`solaris_pylon`)!
+        const isProtossPlayer = (state.playerFaction === 'solaris');
+        const requiresProtossPylonPower = isProtossPlayer && (mode === 'solaris_gate' || mode === 'solaris_robotics' || mode === 'solaris_cyber_lab' || mode === 'turret' || mode === 'hero');
+        if (requiresProtossPylonPower) {
+            const activePlayerPylons = buildings.filter(b =>
+                b && b.type === 'solaris_pylon' && b.hp > 0 && (b.buildProgress === undefined || b.buildProgress >= 1.0)
+            );
+            const activeAllyPylons = (typeof solarisBuildings !== 'undefined')
+                ? solarisBuildings.filter(sb => sb && sb.role === 'pylon' && sb.hp > 0 && (sb.buildProgress === undefined || sb.buildProgress >= 1.0))
+                : [];
+            if (activePlayerPylons.length === 0 && activeAllyPylons.length === 0) {
+                return { ok: false, reason: 'REQUIRES KHAYDARIN PYLON POWER SOURCE! BUILD PYLON [7] FIRST' };
+            }
+            const inPylonField = activePlayerPylons.some(py => Math.hypot(pt.x - py.pos.x, pt.z - py.pos.z) <= 20.5)
+                || activeAllyPylons.some(py => Math.hypot(pt.x - py.pos.x, pt.z - py.pos.z) <= 20.5);
+            if (!inPylonField) {
+                return { ok: false, reason: 'OUTSIDE KHAYDARIN PYLON POWER MATRIX (20M RADIUS)' };
+            }
+        }
+
+        // Power Field Check: allow extending power grid around HQ, around any friendly structure, OR anywhere near a Gem Crater when building a Mine Drill!
+        const maxAllowedDist = (mode === 'turret' || mode === 'mine_drill' || mode === 'solaris_pylon') ? (POWER_RADIUS + 28) : (POWER_RADIUS + 14);
+        let withinPowerGrid = !!nearCrater || (Math.hypot(pt.x - state.baseBuilding.pos.x, pt.z - state.baseBuilding.pos.z) <= maxAllowedDist);
+        if (!withinPowerGrid) {
+            withinPowerGrid = buildings.some(b => b && b.hp > 0 && Math.hypot(pt.x - b.pos.x, pt.z - b.pos.z) <= 28.0);
+        }
+        if (!withinPowerGrid) {
+            return { ok: false, reason: mode === 'mine_drill' ? 'PLACE IN POWER GRID OR ON ANY GEM CRATER' : 'OUTSIDE COMMAND POWER & FORTIFICATION RANGE' };
+        }
+    }
+
+    // 2. Direct Check at Exact Cursor Coordinate (or snapped to Gem Crater center for Mine Drill!)
+    const targetX = nearCrater ? nearCrater.x : pt.x;
+    const targetZ = nearCrater ? nearCrater.z : pt.z;
+    const directRes = checkSingleBuildCandidate(targetX, targetZ, mode, bRad);
+    if (directRes.ok) {
+        const drillLabel = nearCrater
+            ? `DEPLOY MINE DRILL ON GEM CRATER (${COSTS[mode]}M)`
+            : `DEPLOY ${mode.toUpperCase()} (${COSTS[mode]}M)`;
+        return {
+            ok: true,
+            snappedPos: new THREE.Vector3(targetX, getTerrainHeight(targetX, targetZ), targetZ),
+            reason: mode === 'base'
+                ? 'CLICK TO DEPLOY ORBITAL CITADEL HQ HERE'
+                : drillLabel
+        };
+    }
+
+    // 3. Smart Micro-Nudge Search: if cursor is slightly inside the tank pathway exclusion zone or near a river/ramp edge,
+    // automatically find the closest valid spot with full tank pathway clearance within 7.6m!
+    const nudgeRadii = [0.8, 1.6, 2.5, 3.6, 4.8, 6.2, 7.6];
+    for (let rIdx = 0; rIdx < nudgeRadii.length; rIdx++) {
+        const nr = nudgeRadii[rIdx];
+        for (let aIdx = 0; aIdx < 16; aIdx++) {
+            const ang = (aIdx / 16) * Math.PI * 2;
+            const nx = targetX + Math.cos(ang) * nr;
+            const nz = targetZ + Math.sin(ang) * nr;
+            const nudgeRes = checkSingleBuildCandidate(nx, nz, mode, bRad);
+            if (nudgeRes.ok) {
+                return {
+                    ok: true,
+                    snappedPos: new THREE.Vector3(nx, getTerrainHeight(nx, nz), nz),
+                    reason: mode === 'base'
+                        ? 'CLICK TO DEPLOY ORBITAL CITADEL HQ HERE'
+                        : `DEPLOY ${mode.toUpperCase()} (${COSTS[mode]}M · TANK LANE CLEAR)`
+                };
+            }
+        }
+    }
+
+    return { ok: false, reason: directRes.reason };
+}
+
+function deployStructure(pt) {
+    const type = state.mode;
+    state.req -= (COSTS[type] || 0);
+    if (window.SFX) window.SFX.playBuild();
+
+    const pos = pt.clone();
+    const bRad = BUILDING_FOOTPRINT_RADII[type] || 2.15;
+    const linkedCrater = (type === 'mine_drill') ? findNearestGemCrater(pos.x, pos.z, 9.5) : null;
+
+    // Clear any scatter obstacles (trees, rocks, wrecks, craters, props) overlapped by the newly deployed structure
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+        const ob = obstacles[i];
+        if (ob.type !== 'pond' && ob.type !== 'mineral' && ob.type !== 'map_boundary_barrier' && Math.hypot(ob.x - pos.x, ob.z - pos.z) < bRad + ob.r + 0.85) {
+            obstacles.splice(i, 1);
+        }
+    }
+
+    // Dynamically flatten the floor map underneath the placed building so the ground is completely flat!
+    if (typeof window.flattenTerrainUnderBuilding === 'function' && !linkedCrater) {
+        pos.y = window.flattenTerrainUnderBuilding(pos.x, pos.z, bRad + 1.15, 2.4);
+    } else {
+        pos.y = getTerrainHeight(pos.x, pos.z);
+    }
+
+    const isSolPlayer = (state.playerFaction === 'solaris');
+    const modelType = (type === 'base' && isSolPlayer)
+        ? 'solaris_nexus'
+        : ((type === 'turret' && isSolPlayer) ? 'solaris_spire' : type);
+    const mesh = createEngineeredBuilding(modelType, true);
+    mesh.position.copy(pos);
+    // Keep outer building Group at 1.0 scale so the 3D Construction Rig (Terran Crane / Protoss Warp Rift) renders at full height!
+    mesh.scale.set(1.0, 1.0, 1.0);
+    if (type !== 'base' && mesh.userData) {
+        if (mesh.userData.scaffoldGroup) mesh.userData.scaffoldGroup.visible = true;
+        if (mesh.userData.mainStructure) mesh.userData.mainStructure.scale.set(0.25, 0.08, 0.25);
+    }
+
+    scene.add(mesh);
+
+    const maxHp = BUILDING_MAX_HP[type] || 650;
+    const isSolarisStruct = (type.startsWith('solaris_') || (isSolPlayer && (type === 'base' || type === 'turret')));
+    const maxShield = isSolarisStruct ? (type === 'base' ? 1000 : (type === 'solaris_pylon' ? 400 : 550)) : 0;
+    const hb = makeHealthPip(type === 'base' ? '#00e5ff' : (isSolarisStruct ? '#f5b932' : (type === 'mine_drill' ? '#e879f9' : '#00ff66')), true);
+
+    const bObj = {
+        type, mesh, pos, hb,
+        footprintRadius: bRad,
+        hp: maxHp, // 100% full HP immediately on placement (only construction buildProgress takes time!)
+        maxHp,
+        shield: maxShield,
+        maxShield,
+        shieldRegenDelay: 0,
+        level: 1,
+        maxPower: 9,
+        buildProgress: (type === 'base') ? 1.0 : 0.02,
+        unitType: (type === 'factory' || type === 'solaris_robotics') ? 'tank' : (type === 'solaris_gate' ? 'zealot' : 'ranger'),
+        spawnDuration: (type === 'factory' || type === 'solaris_robotics') ? 15.5 : (type === 'base' ? 12.0 : (type === 'solaris_gate' ? 10.0 : 10.0)),
+        spawnTimer: (type === 'factory' || type === 'solaris_robotics') ? 15.5 : (type === 'base' ? 12.0 : (type === 'solaris_gate' ? 10.0 : 10.0)),
+        mineTimer: 2.6,
+        linkedCrater,
+        totalMinedGems: 0,
+        emptyNotified: false,
+        doorHoldTimer: 0,
+        currentYaw: 0,
+        weapons: { left: 'mg', right: 'none', top: 'none' },
+        cooldowns: { left: 0, right: 0, top: 0 }
+    };
+
+    if (type === 'turret') {
+        state.activeTurretSlot = 'top';
+        syncTurretPods(bObj);
+    }
+    buildings.push(bObj);
+
+    if (type === 'base') {
+        state.basePlaced = true;
+        state.baseBuilding = bObj;
+
+        const hBadge = document.createElement('div');
+        hBadge.style.display = 'none';
+        state.humanBadgeDom = hBadge;
+
+        const ringGeo = new THREE.BufferGeometry();
+        const pts = [];
+        for (let i = 0; i <= 120; i++) {
+            const a = (i / 120) * Math.PI * 2;
+            const rx = pos.x + Math.cos(a) * POWER_RADIUS;
+            const rz = pos.z + Math.sin(a) * POWER_RADIUS;
+            const ry = Math.max(-0.3, getTerrainHeight(rx, rz) + 0.16);
+            pts.push(new THREE.Vector3(rx, ry, rz));
+        }
+        ringGeo.setFromPoints(pts);
+        state.powerRing = new THREE.Line(ringGeo, new THREE.LineBasicMaterial({ color: isSolPlayer ? 0xf5b932 : 0x00e5ff }));
+        scene.add(state.powerRing);
+
+        if (isSolPlayer) {
+            document.getElementById('directive-ticker').innerText = "Solaris Nexus & Psionic Probes online! Warp in a Khaydarin Pylon [7] to power Warp Gates [2] & Robotics Bays [3]!";
+            setMode('solaris_pylon');
+        } else {
+            document.getElementById('directive-ticker').innerText = "Command HQ & Auto-Mining Drones online! Build Barracks [2], War Factory [3], or Mine Drill [8]!";
+            setMode('barracks');
+        }
+    }
+    else if (type === 'hero') {
+        state.heroPlaced = true;
+        spawnAlliedUnit('hero', pos);
+        setMode('select');
+    }
+    else if (type === 'turret' || type === 'barracks' || type === 'factory' || type === 'tech_lab' || type === 'solaris_gate' || type === 'solaris_robotics' || type === 'solaris_cyber_lab' || type === 'solaris_pylon' || type === 'mine_drill') {
+        if (type === 'mine_drill' && linkedCrater) {
+            if (linkedCrater.isEmpty || linkedCrater.gemsRemaining <= 0) {
+                spawnCombatFloat(pos, 'SURVEY: THIS GEM CRATER IS EMPTY! (+14M/2.6s ONLY)', '#94a3b8');
+            } else {
+                spawnCombatFloat(pos, `LOCKED ON RICH GEM CRATER (${linkedCrater.gemsRemaining} GEMS)!`, '#f0abfc');
+            }
+        }
+        selectStructure(bObj);
+    }
+
+    if (typeof updateZergCreepColors === 'function') {
+        updateZergCreepColors(creepRadius, false);
+    }
+
+    updateHUD();
+}
+
+// ============================================================================
+// AUTONOMOUS HARVESTER MINING DRONES FOR ALL 3 FACTIONS:
+//   - Terran SCV Hover-Harvester Drones
+//   - Solaris Protoss Golden Psionic Probes
+//   - Zerg Swarm Chitinous Bio-Drones
+// ============================================================================
+const miningDrones = [];
+let _miningDroneHullMat = null;
+let _miningDroneTrimMat = null;
+let _miningDroneProtossGoldMat = null;
+let _miningDroneZergChitinMat = null;
+let _miningDroneZergSacMat = null;
+let _miningDroneCargoBlueMat = null;
+let _miningDroneCargoGoldMat = null;
+let _miningDroneLaserMat = null;
+let _miningDroneZergBeamMat = null;
+
+function createAutoMiningDroneMesh(faction = 'terran') {
+    if (!_miningDroneHullMat) {
+        _miningDroneHullMat = new THREE.MeshStandardMaterial({ color: 0xd99b26, roughness: 0.38, metalness: 0.68 });
+        _miningDroneTrimMat = new THREE.MeshStandardMaterial({ color: 0x2c3644, roughness: 0.50, metalness: 0.72 });
+        _miningDroneProtossGoldMat = new THREE.MeshStandardMaterial({ color: 0xf5b932, roughness: 0.22, metalness: 0.86 });
+        _miningDroneZergChitinMat = new THREE.MeshStandardMaterial({ color: 0x5c2338, roughness: 0.52, metalness: 0.25 });
+        _miningDroneZergSacMat = new THREE.MeshStandardMaterial({
+            color: 0x65ff00, emissive: 0x38b000, emissiveIntensity: 0.75, roughness: 0.28, metalness: 0.10
+        });
+        _miningDroneCargoBlueMat = new THREE.MeshStandardMaterial({
+            color: 0x00e5ff, emissive: 0x0088cc, emissiveIntensity: 0.85, roughness: 0.15, metalness: 0.80
+        });
+        _miningDroneCargoGoldMat = new THREE.MeshStandardMaterial({
+            color: 0xffc400, emissive: 0xb46900, emissiveIntensity: 0.90, roughness: 0.15, metalness: 0.85
+        });
+        _miningDroneLaserMat = new THREE.MeshBasicMaterial({
+            color: 0x00f2ff, transparent: true, opacity: 0.82
+        });
+        _miningDroneZergBeamMat = new THREE.MeshBasicMaterial({
+            color: 0x76ff03, transparent: true, opacity: 0.82
+        });
+    }
+
+    const root = new THREE.Group();
+
+    if (faction === 'solaris') {
+        // SOLARIS PROTOSS PSIONIC PROBE: Golden-Ivory teardrop core, cyan Khaydarin eye lens & floating crescent wing-fins
+        const coreBody = new THREE.Mesh(new THREE.OctahedronGeometry(0.42, 2), _miningDroneProtossGoldMat);
+        coreBody.scale.set(0.92, 0.78, 1.25);
+        coreBody.castShadow = !IS_MOBILE;
+        root.add(coreBody);
+
+        const eyeLens = new THREE.Mesh(new THREE.SphereGeometry(0.18, 12, 10), MAT.cyanGlow || _miningDroneCargoBlueMat);
+        eyeLens.position.set(0, 0.02, 0.44);
+        root.add(eyeLens);
+
+        [-1, 1].forEach(side => {
+            const wing = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.85, 5), _miningDroneProtossGoldMat);
+            wing.position.set(side * 0.52, 0.06, -0.05);
+            wing.rotation.x = Math.PI * 0.48;
+            wing.rotation.z = -side * 0.35;
+            root.add(wing);
+        });
+    } else if (faction === 'zerg') {
+        // ZERG SWARM BIO-DRONE: Chitinous carapace, glowing green acid abdomen, curved harvesting mandibles & beating wings
+        const thorax = new THREE.Mesh(new THREE.SphereGeometry(0.38, 12, 10), _miningDroneZergChitinMat);
+        thorax.scale.set(0.95, 0.68, 1.35);
+        thorax.castShadow = !IS_MOBILE;
+        root.add(thorax);
+
+        const acidSac = new THREE.Mesh(new THREE.SphereGeometry(0.28, 10, 8), _miningDroneZergSacMat);
+        acidSac.position.set(0, 0.08, -0.36);
+        acidSac.scale.set(1.0, 0.85, 1.25);
+        root.add(acidSac);
+
+        [-1, 1].forEach(side => {
+            const mandible = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.48, 6), _miningDroneZergChitinMat);
+            mandible.position.set(side * 0.22, -0.05, 0.54);
+            mandible.rotation.x = Math.PI * 0.46;
+            mandible.rotation.z = side * 0.28;
+            const wing = new THREE.Mesh(
+                new THREE.BoxGeometry(0.62, 0.02, 0.28),
+                new THREE.MeshBasicMaterial({ color: 0xa3e635, transparent: true, opacity: 0.55 })
+            );
+            wing.position.set(side * 0.42, 0.22, -0.04);
+            wing.rotation.z = side * 0.25;
+            root.add(mandible, wing);
+        });
+    } else {
+        // TERRAN DOMINION SCV HOVER-HARVESTER DRONE
+        const hull = new THREE.Mesh(
+            typeof createExtrudedArmorHullGeo === 'function'
+                ? createExtrudedArmorHullGeo(0.82, 0.34, 1.12, 0.04, 0.08)
+                : new THREE.BoxGeometry(0.82, 0.34, 1.12),
+            _miningDroneHullMat
+        );
+        hull.castShadow = !IS_MOBILE;
+        root.add(hull);
+
+        const visor = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.16, 0.32), MAT.cyanGlow || _miningDroneCargoBlueMat);
+        visor.position.set(0, 0.06, 0.48);
+        const cutterArm = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.07, 0.48, 8).rotateX(Math.PI / 2), _miningDroneTrimMat);
+        cutterArm.position.set(0, -0.06, 0.66);
+        root.add(visor, cutterArm);
+
+        [-0.48, 0.48].forEach(sx => {
+            const pod = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.16, 0.68, 8).rotateX(Math.PI / 2), _miningDroneTrimMat);
+            pod.position.set(sx, -0.02, -0.05);
+            const exhaust = new THREE.Mesh(new THREE.CircleGeometry(0.11, 8), MAT.cyanGlow || _miningDroneCargoBlueMat);
+            exhaust.position.set(sx, -0.04, -0.40);
+            exhaust.rotation.y = Math.PI;
+            root.add(pod, exhaust);
+        });
+    }
+
+    // Harvested Mineral Crystal Cargo Pod (visible when returning to Base/Nexus/Citadel with resources!)
+    const cargoCrystal = new THREE.Mesh(new THREE.OctahedronGeometry(0.26, 0), _miningDroneCargoBlueMat);
+    cargoCrystal.scale.set(0.95, 1.25, 1.35);
+    cargoCrystal.position.set(0, 0.34, -0.06);
+    cargoCrystal.visible = false;
+    root.add(cargoCrystal);
+
+    // Active Mining Laser / Psionic Phase Beam / Bio-Extraction Tendril
+    const beamGeo = new THREE.CylinderGeometry(0.035, 0.065, 1.0, 8);
+    beamGeo.translate(0, 0.5, 0);
+    beamGeo.rotateX(Math.PI / 2);
+    const laserBeam = new THREE.Mesh(
+        beamGeo,
+        faction === 'zerg' ? _miningDroneZergBeamMat : _miningDroneLaserMat
+    );
+    laserBeam.position.set(0, -0.05, 0.68);
+    laserBeam.visible = false;
+    root.add(laserBeam);
+
+    root.userData = { cargoCrystal, laserBeam, faction };
+    return root;
+}
+
+function findBestMineralPatchForDrone(basePos, slotIdx) {
+    const patches = Array.isArray(window.MINERAL_PATCHES) ? window.MINERAL_PATCHES : [];
+    const activePatches = patches.filter(p => p && !p.isDepleted && (p.mineralsRemaining === undefined || p.mineralsRemaining > 0));
+    const pool = activePatches.length > 0 ? activePatches : patches;
+    if (pool.length === 0) {
+        const ang = (slotIdx % 2 === 0 ? -0.65 : 0.65) + Math.PI;
+        return {
+            x: basePos.x + Math.cos(ang) * 10.5,
+            z: basePos.z + Math.sin(ang) * 10.5,
+            isGold: (slotIdx % 2 === 1)
+        };
+    }
+    const sorted = pool
+        .slice()
+        .sort((a, b) => Math.hypot(a.x - basePos.x, a.z - basePos.z) - Math.hypot(b.x - basePos.x, b.z - basePos.z));
+    const pickPoolCount = Math.min(4, sorted.length);
+    return sorted[slotIdx % pickPoolCount] || sorted[0];
+}
+
+function clearAutoMiningDrones() {
+    while (miningDrones.length > 0) {
+        const d = miningDrones.pop();
+        if (d && d.mesh) scene.remove(d.mesh);
+        if (d && d.repairBeam) scene.remove(d.repairBeam);
+    }
+}
+
+function syncAndUpdateAutoMiningDrones(dt) {
+    if (state.missionWon) {
+        if (miningDrones.length > 0) clearAutoMiningDrones();
+        return;
+    }
+
+    // Build target roster of mining drones across Player Base, Solaris Protoss Nexus, and Zerg Leviathan Citadel:
+    const desiredRoster = [];
+
+    // 1. Player Base Mining Workers (Terran SCV Drones or Solaris Protoss Probes depending on playerFaction)
+    if (state.basePlaced && state.baseBuilding && state.baseBuilding.hp > 0) {
+        const pFaction = state.playerFaction === 'solaris' ? 'solaris' : 'terran';
+        const activeDrills = buildings.filter(b => b && b.type === 'mine_drill' && b.hp > 0 && (b.buildProgress === undefined || b.buildProgress >= 1.0)).length;
+        const playerDroneCount = Math.min(4, 2 + activeDrills);
+        for (let s = 0; s < playerDroneCount; s++) {
+            desiredRoster.push({ ownerKey: `player_${s}`, ownerType: 'player', faction: pFaction, slotIdx: s, getHomePos: () => state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS });
+        }
+    }
+
+    // 2. Allied Solaris Protoss Enclave Probes (2 Golden Psionic Probes harvesting minerals into the Solaris Nexus)
+    const solNexus = (typeof solarisBuildings !== 'undefined')
+        ? solarisBuildings.find(sb => sb && sb.role === 'nexus' && sb.hp > 0)
+        : null;
+    if (solNexus) {
+        for (let s = 0; s < 2; s++) {
+            desiredRoster.push({ ownerKey: `solaris_${s}`, ownerType: 'solaris', faction: 'solaris', slotIdx: s, getHomePos: () => solNexus.pos });
+        }
+    }
+
+    // 3. Enemy Zerg Hive Cluster Bio-Drones (2 Chitinous Zerg Bio-Drones harvesting minerals into the Zerg Citadel)
+    const zergCitadel = enemyBuildings.find(eb => eb && eb.role === 'citadel' && eb.hp > 0);
+    if (zergCitadel) {
+        for (let s = 0; s < 2; s++) {
+            desiredRoster.push({ ownerKey: `zerg_${s}`, ownerType: 'zerg', faction: 'zerg', slotIdx: s, getHomePos: () => zergCitadel.pos });
+        }
+    }
+
+    // Remove drones whose home base was destroyed or whose faction changed
+    for (let i = miningDrones.length - 1; i >= 0; i--) {
+        const existing = miningDrones[i];
+        const matchSpec = desiredRoster.find(r => r.ownerKey === existing.ownerKey && r.faction === existing.faction);
+        if (!matchSpec) {
+            if (existing.mesh) scene.remove(existing.mesh);
+            if (existing.repairBeam) scene.remove(existing.repairBeam);
+            miningDrones.splice(i, 1);
+        } else {
+            existing.getHomePos = matchSpec.getHomePos;
+        }
+    }
+
+    // Spawn any missing drones for Player, Solaris Protoss, or Zerg Swarm
+    for (let i = 0; i < desiredRoster.length; i++) {
+        const spec = desiredRoster[i];
+        if (miningDrones.some(d => d.ownerKey === spec.ownerKey)) continue;
+        const homePos = spec.getHomePos();
+        const mesh = createAutoMiningDroneMesh(spec.faction);
+        const spawnAng = (spec.slotIdx / 4) * Math.PI * 2;
+        const sx = homePos.x + Math.cos(spawnAng) * 2.8;
+        const sz = homePos.z + Math.sin(spawnAng) * 2.8;
+        const sy = getTerrainHeight(sx, sz) + 2.05;
+        mesh.position.set(sx, sy, sz);
+        scene.add(mesh);
+
+        let repairBeam = null;
+        if (spec.ownerType !== 'zerg' && typeof window.createRepairBeamAssembly === 'function') {
+            repairBeam = window.createRepairBeamAssembly();
+            scene.add(repairBeam);
+        }
+
+        miningDrones.push({
+            ownerKey: spec.ownerKey,
+            ownerType: spec.ownerType,
+            faction: spec.faction,
+            slotIdx: spec.slotIdx,
+            getHomePos: spec.getHomePos,
+            mesh,
+            repairBeam,
+            state: 'to_mineral',
+            targetPatch: findBestMineralPatchForDrone(homePos, spec.slotIdx),
+            timer: 0,
+            sparkTimer: 0,
+            carryingGold: false,
+            bobPhase: i * 1.5
+        });
+    }
+
+    // Update all active mining & field-repair SCV drones across the map
+    for (let i = 0; i < miningDrones.length; i++) {
+        const d = miningDrones[i];
+        if (!d || !d.mesh) continue;
+        const basePos = d.getHomePos ? d.getHomePos() : PLAYER_START_POS;
+        d.bobPhase += dt * 4.2;
+
+        if (!d.targetPatch || d.targetPatch.isDepleted) {
+            d.targetPatch = findBestMineralPatchForDrone(basePos, d.slotIdx);
+        }
+
+        const ud = d.mesh.userData || {};
+        const pos = d.mesh.position;
+
+        // Check if a friendly Mechanical Unit (Tank, Siege Tank, Gunship, Dropship, Valkyrie, Stalker) or Building near this SCV needs emergency Nano-Weld Repair!
+        let mechRepairTarget = null;
+        if (d.ownerType === 'player' || d.ownerType === 'solaris') {
+            let bestRatio = 0.995;
+            for (let ui = 0; ui < units.length; ui++) {
+                const u = units[ui];
+                if (!u || !u.isMechanical || u.hp <= 0 || u.hp >= u.maxHp || !u.mesh) continue;
+                const dToDrone = Math.hypot(u.mesh.position.x - pos.x, u.mesh.position.z - pos.z);
+                const dToBase = Math.hypot(u.mesh.position.x - basePos.x, u.mesh.position.z - basePos.z);
+                if (dToDrone <= 18.0 || dToBase <= 26.0) {
+                    const r = u.hp / u.maxHp;
+                    if (r < bestRatio) {
+                        bestRatio = r;
+                        mechRepairTarget = u;
+                    }
+                }
+            }
+            if (!mechRepairTarget && d.slotIdx === 0) {
+                for (let bi = 0; bi < buildings.length; bi++) {
+                    const b = buildings[bi];
+                    if (!b || b.hp <= 0 || b.hp >= b.maxHp) continue;
+                    if (Math.hypot(b.pos.x - basePos.x, b.pos.z - basePos.z) <= 24.0) {
+                        const r = b.hp / b.maxHp;
+                        if (r < bestRatio) {
+                            bestRatio = r;
+                            mechRepairTarget = b;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (mechRepairTarget) {
+            // SCV / Repair Drone actively patches up damaged mechanical unit with 3D Visual Welding Beam!
+            if (ud.cargoCrystal) ud.cargoCrystal.visible = false;
+            const tWorldBase = mechRepairTarget.mesh ? mechRepairTarget.mesh.position : mechRepairTarget.pos;
+            const targetAlt = mechRepairTarget.isAir ? tWorldBase.y : (getTerrainHeight(tWorldBase.x, tWorldBase.z) + 0.85);
+            const tWorld = new THREE.Vector3(tWorldBase.x, targetAlt, tWorldBase.z);
+
+            const dx = tWorld.x - pos.x;
+            const dz = tWorld.z - pos.z;
+            const dist = Math.hypot(dx, dz);
+            d.mesh.rotation.y = Math.atan2(dx, dz);
+
+            if (dist > 3.15) {
+                const moveStep = Math.min(dist - 2.6, 10.5 * dt);
+                pos.x += (dx / dist) * moveStep;
+                pos.z += (dz / dist) * moveStep;
+            }
+            const groundY = getTerrainHeight(pos.x, pos.z);
+            const desiredHoverY = mechRepairTarget.isAir ? Math.max(groundY + 2.2, tWorld.y - 0.35) : (groundY + 2.05 + Math.sin(d.bobPhase * 1.6) * 0.10);
+            pos.y = THREE.MathUtils.lerp(pos.y, desiredHoverY, Math.min(1, dt * 8));
+
+            if (dist <= 6.5) {
+                mechRepairTarget.hp = Math.min(mechRepairTarget.maxHp, mechRepairTarget.hp + 28 * dt);
+                mechRepairTarget.isBeingRepairedTimer = 0.55;
+                if (mechRepairTarget.hb) {
+                    updateHealthPip(mechRepairTarget.hb, mechRepairTarget.hp, mechRepairTarget.maxHp, mechRepairTarget.shield || 0, mechRepairTarget.maxShield || 0);
+                }
+                if (
+                    window.PORTRAIT_3D_VIEWER &&
+                    typeof window.PORTRAIT_3D_VIEWER.setRepairing === 'function' &&
+                    (state.selectedUnits.includes(mechRepairTarget) || state.selectedBuilding === mechRepairTarget)
+                ) {
+                    window.PORTRAIT_3D_VIEWER.setRepairing(true, 0.75);
+                }
+
+                const emitterStart = pos.clone().add(new THREE.Vector3(Math.sin(d.mesh.rotation.y) * 0.45, -0.05, Math.cos(d.mesh.rotation.y) * 0.45));
+                if (d.repairBeam && typeof window.updateRepairBeamAssembly === 'function') {
+                    window.updateRepairBeamAssembly(d.repairBeam, emitterStart, tWorld, dt);
+                }
+                if (ud.laserBeam) {
+                    ud.laserBeam.visible = true;
+                    const beamDist = Math.max(0.4, emitterStart.distanceTo(tWorld));
+                    ud.laserBeam.scale.set(0.95 + Math.sin(d.bobPhase * 6) * 0.25, 0.95 + Math.cos(d.bobPhase * 6) * 0.25, beamDist);
+                    ud.laserBeam.rotation.x = Math.atan2(pos.y - tWorld.y, Math.max(0.2, dist));
+                }
+
+                d.sparkTimer -= dt;
+                if (d.sparkTimer <= 0) {
+                    d.sparkTimer = 0.42;
+                    if (typeof spawnNanoWeldSparkFX === 'function' && window.isWorldPosInViewport && window.isWorldPosInViewport(tWorld.x, tWorld.y, tWorld.z, 4.5)) {
+                        spawnNanoWeldSparkFX(tWorld);
+                    }
+                }
+            } else if (d.repairBeam) {
+                d.repairBeam.visible = false;
+            }
+        } else {
+            if (d.repairBeam) d.repairBeam.visible = false;
+
+            if (d.state === 'to_mineral') {
+                if (ud.laserBeam) ud.laserBeam.visible = false;
+                if (ud.cargoCrystal) ud.cargoCrystal.visible = false;
+
+                const tx = d.targetPatch.x;
+                const tz = d.targetPatch.z;
+                const dx = tx - pos.x;
+                const dz = tz - pos.z;
+                const dist = Math.hypot(dx, dz);
+
+                if (dist <= 2.15) {
+                    d.state = 'mining';
+                    d.timer = 3.6;
+                    d.carryingGold = Boolean(d.targetPatch.isGold);
+                } else {
+                    const moveStep = Math.min(dist, 6.8 * dt);
+                    pos.x += (dx / dist) * moveStep;
+                    pos.z += (dz / dist) * moveStep;
+                    d.mesh.rotation.y = Math.atan2(dx, dz);
+                }
+                const groundY = getTerrainHeight(pos.x, pos.z);
+                pos.y = THREE.MathUtils.lerp(pos.y, groundY + 2.05 + Math.sin(d.bobPhase) * 0.12, Math.min(1, dt * 8));
+            } else if (d.state === 'mining') {
+                const tx = d.targetPatch.x;
+                const tz = d.targetPatch.z;
+                const ty = getTerrainHeight(tx, tz) + 0.65;
+                d.mesh.rotation.y = Math.atan2(tx - pos.x, tz - pos.z);
+                const groundY = getTerrainHeight(pos.x, pos.z);
+                pos.y = groundY + 1.85 + Math.sin(d.bobPhase * 1.5) * 0.08;
+
+                if (ud.laserBeam) {
+                    ud.laserBeam.visible = true;
+                    const beamDist = Math.max(0.5, Math.hypot(tx - pos.x, ty - pos.y, tz - pos.z) - 0.55);
+                    ud.laserBeam.scale.set(0.85 + Math.sin(d.bobPhase * 5) * 0.25, 0.85 + Math.cos(d.bobPhase * 5) * 0.25, beamDist);
+                    ud.laserBeam.rotation.x = Math.atan2(pos.y - ty, Math.hypot(tx - pos.x, tz - pos.z));
+                }
+
+                d.sparkTimer -= dt;
+                if (d.sparkTimer <= 0) {
+                    d.sparkTimer = 0.55;
+                    if (typeof spawnNanoWeldSparkFX === 'function' && window.isWorldPosInViewport && window.isWorldPosInViewport(tx, ty, tz, 4.0)) {
+                        spawnNanoWeldSparkFX(new THREE.Vector3(tx, ty, tz));
+                    }
+                }
+
+                d.timer -= dt;
+                if (d.timer <= 0) {
+                    const harvestAmt = state.elapsedSec < 90.0 ? (d.carryingGold ? 15 : 10) : (d.carryingGold ? 20 : 14);
+                    if (d.targetPatch && typeof window.depleteMineralPatch === 'function') {
+                        window.depleteMineralPatch(d.targetPatch, harvestAmt);
+                    }
+                    d.state = 'to_base';
+                    if (ud.laserBeam) ud.laserBeam.visible = false;
+                    if (ud.cargoCrystal) {
+                        ud.cargoCrystal.visible = true;
+                        ud.cargoCrystal.material = d.carryingGold ? _miningDroneCargoGoldMat : _miningDroneCargoBlueMat;
+                    }
+                }
+            } else if (d.state === 'to_base') {
+                if (ud.laserBeam) ud.laserBeam.visible = false;
+                if (ud.cargoCrystal) ud.cargoCrystal.visible = true;
+
+                const dx = basePos.x - pos.x;
+                const dz = basePos.z - pos.z;
+                const dist = Math.hypot(dx, dz);
+
+                if (dist <= 2.95) {
+                    const yieldAmt = state.elapsedSec < 90.0 ? (d.carryingGold ? 15 : 10) : (d.carryingGold ? 20 : 14);
+                    if (d.ownerType === 'player') {
+                        state.req += yieldAmt;
+                        updateHUD();
+                    } else if (d.ownerType === 'solaris') {
+                        state.solarisBuildTimer = Math.max(3.5, (state.solarisBuildTimer || 18.0) - 0.55);
+                    } else if (d.ownerType === 'zerg') {
+                        state.enemyBuildTimer = Math.max(4.0, (state.enemyBuildTimer || 20.0) - 0.50);
+                    }
+                    if (ud.cargoCrystal) ud.cargoCrystal.visible = false;
+                    d.targetPatch = findBestMineralPatchForDrone(basePos, d.slotIdx);
+                    d.state = 'to_mineral';
+                } else {
+                    const moveStep = Math.min(dist, 6.8 * dt);
+                    pos.x += (dx / dist) * moveStep;
+                    pos.z += (dz / dist) * moveStep;
+                    d.mesh.rotation.y = Math.atan2(dx, dz);
+                }
+                const groundY = getTerrainHeight(pos.x, pos.z);
+                pos.y = THREE.MathUtils.lerp(pos.y, groundY + 2.15 + Math.sin(d.bobPhase) * 0.12, Math.min(1, dt * 8));
+            }
+        }
+
+        const inView = window.isWorldPosInViewport ? window.isWorldPosInViewport(pos.x, pos.y, pos.z, 4.5) : true;
+        d.mesh.visible = inView && (d.ownerType !== 'zerg' || isWorldPosVisible(pos.x, pos.z));
+    }
+}
+
+function switchToEndlessMode() {
+    document.getElementById('victory-modal').style.display = 'none';
+    state.isEndless = true;
+    state.missionWon = false;
+
+    enemyBuildings.forEach(eb => {
+        scene.remove(eb.mesh);
+        if (eb.badge) eb.badge.remove();
+        if (eb.hb) eb.hb.root.remove();
+    });
+    enemyBuildings.length = 0;
+    state.enemyBase = null;
+    recallAllFriendlyUnitsToMainBase();
+
+    creepTargetRadius = 0;
+    const btnEndless = document.getElementById('btn-toggle-endless');
+    if (btnEndless) btnEndless.style.display = 'none';
+    document.getElementById('mode-badge').innerText = 'ENDLESS';
+    document.getElementById('directive-ticker').innerText = `ENDLESS WAVE #${state.wave}: Survive infinite waves!`;
+    updateHUD();
+}
+
+function getWaveStrengthMultiplier() {
+    return +(1 + (state.wave - 1) * (state.isEndless ? 0.38 : 0.25)).toFixed(1);
+}
+
+let _lastHudUpdateMs = 0;
+function updateHUD(force = false) {
+    const nowMs = performance.now();
+    if (!force && nowMs - _lastHudUpdateMs < 180) return;
+    _lastHudUpdateMs = nowMs;
+
+    document.getElementById('ui-req').innerText = state.req;
+    const gemsEl = document.getElementById('ui-gems');
+    if (gemsEl) gemsEl.innerText = state.gems || 0;
+    document.getElementById('ui-supply').innerText = units.length;
+
+    const mins = Math.floor(state.elapsedSec / 60);
+    const secs = Math.floor(state.elapsedSec % 60);
+    const clockEl = document.getElementById('ui-clock');
+    if (clockEl) {
+        clockEl.innerText = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+
+    document.getElementById('ui-wave').innerText = state.wave;
+    document.getElementById('ui-scale').innerText = `${getWaveStrengthMultiplier()}x`;
+
+    const wfBox = document.getElementById('wireframe-box');
+    const wfText = document.getElementById('wireframe-hp-text');
+
+    if (state.selectedUnits.length > 1) {
+        renderMultiUnitSelectionGrid();
+        return;
+    }
+
+    if (state.selectedUnits.length === 1) {
+        const u = state.selectedUnits[0];
+        const ratio = Math.max(0, u.hp / u.maxHp);
+        const col = ratio > 0.6 ? '#00ff66' : (ratio > 0.3 ? '#ffaa00' : '#ff2a4b');
+        const svgContainer = document.getElementById('wireframe-svg');
+        if (svgContainer) svgContainer.outerHTML = getWireframeSvgMarkup(u.type, col).replace('<svg ', '<svg id="wireframe-svg" ');
+        renderWireframeHpBlocks(ratio, col);
+        wfText.style.color = col;
+        wfText.innerText = `${Math.max(0, Math.ceil(u.hp))}/${u.maxHp}`;
+        document.getElementById('stat-order').innerText = (u.order || 'auto').toUpperCase();
+        return;
+    }
+
+    const sel = state.selectedBuilding;
+    if (sel) {
+        const ratio = Math.max(0, sel.hp / sel.maxHp);
+        const pct = Math.round(ratio * 100);
+        const col = ratio > 0.6 ? '#00ff66' : (ratio > 0.3 ? '#ffaa00' : '#ff2a4b');
+        const svgContainer = document.getElementById('wireframe-svg');
+        if (svgContainer) svgContainer.outerHTML = getWireframeSvgMarkup(sel.type, col).replace('<svg ', '<svg id="wireframe-svg" ');
+        renderWireframeHpBlocks(ratio, col);
+        wfText.style.color = col;
+        wfText.innerText = sel.type === 'base' ? 'ONLINE' : `${Math.max(0, Math.floor(sel.hp))} (${pct}%)`;
+        const isUnderConstruction = (sel.buildProgress !== undefined && sel.buildProgress < 1.0);
+        if (isUnderConstruction) {
+            const buildPct = Math.min(99, Math.max(1, Math.round(sel.buildProgress * 100)));
+            const isProtossBld = sel.type.startsWith('solaris_') || state.playerFaction === 'solaris';
+            document.getElementById('prod-unit-name').innerText = isProtossBld
+                ? `WARPING IN STRUCTURE... (${buildPct}%)`
+                : `CONSTRUCTING STRUCTURE... (${buildPct}%)`;
+            document.getElementById('prod-pct').innerText = `${buildPct}%`;
+            document.getElementById('prod-bar-fill').style.width = `${buildPct}%`;
+        } else if (sel.type === 'barracks' || sel.type === 'factory' || sel.type === 'solaris_gate' || sel.type === 'solaris_robotics') {
+            const p = Math.min(100, Math.max(0, Math.round((1 - sel.spawnTimer / sel.spawnDuration) * 100)));
+            const uLabel = (sel.unitType || 'ranger').toUpperCase();
+            const isProtossProd = (sel.type === 'solaris_gate' || sel.type === 'solaris_robotics');
+            document.getElementById('prod-unit-name').innerText = isProtossProd ? `WARPING IN: ${uLabel}` : `TRAINING: ${uLabel}`;
+            document.getElementById('prod-pct').innerText = `${p}%`;
+            document.getElementById('prod-bar-fill').style.width = `${p}%`;
+        }
+    } else if (wfBox) {
+        const svgContainer = document.getElementById('wireframe-svg');
+        if (svgContainer) svgContainer.outerHTML = getWireframeSvgMarkup('base', '#00ff66').replace('<svg ', '<svg id="wireframe-svg" ');
+        renderWireframeHpBlocks(1.0, '#00ff66');
+        wfText.style.color = '#00ff66';
+    }
+
+    const ticker = document.getElementById('directive-ticker');
+    if (ticker && !state.missionWon) {
+        if (!state.basePlaced) {
+            ticker.innerText = "Deploy Command HQ on flat ground, or drag a box to select units.";
+            ticker.style.color = "#00e5ff";
+        } else if (state.rushGraceTimer > 0 && !state.isEndless) {
+            ticker.innerText = `RECON PHASE: Enemy air wing awakening in 00:${String(Math.ceil(state.rushGraceTimer)).padStart(2, '0')} — Establish defenses!`;
+            ticker.style.color = "#ffaa00";
+        } else if (!state.isEndless) {
+            ticker.innerText = `PRIMARY OBJECTIVE: Destroy all ${enemyBuildings.length} Zerg Hive Cluster structures across Sector-09.`;
+            ticker.style.color = "#00e5ff";
+        }
+    }
+}
+renderSC2CommandCard();
+updateFogOfWarVision();
+renderTacticalMinimap();
+
+// ============================================================================
+// 8. SPAWNERS WITH BIOLOGICAL VS MECHANICAL TAGS, SELECTION RINGS & COLLISION
+// ============================================================================
+const _projScreenVec = new THREE.Vector3();
+function projectToScreen(dom, pos, yOff = 1.3) {
+    if (!dom || !pos) return;
+    _projScreenVec.set(pos.x, pos.y + yOff, pos.z);
+    _projScreenVec.project(camera);
+    if (_projScreenVec.z > 1 || _projScreenVec.x < -1.08 || _projScreenVec.x > 1.08 || _projScreenVec.y < -1.08 || _projScreenVec.y > 1.08) {
+        if (dom.style.display !== 'none') dom.style.display = 'none';
+        return;
+    }
+    if (dom.style.display !== 'block') dom.style.display = 'block';
+    const lx = Math.round((_projScreenVec.x * 0.5 + 0.5) * window.innerWidth);
+    const ly = Math.round((-(_projScreenVec.y * 0.5) + 0.5) * window.innerHeight);
+    if (dom._lastLx !== lx) { dom._lastLx = lx; dom.style.left = `${lx}px`; }
+    if (dom._lastLy !== ly) { dom._lastLy = ly; dom.style.top = `${ly}px`; }
+}
+
+let _activeCombatFloats = 0;
+let _lastCombatFloatMs = 0;
+function spawnCombatFloat(pos, txt, color = '#ffaa00') {
+    const nowMs = performance.now();
+    if (_activeCombatFloats >= 14 || (nowMs - _lastCombatFloatMs < 70 && _activeCombatFloats >= 6)) return;
+    // Suppress non-numeric floating action/status text popups (e.g. Valkyrie mode switches, queued unit labels, orders)
+    if (typeof txt !== 'number') {
+        const str = String(txt || '').trim();
+        if (!/^[+-]?\d+(\s*CRIT|\s*HP)?$/i.test(str)) return;
+    }
+    if (!pos || !isWorldPosVisible(pos.x, pos.z)) return;
+    _projScreenVec.set(pos.x, pos.y + 1.0, pos.z).project(camera);
+    if (_projScreenVec.z > 1) return;
+    _lastCombatFloatMs = nowMs;
+    _activeCombatFloats++;
+    const el = document.createElement('div');
+    el.className = 'combat-float';
+    el.style.color = color;
+    el.innerText = typeof txt === 'number' ? `-${Math.round(txt)}` : txt;
+    el.style.left = `${(_projScreenVec.x * 0.5 + 0.5) * window.innerWidth + (Math.random()-0.5)*18}px`;
+    el.style.top = `${(-(_projScreenVec.y * 0.5) + 0.5) * window.innerHeight}px`;
+    worldUi.appendChild(el);
+    setTimeout(() => {
+        el.remove();
+        _activeCombatFloats = Math.max(0, _activeCombatFloats - 1);
+    }, 650);
+}
+
+const healBeamGeo = createSculptedLatheBarrelGeo(0.035, 0.035, 1, 8);
+healBeamGeo.rotateX(Math.PI / 2);
+
+// Smooth 6-DOF Air Vehicle Flight Controller (with 3.0-second smooth VTOL liftoff climb for Valkyrie!)
+function smoothAirVehicleTransform(actor, targetX, targetZ, desiredAlt, isMoving, dt) {
+    const pos = actor.mesh.position;
+    const groundH = Math.max(0, getTerrainHeight(pos.x, pos.z));
+    if (actor.type === 'valkyrie' && actor.mesh && actor.mesh.userData && typeof actor.mesh.userData.mechTransition === 'number') {
+        const mt = actor.mesh.userData.mechTransition;
+        const smoothFlightT = 1.0 - (mt * mt * (3.0 - 2.0 * mt));
+        const targetAltY = groundH + desiredAlt * smoothFlightT;
+        pos.y = THREE.MathUtils.lerp(pos.y, targetAltY, Math.min(1, dt * 6.5));
+    } else {
+        pos.y = THREE.MathUtils.lerp(pos.y, groundH + desiredAlt, dt * 4.2);
+    }
+
+    const dx = targetX - pos.x;
+    const dz = targetZ - pos.z;
+    const horizDistSq = dx * dx + dz * dz;
+
+    if (actor.currentYaw === undefined) {
+        actor.currentYaw = actor.mesh.rotation.y || 0;
+        actor.currentPitch = 0;
+        actor.currentRoll = 0;
+    }
+
+    let angleDiff = 0;
+    if (horizDistSq > 0.04) {
+        const desiredYaw = Math.atan2(dx, dz);
+        angleDiff = shortestAngleDiff(actor.currentYaw, desiredYaw);
+        const turnRate = actor.type === 'transport' ? 2.4 : (actor.variant === 'mutalisk' ? 3.6 : 3.2);
+        const maxTurnStep = turnRate * dt;
+        if (Math.abs(angleDiff) <= maxTurnStep) {
+            actor.currentYaw = desiredYaw;
+        } else {
+            actor.currentYaw += Math.sign(angleDiff) * maxTurnStep;
+        }
+    }
+
+    // Smooth aerodynamic roll banking into turns + forward pitch tilt while moving
+    const targetRoll = isMoving ? Math.max(-0.38, Math.min(0.38, -angleDiff * 0.48)) : 0;
+    const targetPitch = isMoving ? (actor.type === 'transport' ? 0.10 : 0.16) : 0;
+    actor.currentRoll = THREE.MathUtils.lerp(actor.currentRoll || 0, targetRoll, dt * 6.0);
+    actor.currentPitch = THREE.MathUtils.lerp(actor.currentPitch || 0, targetPitch, dt * 5.0);
+
+    actor.mesh.rotation.order = 'YXZ';
+    actor.mesh.rotation.y = actor.currentYaw;
+    actor.mesh.rotation.x = actor.currentPitch;
+    actor.mesh.rotation.z = actor.currentRoll;
+
+    // Rotor downwash triggers subtle concentric ripples when hovering over uncovered water ponds (never over bridges)!
+    actor.waterWashTimer = (actor.waterWashTimer || 0) - dt;
+    if (actor.waterWashTimer <= 0 && typeof triggerWaterRippleFX === 'function') {
+        actor.waterWashTimer = 0.55;
+        if (!(typeof isOnRiverBridge === 'function' && isOnRiverBridge(pos.x, pos.z, 0.8))) {
+            triggerWaterRippleFX(pos.x, pos.z, 0.50, false);
+        }
+    }
+}
+
+const MAX_ALLIED_UNITS = 40;
+const MAX_ENEMY_UNITS = 54;
+
+function spawnAlliedUnit(uType, spawnOrigin) {
+    if (uType !== 'hero' && units.length >= MAX_ALLIED_UNITS) return;
+    const statsMap = {
+        grunt:     { hp: 255, dmg: 38, rng: 1.95, spd: 4.7, rate: 0.42, rad: 0.52, col: '#00ff66' },
+        ranger:    { hp: 125, dmg: 25, rng: 9.0,  spd: 3.5, rate: 0.58, rad: 0.48, col: '#00ff66' },
+        medic:     { hp: 140, dmg: 0,  rng: 6.8,  spd: 3.8, rate: 0.25, rad: 0.48, col: '#00e5ff' },
+        rocketman: { hp: 155, dmg: 46, rng: 15.5, spd: 3.9, rate: 1.25, rad: 0.52, col: '#ffaa00' },
+        reaper:    { hp: 145, dmg: 24, rng: 9.5,  spd: 6.6, rate: 0.34, rad: 0.48, col: '#ffaa00' },
+        firebat:   { hp: 265, dmg: 38, rng: 5.5,  spd: 4.1, rate: 0.48, rad: 0.54, col: '#ff5500' },
+        marauder:  { hp: 315, dmg: 54, rng: 11.5, spd: 3.6, rate: 0.92, rad: 0.58, col: '#ffaa00' },
+        hero:      { hp: 750, dmg: 48, rng: 10.5, spd: 4.5, rate: 0.24, rad: 0.65, col: '#ffaa00' },
+        tank:      { hp: 620, dmg: 90, rng: 15.0, spd: 2.9, rate: 2.00, rad: 1.15, col: '#00e5ff' },
+        siege_tank:{ hp: 680, dmg: 85, rng: 14.0, spd: 2.6, rate: 1.85, rad: 1.22, col: '#00e5ff' },
+        heli:      { hp: 360, dmg: 40, rng: 13.0, spd: 6.5, rate: 0.52, rad: 0.95, col: '#00e5ff' },
+        transport: { hp: 520, dmg: 0,  rng: 10.5, spd: 7.2, rate: 1.00, rad: 1.15, col: '#00ff66' },
+        valkyrie:  { hp: 440, dmg: 38, rng: 17.5, spd: 6.8, rate: 1.15, rad: 1.05, col: '#38bdf8' },
+        zealot:    { hp: 220, shd: 120, dmg: 44, rng: 1.95, spd: 5.2, rate: 0.42, rad: 0.54, col: '#f5b932' },
+        stalker:   { hp: 180, shd: 140, dmg: 38, rng: 13.5, spd: 4.6, rate: 0.72, rad: 0.72, col: '#38bdf8' },
+        archon:    { hp: 160, shd: 380, dmg: 68, rng: 9.5,  spd: 4.1, rate: 0.95, rad: 0.82, col: '#f5b932' }
+    };
+    if (!uType || !statsMap[uType]) uType = 'ranger';
+    const stats = statsMap[uType];
+    if (!spawnOrigin) spawnOrigin = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+
+    const mesh = createAnimatedUnitModel(uType);
+    // Reaper is a flying jump-jet infantry unit; Heli, Transport & Valkyrie are aircraft
+    const isAir = (uType === 'heli' || uType === 'transport' || uType === 'valkyrie' || uType === 'reaper');
+    const isMechanical = (uType === 'tank' || uType === 'siege_tank' || uType === 'stalker' || uType === 'heli' || uType === 'transport' || uType === 'valkyrie');
+    const isBiological = !isMechanical;
+
+    // Use Clear Spawn Point Finder so ground units NEVER spawn wedged inside tight building gaps!
+    let sx = spawnOrigin.x + (Math.random() - 0.5) * 1.4;
+    let sz = spawnOrigin.z + 2.2 + Math.random() * 0.6;
+    if (!isAir && typeof findClearSpawnPoint === 'function') {
+        const rallyX = BRIDGES.length > 0 ? BRIDGES[0].southEntry.x : ENEMY_BASE_POS.x;
+        const rallyZ = BRIDGES.length > 0 ? BRIDGES[0].southEntry.z : ENEMY_BASE_POS.z;
+        const clearPt = findClearSpawnPoint(spawnOrigin.x, spawnOrigin.z, rallyX, rallyZ, stats.rad, buildings, enemyBuildings, units);
+        sx = clearPt.x;
+        sz = clearPt.z;
+    }
+
+    const baseH = getTerrainHeight(sx, sz);
+    const initAirAlt = uType === 'reaper' ? 2.65 : 6.2;
+    mesh.position.set(sx, isAir ? Math.max(0, baseH) + initAirAlt : baseH, sz);
+
+    // Initial smooth yaw facing outward from spawn building
+    const initYaw = Math.atan2(sx - spawnOrigin.x, sz - spawnOrigin.z);
+    mesh.rotation.y = initYaw;
+
+    // StarCraft Green Unit Selection Circle under unit feet
+    const selCircle = new THREE.Mesh(unitSelRingGeo, unitSelRingMat);
+    selCircle.position.y = isAir ? (uType === 'reaper' ? -2.55 : -5.8) : 0.08;
+    selCircle.scale.setScalar(stats.rad * 1.55);
+    selCircle.visible = false;
+    mesh.add(selCircle);
+    mesh.userData.selCircle = selCircle;
+
+    scene.add(mesh);
+
+    const hb = makeHealthPip(stats.col);
+    let healBeam = null;
+    if (uType === 'medic') {
+        healBeam = new THREE.Mesh(healBeamGeo, MAT.medicBioBeam);
+        healBeam.visible = false;
+        scene.add(healBeam);
+    }
+
+    // Compute a clear initial rally step 3.4m outward toward the front of the base so units march cleanly out of tight base clusters
+    const outAng = Math.atan2((ENEMY_BASE_POS.z - spawnOrigin.z) * 0.4 + (sz - spawnOrigin.z), (ENEMY_BASE_POS.x - spawnOrigin.x) * 0.4 + (sx - spawnOrigin.x));
+    const rawRx = sx + Math.cos(outAng) * 3.4;
+    const rawRz = sz + Math.sin(outAng) * 3.4;
+    const clearRallyPt = (!isAir && typeof findClearSpawnPoint === 'function')
+        ? findClearSpawnPoint(rawRx, rawRz, ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, stats.rad, buildings, enemyBuildings, units)
+        : { x: rawRx, z: rawRz };
+    const spawnRallyTarget = !isAir ? new THREE.Vector3(
+        clearRallyPt.x,
+        getTerrainHeight(clearRallyPt.x, clearRallyPt.z),
+        clearRallyPt.z
+    ) : null;
+
+    // If the Enemy Zerg Base has already been discovered by scouts, newly spawned units immediately march to attack the Enemy Base!
+    const initialPatrolTarget = (state.enemyBaseDiscovered && enemyBuildings.length > 0)
+        ? (state.enemyBase && state.enemyBase.hp > 0 ? state.enemyBase.pos.clone() : enemyBuildings[0].pos.clone())
+        : null;
+
+    const isSolUnit = (uType === 'zealot' || uType === 'stalker' || uType === 'archon');
+    const facKey = isSolUnit ? 'solaris' : 'terran';
+    const upg = (state.upgrades && state.upgrades[facKey]) ? state.upgrades[facKey] : { weapons: 0, armor: 0 };
+    const wMult = 1.0 + (upg.weapons || 0) * 0.20;
+    const aMult = 1.0 + (upg.armor || 0) * 0.20;
+    const finalMaxHp = Math.round(stats.hp * aMult);
+    const finalDmg = Math.round(stats.dmg * wMult);
+
+    const newUnitObj = {
+        type: uType, isAir, isVehicle: isMechanical, isMechanical, isBiological,
+        radius: stats.rad, mesh, hb, healBeam, selCircle,
+        baseMaxHp: stats.hp,
+        baseDamage: stats.dmg,
+        hp: finalMaxHp, maxHp: finalMaxHp,
+        shield: stats.shd || 0,
+        maxShield: stats.shd || 0,
+        shieldRegenDelay: 0,
+        damage: finalDmg,
+        armorBonus: (upg.armor || 0) * 2,
+        range: stats.rng,
+        speed: stats.spd,
+        fireRate: stats.rate,
+        cooldown: 0,
+        currentYaw: initYaw,
+        currentPitch: 0,
+        currentRoll: 0,
+        order: 'auto',
+        orderTarget: null,
+        patrolTarget: initialPatrolTarget,
+        spawnRallyTarget,
+        spawnRallyTimer: !isAir ? 1.1 : 0,
+        stuckTimer: 0,
+        lastProgressPos: new THREE.Vector3(sx, baseH, sz),
+        flankSign: (units.length % 2 === 0 ? 1 : -1),
+        lastHitImpulse: null,
+        lastHitHeavy: false,
+        dropTimer: uType === 'transport' ? 2.5 : 0,
+        evasionTimer: 0,
+        homePos: new THREE.Vector3(sx, baseH, sz + 2.2)
+    };
+    if (((upg.weapons || 0) > 0 || (upg.armor || 0) > 0) && typeof window.applyUnitUpgradeVisuals === 'function') {
+        window.applyUnitUpgradeVisuals(newUnitObj, upg.weapons || 0, upg.armor || 0, facKey);
+    }
+    units.push(newUnitObj);
+    updateHealthPip(hb, finalMaxHp, finalMaxHp, stats.shd || 0, stats.shd || 0);
+    updateHUD();
+}
+
+function spawnEnemyFromBuilding(variant, originPos) {
+    if (!state.basePlaced || state.missionWon) return;
+    if (enemies.length >= MAX_ENEMY_UNITS) return;
+
+    // Mutalisk air fliers are locked until rush grace timer expires or wave >= 2
+    if (variant === 'mutalisk' && state.rushGraceTimer > 0 && !state.isEndless) {
+        variant = Math.random() < 0.6 ? 'skitterer' : 'spitter';
+    }
+
+    const baseStatsMap = {
+        skitterer: { hp: 80,  dmg: 14, spd: 3.8, rng: 1.6,  rate: 0.85, rad: 0.52, col: '#ff2a4b', reward: 15 },
+        spitter:   { hp: 70,  dmg: 16, spd: 2.9, rng: 8.5,  rate: 1.35, rad: 0.58, col: '#84cc16', reward: 20 },
+        burster:   { hp: 55,  dmg: 68, spd: 4.7, rng: 1.7,  rate: 0.10, rad: 0.55, col: '#ff5400', reward: 18 },
+        mutalisk:  { hp: 135, dmg: 22, spd: 3.1, rng: 9.5,  rate: 1.15, rad: 0.72, col: '#ff2a4b', reward: 32 },
+        crusher:   { hp: 340, dmg: 38, spd: 2.1, rng: 2.2,  rate: 1.15, rad: 0.98, col: '#b845ff', reward: 45 },
+        gorgon:    { hp: 420, dmg: 52, spd: 2.35,rng: 12.5, rate: 1.85, rad: 1.08, col: '#84cc16', reward: 55 },
+        behemoth:  { hp: 490, dmg: 75, spd: 1.6, rng: 14.5, rate: 2.50, rad: 1.25, col: '#d946ef', reward: 65 }
+    };
+    if (!variant || !baseStatsMap[variant]) variant = 'skitterer';
+    const baseStats = baseStatsMap[variant];
+    if (!originPos) originPos = state.enemyBase ? state.enemyBase.pos : ENEMY_BASE_POS;
+    const isAir = (variant === 'mutalisk');
+    const mult = getWaveStrengthMultiplier();
+
+    let sx = originPos.x + (Math.random() - 0.5) * 4.5;
+    let sz = originPos.z + (Math.random() - 0.5) * 4.5;
+    if (!isAir && typeof findClearSpawnPoint === 'function') {
+        const rallyX = state.baseBuilding ? state.baseBuilding.pos.x : PLAYER_START_POS.x;
+        const rallyZ = state.baseBuilding ? state.baseBuilding.pos.z : PLAYER_START_POS.z;
+        const clearPt = findClearSpawnPoint(originPos.x, originPos.z, rallyX, rallyZ, baseStats.rad, buildings, enemyBuildings, enemies);
+        sx = clearPt.x;
+        sz = clearPt.z;
+    }
+    const groundH = getTerrainHeight(sx, sz);
+
+    const mesh = createAnimatedUnitModel(variant);
+    mesh.position.set(sx, isAir ? Math.max(0, groundH) + 5.8 : groundH, sz);
+    const initYaw = Math.atan2(PLAYER_START_POS.x - sx, PLAYER_START_POS.z - sz);
+    mesh.rotation.y = initYaw;
+    scene.add(mesh);
+
+    const zergUpg = (state.upgrades && state.upgrades.zerg) ? state.upgrades.zerg : { weapons: 0, armor: 0 };
+    const zergWMult = 1.0 + (zergUpg.weapons || 0) * 0.20;
+    const zergAMult = 1.0 + (zergUpg.armor || 0) * 0.20;
+    const maxHp = Math.round(baseStats.hp * mult * zergAMult);
+    const finalEnemyDmg = Math.round(baseStats.dmg * mult * zergWMult);
+    const hb = makeHealthPip(baseStats.col);
+
+    // Dynamic Zerg AI: Staging rally point & tactical roles (Flankers, Vanguard, Siege Behemoths)
+    const isFlanker = (variant === 'skitterer' || variant === 'burster') && Math.random() < 0.55;
+    const flankSide = (enemies.length % 2 === 0 ? 1 : -1);
+
+    const enemyObj = {
+        variant, isAir, radius: baseStats.rad, mesh, hb,
+        baseMaxHp: Math.round(baseStats.hp * mult),
+        baseDamage: Math.round(baseStats.dmg * mult),
+        hp: maxHp, maxHp,
+        damage: finalEnemyDmg,
+        armorBonus: (zergUpg.armor || 0) * 2,
+        speed: baseStats.spd,
+        range: baseStats.rng,
+        fireRate: baseStats.rate,
+        reward: baseStats.reward,
+        cooldown: 0,
+        currentYaw: initYaw,
+        currentPitch: 0,
+        currentRoll: 0,
+        stuckTimer: 0,
+        lastProgressPos: new THREE.Vector3(sx, groundH, sz),
+        flankSign: flankSide,
+        isFlanker,
+        aiState: (state.rushGraceTimer > 0 && !state.isEndless) ? 'staging' : (isFlanker ? 'flank' : 'charge'),
+        stagingTimer: 14.0 + Math.random() * 12.0,
+        burrowed: false,
+        burrowCooldown: 4.0 + Math.random() * 4.0,
+        lastHitImpulse: null,
+        lastHitHeavy: false
+    };
+    if (((zergUpg.weapons || 0) > 0 || (zergUpg.armor || 0) > 0) && typeof window.applyUnitUpgradeVisuals === 'function') {
+        window.applyUnitUpgradeVisuals(enemyObj, zergUpg.weapons || 0, zergUpg.armor || 0, 'zerg');
+    }
+    enemies.push(enemyObj);
+}
+
+// ============================================================================
+// 8B. MASS-WEIGHTED COLLISION SOLVER (WITH TIGHT-BUILDING PINCH ESCAPE & AIR SEPARATION)
+// ============================================================================
+function resolveAllUnitCollisions() {
+    const groundActors = [];
+    for (let i = 0; i < units.length; i++) {
+        if (!units[i].isAir) groundActors.push(units[i]);
+    }
+    for (let i = 0; i < enemies.length; i++) {
+        if (!enemies[i].isAir) groundActors.push(enemies[i]);
+    }
+
+    const allStructs = [];
+    for (let i = 0; i < buildings.length; i++) {
+        const b = buildings[i];
+        if (!b || b.hp <= 0) continue;
+        allStructs.push({
+            x: b.pos.x,
+            z: b.pos.z,
+            r: b.type === 'base' ? 2.15 : (b.type === 'barrier' ? 1.55 : (b.type === 'turret' ? 1.48 : 1.92)),
+            isBarrier: b.type === 'barrier'
+        });
+    }
+    for (let i = 0; i < enemyBuildings.length; i++) {
+        const eb = enemyBuildings[i];
+        if (!eb || eb.hp <= 0) continue;
+        allStructs.push({
+            x: eb.pos.x,
+            z: eb.pos.z,
+            r: eb.role === 'citadel' ? 2.65 : (eb.role === 'spine_turret' ? 1.38 : 2.05)
+        });
+    }
+    if (typeof solarisBuildings !== 'undefined') {
+        for (let i = 0; i < solarisBuildings.length; i++) {
+            const sb = solarisBuildings[i];
+            if (!sb || sb.hp <= 0) continue;
+            allStructs.push({
+                x: sb.pos.x,
+                z: sb.pos.z,
+                r: sb.footprintRadius || 1.95
+            });
+        }
+    }
+    if (typeof obstacles !== 'undefined') {
+        for (let i = 0; i < obstacles.length; i++) {
+            const ob = obstacles[i];
+            if (!ob || !ob.pos) continue;
+            if (ob.isBarrier || ob.type === 'anti_rush_barrier' || ob.type === 'battlefield_barriers') {
+                allStructs.push({
+                    x: ob.pos.x,
+                    z: ob.pos.z,
+                    r: (ob.radius || 1.65) + 0.15,
+                    isBarrier: true
+                });
+            }
+        }
+    }
+
+    for (let i = 0; i < groundActors.length; i++) {
+        const a = groundActors[i];
+        const ax = a.mesh.position.x, az = a.mesh.position.z;
+        const isAnchoredA = !!(a.type === 'siege_tank' && a.siegeMode);
+        const isHeavyA = (a.type === 'tank' || a.type === 'siege_tank' || (a.type === 'valkyrie' && a.mechMode));
+        const massA = isAnchoredA ? 99999 : (isHeavyA ? 85 : (a.variant === 'behemoth' || a.variant === 'gorgon' || a.variant === 'crusher' ? 25 : 1));
+
+        for (let j = i + 1; j < groundActors.length; j++) {
+            const b = groundActors[j];
+            const dx = b.mesh.position.x - ax;
+            const dz = b.mesh.position.z - az;
+            if (Math.abs(dx) > 4.6 || Math.abs(dz) > 4.6) continue;
+            const dist = Math.hypot(dx, dz);
+            const minSep = (a.radius || 0.55) + (b.radius || 0.55);
+            const isAnchoredB = !!(b.type === 'siege_tank' && b.siegeMode);
+            const isHeavyB = (b.type === 'tank' || b.type === 'siege_tank' || (b.type === 'valkyrie' && b.mechMode));
+
+            // Proactive Human Ground Unit Pathway-Yielding ("Give Pathway to Tanks" across 4.2m forward corridor):
+            if ((isHeavyA !== isHeavyB) && !a.variant && !b.variant && dist < minSep + 2.65 && dist > 0.001) {
+                const tankActor = isHeavyA ? a : b;
+                const yieldActor = isHeavyA ? b : a;
+                if (!(yieldActor.type === 'siege_tank' && yieldActor.siegeMode)) {
+                    const tankYaw = tankActor.currentYaw !== undefined ? tankActor.currentYaw : (tankActor.mesh.rotation.y || 0);
+                    const tankFwdX = Math.sin(tankYaw);
+                    const tankFwdZ = Math.cos(tankYaw);
+                    const relX = yieldActor.mesh.position.x - tankActor.mesh.position.x;
+                    const relZ = yieldActor.mesh.position.z - tankActor.mesh.position.z;
+                    const forwardProj = relX * tankFwdX + relZ * tankFwdZ;
+                    const perpX = tankFwdZ;
+                    const perpZ = -tankFwdX;
+                    const sideDot = relX * perpX + relZ * perpZ;
+                    const laneHalfWidth = (tankActor.radius || 1.15) + (yieldActor.radius || 0.5) + 0.85;
+                    if (forwardProj > -0.95 && forwardProj < 4.2 && Math.abs(sideDot) < laneHalfWidth) {
+                        const sideSign = Math.abs(sideDot) > 0.04 ? Math.sign(sideDot) : (yieldActor.flankSign || 1);
+                        const urgency = Math.max(0.35, 1.0 - Math.abs(sideDot) / laneHalfWidth);
+                        const yieldStep = Math.min(0.14, 0.065 + urgency * 0.085);
+                        const yNextX = yieldActor.mesh.position.x + perpX * sideSign * yieldStep;
+                        const yNextZ = yieldActor.mesh.position.z + perpZ * sideSign * yieldStep;
+                        if (isWalkableGround(yNextX, yNextZ, (yieldActor.radius || 0.5) * 0.55)) {
+                            yieldActor.mesh.position.x = yNextX;
+                            yieldActor.mesh.position.z = yNextZ;
+                        }
+                    }
+                }
+            }
+
+            if (dist < minSep && dist > 0.0001) {
+                const bothTanks = (isHeavyA && isHeavyB);
+                const damp = bothTanks ? 0.22 : 0.42;
+                const overlap = Math.min(0.09, (minSep - dist) * damp);
+                const nx = dx / dist, nz = dz / dist;
+
+                const massB = isAnchoredB ? 99999 : (isHeavyB ? 85 : (b.variant === 'behemoth' || b.variant === 'crusher' ? 25 : 1));
+                let ratioA = massB / (massA + massB);
+                let ratioB = massA / (massA + massB);
+                if (isHeavyA && !isHeavyB) { ratioA = 0; ratioB = 1.0; }
+                else if (isHeavyB && !isHeavyA) { ratioA = 1.0; ratioB = 0; }
+
+                // SIEGE TANK ANCHOR RULE: When a Siege Tank is in Siege Mode, its body is 100% anchored to the ground
+                // and NEVER moves or gets pushed by colliding tanks or units until it unsieges!
+                if (isAnchoredA && isAnchoredB) {
+                    ratioA = 0;
+                    ratioB = 0;
+                } else if (isAnchoredA) {
+                    ratioA = 0;
+                    ratioB = 1.0;
+                } else if (isAnchoredB) {
+                    ratioA = 1.0;
+                    ratioB = 0;
+                }
+
+                if (ratioA > 0) {
+                    const aNextX = a.mesh.position.x - nx * overlap * ratioA;
+                    const aNextZ = a.mesh.position.z - nz * overlap * ratioA;
+                    if (isWalkableGround(aNextX, aNextZ, (a.radius || 0.5) * 0.6)) {
+                        a.mesh.position.x = aNextX;
+                        a.mesh.position.z = aNextZ;
+                    }
+                }
+
+                if (ratioB > 0) {
+                    const bNextX = b.mesh.position.x + nx * overlap * ratioB;
+                    const bNextZ = b.mesh.position.z + nz * overlap * ratioB;
+                    if (isWalkableGround(bNextX, bNextZ, (b.radius || 0.5) * 0.6)) {
+                        b.mesh.position.x = bNextX;
+                        b.mesh.position.z = bNextZ;
+                    }
+                }
+            }
+        }
+
+        // Anchored Siege Tanks in Siege Mode never slide, rotate, or move from structure or unit pushback!
+        if (isAnchoredA) {
+            if (a.anchoredPos) {
+                a.mesh.position.x = a.anchoredPos.x;
+                a.mesh.position.z = a.anchoredPos.z;
+                const surfY = typeof getSurfaceHeightWithBridges === 'function'
+                    ? getSurfaceHeightWithBridges(a.anchoredPos.x, a.anchoredPos.z)
+                    : getTerrainHeight(a.anchoredPos.x, a.anchoredPos.z);
+                a.mesh.position.y = surfY;
+            }
+            if (a.anchoredYaw !== undefined) {
+                a.mesh.rotation.y = a.anchoredYaw;
+                if (a.mesh.userData) a.mesh.userData.smoothYaw = a.anchoredYaw;
+            }
+            continue;
+        }
+
+        // Keep ground units from clipping through barriers or getting wedged between tight buildings!
+        let touchCount = 0;
+        let sumPushX = 0, sumPushZ = 0;
+        let nearBldMidX = 0, nearBldMidZ = 0;
+
+        for (let s = 0; s < allStructs.length; s++) {
+            const st = allStructs[s];
+            const dx = a.mesh.position.x - st.x;
+            const dz = a.mesh.position.z - st.z;
+            if (Math.abs(dx) > 4.5 || Math.abs(dz) > 4.5) continue;
+            const dist = Math.hypot(dx, dz);
+            const minSep = (a.radius || 0.55) + st.r;
+
+            if (dist < minSep + 0.25 && dist > 0.0001) {
+                touchCount++;
+                nearBldMidX += st.x;
+                nearBldMidZ += st.z;
+            }
+
+            if (dist < minSep && dist > 0.0001) {
+                const push = st.isBarrier
+                    ? Math.min(0.16, (minSep - dist) * 0.85 + 0.025)
+                    : Math.min(0.08, (minSep - dist) * 0.55 + 0.015);
+                const rnx = dx / dist, rnz = dz / dist;
+                const slideSign = a.wallFollowSign || a.flankSign || 1;
+                const tx = -rnz * slideSign * 0.05;
+                const tz = rnx * slideSign * 0.05;
+                sumPushX += rnx * push + tx;
+                sumPushZ += rnz * push + tz;
+            }
+        }
+
+        if (touchCount >= 2) {
+            nearBldMidX /= touchCount;
+            nearBldMidZ /= touchCount;
+            let ex = a.mesh.position.x - nearBldMidX;
+            let ez = a.mesh.position.z - nearBldMidZ;
+            const eLen = Math.hypot(ex, ez);
+            if (eLen > 0.001) { ex /= eLen; ez /= eLen; }
+            else { ex = 0; ez = 1; }
+            const stepX = Math.max(-0.12, Math.min(0.12, ex * 0.07 + sumPushX));
+            const stepZ = Math.max(-0.12, Math.min(0.12, ez * 0.07 + sumPushZ));
+            const escapeX = a.mesh.position.x + stepX;
+            const escapeZ = a.mesh.position.z + stepZ;
+            if (isWalkableGround(escapeX, escapeZ, (a.radius || 0.5) * 0.5)) {
+                a.mesh.position.x = escapeX;
+                a.mesh.position.z = escapeZ;
+            }
+        } else if (Math.abs(sumPushX) > 0.0001 || Math.abs(sumPushZ) > 0.0001) {
+            const clampedX = Math.max(-0.14, Math.min(0.14, sumPushX));
+            const clampedZ = Math.max(-0.14, Math.min(0.14, sumPushZ));
+            const nx = a.mesh.position.x + clampedX;
+            const nz = a.mesh.position.z + clampedZ;
+            if (isWalkableGround(nx, nz, (a.radius || 0.5) * 0.5)) {
+                a.mesh.position.x = nx;
+                a.mesh.position.z = nz;
+            }
+        }
+
+        // Smooth Bridge Barrier Collision & Guardrail Clamping (strictly matched to the active bridge!)
+        if (typeof isOnRiverBridge === 'function' && isOnRiverBridge(a.mesh.position.x, a.mesh.position.z)) {
+            const rc = getRiverCoords(a.mesh.position.x, a.mesh.position.z);
+            let activeBr = null;
+            let bestDS = Infinity;
+            for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+                const dS = Math.abs(rc.s - RIVER_BRIDGES[i].sCoord);
+                if (dS < bestDS) {
+                    bestDS = dS;
+                    activeBr = RIVER_BRIDGES[i];
+                }
+            }
+            if (activeBr && bestDS <= activeBr.halfWidth + 1.25) {
+                const dS = rc.s - activeBr.sCoord;
+                const maxDS = Math.max(0.6, activeBr.halfWidth - (a.radius || 0.50) - 0.50);
+                if (Math.abs(dS) > maxDS) {
+                    const targetS = activeBr.sCoord + Math.sign(dS) * maxDS;
+                    const smoothS = THREE.MathUtils.lerp(rc.s, targetS, 0.38);
+                    const clampedWorld = riverCoordsToWorld(smoothS, rc.u);
+                    a.mesh.position.x = clampedWorld.x;
+                    a.mesh.position.z = clampedWorld.z;
+                }
+            }
+        }
+
+        const targetGroundY = (typeof getSurfaceHeightWithBridges === 'function')
+            ? getSurfaceHeightWithBridges(a.mesh.position.x, a.mesh.position.z)
+            : getTerrainHeight(a.mesh.position.x, a.mesh.position.z);
+        if (Number.isFinite(a.mesh.position.y)) {
+            if (a.type === 'valkyrie' && a.mesh && a.mesh.userData && typeof a.mesh.userData.mechTransition === 'number') {
+                // Smooth 3.0-second VTOL descent curve from flight altitude (ground + 6.0) down to ground level!
+                const mt = a.mesh.userData.mechTransition;
+                const smoothDescendT = mt * mt * (3.0 - 2.0 * mt);
+                const transHoverAlt = (1.0 - smoothDescendT) * 5.8;
+                a.mesh.position.y = THREE.MathUtils.lerp(a.mesh.position.y, targetGroundY + transHoverAlt, 0.22);
+            } else {
+                const yLerp = a.type === 'valkyrie' ? 0.18 : (a.type === 'tank' ? 0.35 : 0.65);
+                a.mesh.position.y = THREE.MathUtils.lerp(a.mesh.position.y, targetGroundY, yLerp);
+            }
+        } else {
+            a.mesh.position.y = targetGroundY;
+        }
+
+        // Trigger interactive water ripples ONLY when ground units wade in uncovered water ponds (never on bridges)!
+        a.waterStepTimer = (a.waterStepTimer || 0) - 0.016;
+        if (
+            a.waterStepTimer <= 0 &&
+            !(typeof isOnRiverBridge === 'function' && isOnRiverBridge(a.mesh.position.x, a.mesh.position.z, 0.8)) &&
+            typeof isPointInWaterPond === 'function' &&
+            isPointInWaterPond(a.mesh.position.x, a.mesh.position.z, 0.15)
+        ) {
+            a.waterStepTimer = 0.42 + Math.random() * 0.22;
+            triggerWaterRippleFX(a.mesh.position.x, a.mesh.position.z, a.type === 'tank' ? 0.92 : 0.55, true);
+        }
+    }
+
+    // Aerial separation for Friendly Air Units & Enemy Flying Units (with wide anti-cuddle spacing for Dropships!)
+    const airActors = [...units.filter(u => u.isAir), ...enemies.filter(e => e.isAir)];
+    for (let i = 0; i < airActors.length; i++) {
+        for (let j = i + 1; j < airActors.length; j++) {
+            const a = airActors[i], b = airActors[j];
+            const dx = b.mesh.position.x - a.mesh.position.x;
+            const dz = b.mesh.position.z - a.mesh.position.z;
+            const dist = Math.hypot(dx, dz);
+            const isDropshipPair = (a.type === 'transport' || b.type === 'transport');
+            const minSep = isDropshipPair ? 5.2 : 2.55;
+            if (dist < minSep && dist > 0.001) {
+                const overlap = (minSep - dist) * 0.5;
+                a.mesh.position.x -= (dx / dist) * overlap;
+                a.mesh.position.z -= (dz / dist) * overlap;
+                b.mesh.position.x += (dx / dist) * overlap;
+                b.mesh.position.z += (dz / dist) * overlap;
+            }
+        }
+    }
+
+    // Physical Turret Shield Dome Barrier: NO enemy unit (ground or air) can enter the 9.5m shield radius while the shield is active!
+    const activeShieldTurrets = buildings.filter(
+        b => b && b.type === 'turret' && b.hp > 0 && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)
+    );
+    if (activeShieldTurrets.length > 0) {
+        for (let ei = 0; ei < enemies.length; ei++) {
+            const e = enemies[ei];
+            if (!e || e.hp <= 0 || !e.mesh) continue;
+            for (let si = 0; si < activeShieldTurrets.length; si++) {
+                const st = activeShieldTurrets[si];
+                const dx = e.mesh.position.x - st.pos.x;
+                const dz = e.mesh.position.z - st.pos.z;
+                const dist = Math.hypot(dx, dz);
+                const minShieldDist = 9.5 + (e.radius || 0.55);
+                if (dist < minShieldDist) {
+                    const nx = dist > 0.001 ? dx / dist : 0;
+                    const nz = dist > 0.001 ? dz / dist : 1;
+                    e.mesh.position.x = st.pos.x + nx * minShieldDist;
+                    e.mesh.position.z = st.pos.z + nz * minShieldDist;
+                    if (!e.isAir) {
+                        const gy = typeof getSurfaceHeightWithBridges === 'function'
+                            ? getSurfaceHeightWithBridges(e.mesh.position.x, e.mesh.position.z)
+                            : getTerrainHeight(e.mesh.position.x, e.mesh.position.z);
+                        e.mesh.position.y = gy;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 8C. SMART TARGETING LOGIC SYSTEM, SHIELD DOME BARRIER & MIND CONTROL
+// ============================================================================
+function applyDamageWithTurretShield(victim, dmg, hitWorldPos = null) {
+    if (!victim || dmg <= 0) return;
+    const vPos = victim.mesh ? victim.mesh.position : victim.pos;
+    if (vPos) {
+        for (let i = 0; i < buildings.length; i++) {
+            const b = buildings[i];
+            if (b.type === 'turret' && b.hp > 0 && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)) {
+                const d = Math.hypot(vPos.x - b.pos.x, vPos.z - b.pos.z);
+                if (d <= 9.65 || victim === b) {
+                    // Active Shield Barrier absorbs 100% of incoming damage until the barrier is destroyed!
+                    const absorbed = Math.min(b.shieldHp, dmg);
+                    b.shieldHp -= absorbed;
+                    dmg -= absorbed;
+                    if (typeof triggerShieldHitRippleFX === 'function') {
+                        triggerShieldHitRippleFX(hitWorldPos || vPos, b.pos, 9.5);
+                    }
+                    if (b.shieldDomeMesh && b.shieldDomeMesh.userData.dome) {
+                        b.shieldDomeMesh.scale.setScalar(1.025);
+                        setTimeout(() => { if (b.shieldDomeMesh) b.shieldDomeMesh.scale.setScalar(1.0); }, 90);
+                    }
+                    if (b.shieldHp <= 15) {
+                        b.shieldHp = 0;
+                        b.shieldBrokenTimer = 6.5;
+                        if (b.shieldDomeMesh) b.shieldDomeMesh.visible = false;
+                        spawnCombatFloat(b.pos, 'SHIELD BARRIER DESTROYED!', '#38bdf8');
+                    }
+                    if (dmg <= 0.01) return;
+                    break;
+                }
+            }
+        }
+    }
+    // Protoss Solaris Plasma Shield HP Absorption (Absorbs incoming damage before hull/biological HP!)
+    if (victim.maxShield && victim.maxShield > 0) {
+        victim.shieldRegenDelay = 3.6;
+        if ((victim.shield || 0) > 0) {
+            const shdAbsorbed = Math.min(victim.shield, dmg);
+            victim.shield -= shdAbsorbed;
+            dmg -= shdAbsorbed;
+            if (vPos && typeof triggerShieldHitRippleFX === 'function') {
+                triggerShieldHitRippleFX(hitWorldPos || vPos, vPos, (victim.radius || victim.footprintRadius || 1.1) * 1.35);
+            }
+            if (dmg <= 0.01) return;
+        }
+    }
+    if (victim.armorBonus && victim.armorBonus > 0) {
+        dmg = Math.max(1, dmg - victim.armorBonus);
+    }
+    // Forest Concealment & Structural Ruin Tactical Cover for Ground Infantry (-18% incoming damage)
+    if (vPos && victim.mesh && !victim.isAir && !victim.isVehicle && typeof window.getEnvironmentalTacticalModifiers === 'function') {
+        const envMod = window.getEnvironmentalTacticalModifiers(vPos.x, vPos.z, false, false);
+        if (envMod && envMod.coverDamageMult < 1.0) {
+            dmg = Math.max(1, Math.round(dmg * envMod.coverDamageMult));
+        }
+    }
+    victim.hp -= dmg;
+}
+
+function selectSmartTarget(originPos, maxRange, canHitAir = true, preferHeavy = false, preferSwarm = false) {
+    let bestTarget = null;
+    let bestScore = -Infinity;
+
+    enemies.forEach(e => {
+        if (e.hp <= 0) return;
+        if (e.isAir && !canHitAir) return;
+        const d = Math.hypot(e.mesh.position.x - originPos.x, e.mesh.position.z - originPos.z);
+        if (d > maxRange) return;
+
+        // Base proximity score (closer enemies are higher priority)
+        let score = (maxRange - d) * 3.5;
+
+        // Finish-off bonus: prioritize wounded targets so squads focus fire and eliminate threats quickly
+        const hpRatio = Math.max(0.05, e.hp / e.maxHp);
+        score += (1.0 - hpRatio) * 42.0;
+
+        // Threat-type tactical weighting
+        if (e.variant === 'burster' && d < 9.5) score += 95.0; // Immediate volatile baneling danger!
+        if (e.variant === 'behemoth') score += preferHeavy ? 75.0 : 28.0;
+        if (e.variant === 'gorgon')   score += preferHeavy ? 68.0 : 26.0;
+        if (e.variant === 'crusher')  score += preferHeavy ? 55.0 : 20.0;
+        if (e.variant === 'mutalisk') score += canHitAir ? 32.0 : 0;
+        if (e.variant === 'spitter')  score += 22.0;
+        if (preferSwarm && (e.variant === 'skitterer' || e.variant === 'burster')) score += 35.0;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestTarget = e;
+        }
+    });
+
+    if (!bestTarget && enemyBuildings.length > 0) {
+        let minBldDist = Infinity;
+        enemyBuildings.forEach(eb => {
+            if (eb.hp <= 0) return;
+            const d = Math.hypot(eb.pos.x - originPos.x, eb.pos.z - originPos.z);
+            if (d <= maxRange + 3.5 && d < minBldDist) {
+                minBldDist = d;
+                bestTarget = eb;
+            }
+        });
+    }
+
+    return bestTarget;
+}
+
+const MAX_MIND_CONTROL_UNITS = 3;
+
+function getActiveMindControlledCount() {
+    let count = 0;
+    for (let i = 0; i < units.length; i++) {
+        if (units[i] && units[i].isMindControlled && units[i].hp > 0) count++;
+    }
+    return count;
+}
+
+function convertEnemyWithMindControl(enemyObj, emitterWorldPos) {
+    // Strictly cap Mind Control at 3 active controlled units!
+    const currentThralls = getActiveMindControlledCount();
+    if (currentThralls >= MAX_MIND_CONTROL_UNITS) {
+        return false;
+    }
+
+    const idx = enemies.indexOf(enemyObj);
+    if (idx === -1) return false;
+    enemies.splice(idx, 1);
+
+    if (typeof spawnMindControlDominationFX === 'function') {
+        spawnMindControlDominationFX(enemyObj.mesh.position, emitterWorldPos);
+    }
+
+    // Replace enemy health bar with psionic magenta allied health bar
+    if (enemyObj.hb && enemyObj.hb.root) enemyObj.hb.root.remove();
+    const hb = makeHealthPip('#d946ef');
+
+    // Add selection circle + glowing psionic neural halo above converted unit
+    const selCircle = new THREE.Mesh(unitSelRingGeo, unitSelRingMat);
+    selCircle.position.y = enemyObj.isAir ? -5.6 : 0.08;
+    selCircle.scale.setScalar((enemyObj.radius || 0.6) * 1.55);
+    selCircle.visible = false;
+    enemyObj.mesh.add(selCircle);
+
+    const psiHalo = new THREE.Mesh(
+        new THREE.RingGeometry(0.28, 0.42, 20),
+        SHARED_FX_MAT.mindControlRing || MAT.hiveVeinGlow
+    );
+    psiHalo.rotation.x = -Math.PI / 2;
+    psiHalo.position.y = enemyObj.variant === 'behemoth' ? 1.85 : 1.15;
+    enemyObj.mesh.add(psiHalo);
+    if (enemyObj.mesh.userData) {
+        enemyObj.mesh.userData.isMindControlled = true;
+    }
+    const isMeleeZerg = (enemyObj.variant === 'skitterer' || enemyObj.variant === 'burster' || enemyObj.variant === 'crusher');
+
+    units.push({
+        type: enemyObj.variant,
+        variant: enemyObj.variant,
+        isMindControlled: true,
+        isAir: !!enemyObj.isAir,
+        isVehicle: false,
+        isMechanical: false,
+        isBiological: true,
+        radius: enemyObj.radius || 0.58,
+        mesh: enemyObj.mesh,
+        hb,
+        healBeam: null,
+        selCircle,
+        hp: enemyObj.maxHp,
+        maxHp: enemyObj.maxHp,
+        damage: Math.max(24, Math.round((enemyObj.damage || 20) * 1.25)),
+        range: isMeleeZerg ? Math.max(2.25, enemyObj.range || 2.0) : Math.max(9.0, enemyObj.range || 9.0),
+        speed: (enemyObj.speed || 3.2) * 1.12,
+        fireRate: Math.max(0.35, (enemyObj.fireRate || 1.0) * 0.85),
+        cooldown: 0,
+        retaliateTarget: null,
+        currentYaw: enemyObj.currentYaw || 0,
+        currentPitch: 0,
+        currentRoll: 0,
+        order: 'auto',
+        orderTarget: null,
+        stuckTimer: 0,
+        lastProgressPos: enemyObj.mesh.position.clone(),
+        flankSign: (units.length % 2 === 0 ? 1 : -1),
+        lastHitImpulse: null,
+        lastHitHeavy: false
+    });
+    const newCount = getActiveMindControlledCount();
+    spawnCombatFloat(enemyObj.mesh.position, `MIND CONTROLLED! (${newCount}/${MAX_MIND_CONTROL_UNITS})`, '#d946ef');
+    if (state.selectedBuilding && state.selectedBuilding.type === 'turret') {
+        renderSC2CommandCard();
+    }
+    updateHUD();
+    return true;
+}
+
+// Smooth Anti-Stuck Steering & Self-Calibrating "Stuck Babyspot" Spatial Memory for Ground Units
+function checkAndUnstickGroundUnit(actor, targetPos, dt) {
+    if (actor.isAir || !targetPos) return;
+    if (!actor.lastProgressPos) {
+        actor.lastProgressPos = actor.mesh.position.clone();
+        actor.anchorCheckPos = actor.mesh.position.clone();
+        actor.anchorCheckTimer = 0;
+        actor.stuckTimer = 0;
+        return;
+    }
+
+    // Net-displacement anti-circling detector: if a unit runs in a small loop for 1.8s without advancing > 2.6m, break the loop immediately!
+    if (!actor.anchorCheckPos) actor.anchorCheckPos = actor.mesh.position.clone();
+    actor.anchorCheckTimer = (actor.anchorCheckTimer || 0) + dt;
+    let isOrbitingInPlace = false;
+    if (actor.anchorCheckTimer >= 1.8) {
+        const netDisp = Math.hypot(
+            actor.mesh.position.x - actor.anchorCheckPos.x,
+            actor.mesh.position.z - actor.anchorCheckPos.z
+        );
+        const distToGoal = Math.hypot(
+            targetPos.x - actor.mesh.position.x,
+            targetPos.z - actor.mesh.position.z
+        );
+        actor.anchorCheckPos.copy(actor.mesh.position);
+        actor.anchorCheckTimer = 0;
+        if (netDisp < 2.6 && distToGoal > 3.5) {
+            isOrbitingInPlace = true;
+            if (actor.patrolTarget && !state.enemyBaseDiscovered && enemyBuildings.length > 0) {
+                actor.patrolTarget = new THREE.Vector3(
+                    ENEMY_BASE_POS.x,
+                    getTerrainHeight(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z),
+                    ENEMY_BASE_POS.z
+                );
+            }
+        }
+    }
+
+    const movedDist = Math.hypot(
+        actor.mesh.position.x - actor.lastProgressPos.x,
+        actor.mesh.position.z - actor.lastProgressPos.z
+    );
+    if (movedDist > 0.16 && !isOrbitingInPlace) {
+        actor.lastProgressPos.copy(actor.mesh.position);
+        actor.stuckTimer = 0;
+    } else {
+        actor.stuckTimer = isOrbitingInPlace ? 0.50 : ((actor.stuckTimer || 0) + dt);
+        if (actor.stuckTimer > 0.42) {
+            actor.stuckTimer = 0.18; // Keep gentle steering active without hard snapping
+            actor.wallFollowSign = -(actor.wallFollowSign || actor.flankSign || 1);
+            actor.wallFollowTimer = 1.65;
+
+            const ax = actor.mesh.position.x;
+            const az = actor.mesh.position.z;
+
+            // Record this stuck babyspot into the global navigation heatmap so A* and bridge selection learn to avoid it!
+            if (typeof window.recordNavStuckHotspot === 'function') {
+                window.recordNavStuckHotspot(ax, az, 2.8, 1.85);
+            }
+            // Clear cached A* waypoints so the unit immediately recomputes a detour around the calibrated babyspot
+            actor.navWaypoints = null;
+
+            // If this is an Enemy Zerg AI unit, recalibrate its flanking corridor & preferred bridge to make a smarter flank!
+            if (actor.variant) {
+                actor.isFlanker = true;
+                actor.flankRecalibrateCount = (actor.flankRecalibrateCount || 0) + 1;
+                actor.flankSign = (actor.flankRecalibrateCount % 2 === 0) ? 1 : -1;
+                const tactics = ['west_bridge_pincer', 'east_bridge_pincer', 'canyon_rim_envelopment', 'rear_eco_raid'];
+                actor.flankTactic = tactics[(actor.flankRecalibrateCount + Math.floor(Math.abs(ax))) % tactics.length];
+                if (typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 1) {
+                    let bestBrIdx = 0;
+                    let lowestPen = Infinity;
+                    for (let bi = 0; bi < RIVER_BRIDGES.length; bi++) {
+                        if (bi === actor.preferredBridgeIdx && RIVER_BRIDGES.length > 1) continue;
+                        const bWorld = typeof riverCoordsToWorld === 'function' ? riverCoordsToWorld(RIVER_BRIDGES[bi].sCoord, 0) : { x: 0, z: 0 };
+                        const pen = typeof window.getNavStuckPenalty === 'function' ? window.getNavStuckPenalty(bWorld.x, bWorld.z) : 0;
+                        if (pen < lowestPen) {
+                            lowestPen = pen;
+                            bestBrIdx = bi;
+                        }
+                    }
+                    actor.preferredBridgeIdx = bestBrIdx;
+                }
+            }
+
+            const surfH = typeof getSurfaceHeightWithBridges === 'function' ? getSurfaceHeightWithBridges : getTerrainHeight;
+            const stepLen = Math.min(0.18, (actor.speed || 3.5) * dt * 1.25);
+
+            // If near or on a river bridge or bridge exit, smoothly advance across the deck and out onto the destination bank!
+            if (typeof getRiverCoords === 'function' && typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 0) {
+                const rc = getRiverCoords(ax, az);
+                let bestBr = RIVER_BRIDGES[0];
+                let minDS = Infinity;
+                for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+                    const dS = Math.abs(rc.s - RIVER_BRIDGES[i].sCoord);
+                    if (dS < minDS) {
+                        minDS = dS;
+                        bestBr = RIVER_BRIDGES[i];
+                    }
+                }
+                const bCenterU = typeof getRiverCenterUAtS === 'function' ? getRiverCenterUAtS(bestBr.sCoord) : 0;
+                const dU = Math.abs(rc.u - bCenterU);
+                if (dU <= RIVER_HALF_WIDTH + 7.5 && minDS <= bestBr.halfWidth + 2.5) {
+                    const destRC = getRiverCoords(targetPos.x, targetPos.z);
+                    const uStepSign = (destRC.u - bCenterU) >= 0 ? 1 : -1;
+                    // On the water span, center toward bestBr.sCoord; once on the bridge end ramp, step straight toward targetPos!
+                    let safeWorld;
+                    if (dU <= RIVER_HALF_WIDTH + 2.4) {
+                        const newS = rc.s + Math.sign(bestBr.sCoord - rc.s) * Math.min(Math.abs(bestBr.sCoord - rc.s), stepLen * 1.15);
+                        const newU = rc.u + uStepSign * stepLen * 1.2;
+                        safeWorld = riverCoordsToWorld(newS, newU);
+                    } else {
+                        const toDestX = targetPos.x - ax;
+                        const toDestZ = targetPos.z - az;
+                        const toDestLen = Math.hypot(toDestX, toDestZ) || 1;
+                        safeWorld = {
+                            x: ax + (toDestX / toDestLen) * stepLen * 1.25,
+                            z: az + (toDestZ / toDestLen) * stepLen * 1.25
+                        };
+                    }
+                    if (isWalkableGround(safeWorld.x, safeWorld.z, (actor.radius || 0.50) * 0.40)) {
+                        actor.mesh.position.x = safeWorld.x;
+                        actor.mesh.position.z = safeWorld.z;
+                        actor.mesh.position.y = THREE.MathUtils.lerp(actor.mesh.position.y, surfH(safeWorld.x, safeWorld.z), 0.5);
+                        actor.lastProgressPos.copy(actor.mesh.position);
+                        return;
+                    }
+                }
+            }
+
+            // Smooth tangential slide around local obstacle
+            const dx = targetPos.x - ax;
+            const dz = targetPos.z - az;
+            const dLen = Math.hypot(dx, dz) || 1;
+            const tx = (-dz / dLen) * actor.wallFollowSign;
+            const tz = (dx / dLen) * actor.wallFollowSign;
+            const nx = ax + tx * stepLen;
+            const nz = az + tz * stepLen;
+            if (isWalkableGround(nx, nz, (actor.radius || 0.50) * 0.45)) {
+                actor.mesh.position.x = nx;
+                actor.mesh.position.z = nz;
+                actor.mesh.position.y = THREE.MathUtils.lerp(actor.mesh.position.y, surfH(nx, nz), 0.5);
+            }
+            actor.lastProgressPos.copy(actor.mesh.position);
+        }
+    }
+}
+
+function recordRagdollHitImpulse(victim, originPos, isHeavy = false) {
+    if (!victim || !victim.mesh) return;
+    const dir = victim.mesh.position.clone().sub(originPos);
+    dir.y = 0;
+    if (dir.lengthSq() < 0.001) dir.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+    dir.normalize();
+    const force = isHeavy ? (5.5 + Math.random() * 2.5) : (2.2 + Math.random() * 1.4);
+    victim.lastHitImpulse = new THREE.Vector3(
+        dir.x * force,
+        isHeavy ? (5.4 + Math.random() * 2.4) : (2.6 + Math.random() * 1.2),
+        dir.z * force
+    );
+    victim.lastHitHeavy = isHeavy;
+}
+
+// Non-Homing Ballistic Projectile Launcher: locks onto the exact landing coordinates at fire time!
+function launchOrdProjectile(startPos, targetObj, wType, damage, isEnemyAcid = false) {
+    if (window.SFX) window.SFX.playShoot(wType);
+    if (projectiles.length >= 65) {
+        const old = projectiles.shift();
+        scene.remove(old.mesh);
+    }
+    const isTankRound = (wType === 'tank' || wType === 'siege_tank');
+    const isMortar = (wType === 'mortar' || wType === 'behemoth');
+    const isPlasma = (wType === 'plasma');
+    const isSniper = (wType === 'sniper');
+    const isSunlance = (wType === 'sunlance' || wType === 'hero');
+    const isSolarisBeam = (wType === 'stalker' || wType === 'archon' || wType === 'solaris_spire');
+    const isValkMech = (wType === 'valk_mech');
+    const isValkAA = (wType === 'valk_aa');
+    const isMarauder = (wType === 'marauder');
+    const isRocket = (wType === 'rocket' || wType === 'heli' || wType === 'rocketman' || wType === 'valkyrie' || isValkAA || isMarauder);
+    const isZergGoo = isEnemyAcid || wType === 'spitter' || wType === 'mutalisk' || wType === 'behemoth' || wType === 'gorgon' || wType === 'spine';
+
+    let mesh;
+    if (isZergGoo && typeof createAlgorithmicBioGooProjectile === 'function') {
+        // Algorithmic Viscoelastic Zerg Spit / Goo / Jelly Cluster (Zero basic shapes!)
+        mesh = createAlgorithmicBioGooProjectile(wType);
+    } else if (isTankRound && typeof createTankCannonShellMesh === 'function') {
+        mesh = createTankCannonShellMesh(wType === 'siege_tank');
+    } else if (isSolarisBeam) {
+        // Realistic Protoss Solaris Phase-Disruptor / Psionic Shock-Orb & Khaydarin Prismatic Lance
+        mesh = new THREE.Group();
+        mesh.userData.isSolarisProj = true;
+        const eggGeoFn = typeof window.createSculptedEggSacGeo === 'function'
+            ? window.createSculptedEggSacGeo
+            : (rx, ry, segs) => createSculptedArmorDomeGeo(rx, segs || 10, segs || 10);
+        if (wType === 'archon') {
+            // Archon Psionic Maelstrom Shock-Orb: Multi-layered Khaydarin plasma sphere + 2 counter-rotating gyroscopic lightning rings
+            const coreOrb = new THREE.Mesh(
+                eggGeoFn(0.14, 0.16, 12),
+                MAT.solarisPrismGlow || MAT.cyanGlow
+            );
+            const outerShell = new THREE.Mesh(
+                eggGeoFn(0.22, 0.24, 12),
+                MAT.solarisGold || MAT.amberGlow
+            );
+            const ring1 = new THREE.Mesh(
+                createSculptedTorusCollarGeo(0.26, 0.024, 8, 18),
+                MAT.solarisPrismGlow || MAT.cyanGlow
+            );
+            const ring2 = new THREE.Mesh(
+                createSculptedTorusCollarGeo(0.22, 0.020, 8, 18),
+                MAT.solarisGold || MAT.amberGlow
+            );
+            ring2.rotation.x = Math.PI / 2;
+            mesh.add(coreOrb, outerShell, ring1, ring2);
+            mesh.userData.gyroRing1 = ring1;
+            mesh.userData.gyroRing2 = ring2;
+        } else if (wType === 'stalker') {
+            // Stalker Void-Phase Disruptor Bolt: Elongated antimatter crystal spear + twin swept golden phase fins + warp collar
+            const lanceCore = new THREE.Mesh(
+                createSculptedLatheBarrelGeo(0.032, 0.048, 0.64, 10).rotateX(Math.PI / 2),
+                MAT.solarisPrismGlow || MAT.cyanGlow
+            );
+            const tipCrystal = new THREE.Mesh(
+                createSculptedOgiveSpireGeo(0.056, 0.24, 8).rotateX(Math.PI / 2),
+                MAT.solarisPrismGlow || MAT.cyanGlow
+            );
+            tipCrystal.position.z = 0.34;
+            const warpCollar = new THREE.Mesh(
+                createSculptedTorusCollarGeo(0.11, 0.018, 8, 14),
+                MAT.solarisGold || MAT.amberGlow
+            );
+            warpCollar.position.z = 0.04;
+            mesh.add(lanceCore, tipCrystal, warpCollar);
+            mesh.userData.gyroRing1 = warpCollar;
+        } else {
+            // Photon Spire Prismatic Solar-Lance: Focusing Khaydarin prism orb + high-energy golden-cyan photon spear
+            const photonCore = new THREE.Mesh(
+                eggGeoFn(0.11, 0.28, 10).rotateX(Math.PI / 2),
+                MAT.solarisPrismGlow || MAT.cyanGlow
+            );
+            const solarCrown = new THREE.Mesh(
+                createSculptedTorusCollarGeo(0.14, 0.022, 8, 16),
+                MAT.solarisGold || MAT.amberGlow
+            );
+            mesh.add(photonCore, solarCrown);
+            mesh.userData.gyroRing1 = solarCrown;
+        }
+    } else if (isSunlance) {
+        // Bespoke Hero Vanguard Aegis-X9 Twin-Core Sunlance Rail-Bolt (Golden-Cyan Plasma Spear + Magnetic Halo Ring)
+        mesh = new THREE.Group();
+        const spearCore = new THREE.Mesh(
+            createSculptedLatheBarrelGeo(0.045, 0.045, 0.72, 10).rotateX(Math.PI / 2),
+            MAT.cyanGlow
+        );
+        const goldenSheath = new THREE.Mesh(
+            createSculptedLatheBarrelGeo(0.085, 0.025, 0.52, 10).rotateX(Math.PI / 2),
+            MAT.amberGlow
+        );
+        const haloRing = new THREE.Mesh(
+            createSculptedTorusCollarGeo(0.13, 0.024, 8, 16),
+            MAT.amberGlow
+        );
+        haloRing.position.z = 0.10;
+        mesh.add(spearCore, goldenSheath, haloRing);
+    } else if (isValkMech) {
+        // Valkyrie Semi-Mech 35mm Ground-Assault Armor-Piercing Explosive Shell
+        mesh = new THREE.Group();
+        const shellBody = new THREE.Mesh(
+            createSculptedLatheBarrelGeo(0.042, 0.052, 0.36, 10).rotateX(Math.PI / 2),
+            MAT.amberGlow
+        );
+        const tip = new THREE.Mesh(
+            createSculptedOgiveSpireGeo(0.052, 0.14, 10).rotateX(Math.PI / 2),
+            MAT.cyanGlow
+        );
+        tip.position.z = 0.22;
+        mesh.add(shellBody, tip);
+    } else if (isRocket) {
+        mesh = new THREE.Group();
+        const body = new THREE.Mesh(createSculptedLatheBarrelGeo(0.045, 0.055, 0.42, 10).rotateX(Math.PI / 2), MAT.titanium);
+        const cone = new THREE.Mesh(createSculptedOgiveSpireGeo(0.055, 0.16, 10).rotateX(Math.PI / 2), SHARED_FX_MAT.projRocket || MAT.crimson);
+        cone.position.z = 0.26;
+        // Dynamic 3D Rocket Thruster Nozzle Node (emits thrust particles in flight instead of basic shape plume!)
+        const nozzleRim = new THREE.Mesh(createSculptedTorusCollarGeo(0.044, 0.012, 6, 10), MAT.gunmetal);
+        nozzleRim.position.z = -0.21;
+        mesh.add(body, cone, nozzleRim);
+        mesh.userData.hasRocketThruster = true;
+    } else {
+        const geo = isMortar
+            ? SHARED_FX_GEO.mortarProj
+            : (isPlasma ? SHARED_FX_GEO.acidProj : SHARED_FX_GEO.bulletProj);
+        const mat = isPlasma ? MAT.cyanGlow : (isSniper ? MAT.healGlow : (isMortar ? SHARED_FX_MAT.projMortar : SHARED_FX_MAT.projBullet));
+        mesh = new THREE.Mesh(geo, mat);
+        if (isPlasma) mesh.scale.setScalar(1.35);
+        if (isSniper) mesh.scale.set(0.8, 0.8, 2.4);
+    }
+    mesh.position.copy(startPos);
+    scene.add(mesh);
+
+    // Lock the fixed target landing position at the moment the shot is fired
+    const rawTargetPos = targetObj.mesh ? targetObj.mesh.position : targetObj.pos;
+    const isAirTarget = !!(targetObj.isAir);
+    const impactY = isAirTarget ? rawTargetPos.y : (getTerrainHeight(rawTargetPos.x, rawTargetPos.z) + 0.42);
+    const landingPos = new THREE.Vector3(rawTargetPos.x, impactY, rawTargetPos.z);
+
+    projectiles.push({
+        mesh,
+        isBioGoo: isZergGoo,
+        isEnemyAcid: !!isEnemyAcid,
+        start: startPos.clone(),
+        landingPos,
+        targetObj,
+        isAirTarget,
+        wType, damage,
+        progress: 0,
+        gooTime: Math.random() * 6.28,
+        speed: isSniper ? 11.5 : (isSunlance ? 7.8 : (isValkMech ? 6.4 : (isTankRound ? (wType === 'siege_tank' ? 4.2 : 5.6) : (isRocket ? 4.6 : (isPlasma ? 4.8 : (isMortar ? 1.15 : (isZergGoo ? 2.85 : 5.8)))))))
+    });
+}
+
+// ============================================================================
+// 9. MAIN REAL-TIME SIMULATION LOOP
+// ============================================================================
+let prevTime = performance.now();
+let endlessSpawnClock = 0;
+let creepUpdateClock = 0;
+let fowTimer = 0;
+let hudClockTimer = 0;
+let hitstopTimer = 0;
+const TURRET_TURN_SPEED = 3.2;
+
+window.triggerHitstop = function(duration = 0.035) {
+    hitstopTimer = Math.max(hitstopTimer, duration);
+};
+
+function shortestAngleDiff(current, target) {
+    let diff = (target - current + Math.PI) % (Math.PI * 2) - Math.PI;
+    if (diff < -Math.PI) diff += Math.PI * 2;
+    return diff;
+}
+
+let _fowStepToggle = false;
+let _portrait3DAccum = 0;
+function animate(now) {
+    requestAnimationFrame(animate);
+    try {
+    const rawDt = Math.min((now - prevTime) / 1000, 0.05);
+    prevTime = now;
+
+    if (window.titleScreenActive || window.loadingCameraSweep) {
+        fowMesh.visible = false;
+        const orbitSpeed = window.loadingCameraSweep ? 0.00065 : 0.00022;
+        const orbitAngle = now * orbitSpeed;
+        const bridgeCenterX = BRIDGES.length > 0 ? BRIDGES[0].center.x : 0;
+        const bridgeCenterZ = BRIDGES.length > 0 ? BRIDGES[0].center.z : 0;
+        const focusX = window.loadingCameraSweep ? 0 : (bridgeCenterX * 0.5 + PLAYER_START_POS.x * 0.5);
+        const focusZ = window.loadingCameraSweep ? 0 : (bridgeCenterZ * 0.5 + PLAYER_START_POS.z * 0.5);
+        const orbitRadius = window.loadingCameraSweep ? 72 : 44;
+        const camHeight = window.loadingCameraSweep ? 58 : (36 + Math.sin(orbitAngle * 1.5) * 4);
+        controls.target.set(focusX, getTerrainHeight(focusX, focusZ), focusZ);
+        camera.position.set(
+            focusX + Math.cos(orbitAngle) * orbitRadius,
+            camHeight,
+            focusZ + Math.sin(orbitAngle) * orbitRadius
+        );
+        controls.update();
+        if (MAT.updateShaders) MAT.updateShaders(now * 0.001);
+        if (window.SHADER_ENGINE && typeof window.SHADER_ENGINE.update === 'function') {
+            window.SHADER_ENGINE.update(now * 0.001);
+        }
+        waterTex.offset.x += rawDt * 0.04;
+        waterTex.offset.y += rawDt * 0.025;
+        fowTimer -= rawDt;
+        if (fowTimer <= 0) {
+            renderTacticalMinimap();
+            fowTimer = 0.2;
+        }
+        renderer.render(scene, camera);
+        return;
+    }
+
+    fowMesh.visible = true;
+
+    if (window.gamePaused) {
+        controls.update();
+        renderer.render(scene, camera);
+        return;
+    }
+
+    if (hitstopTimer > 0) {
+        hitstopTimer -= rawDt;
+        controls.update();
+        renderer.render(scene, camera);
+        return;
+    }
+
+    const dt = rawDt;
+    if (state.basePlaced && !state.missionWon) {
+        state.elapsedSec += dt;
+
+        if (state.rushGraceTimer > 0) {
+            state.rushGraceTimer = Math.max(0, state.rushGraceTimer - dt);
+            if (state.rushGraceTimer === 0) {
+                spawnCombatFloat(state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS, 'WARNING: HOSTILE AIR WINGS UNLEASHED!', '#ff2a4b');
+                const ticker = document.getElementById('directive-ticker');
+                if (ticker) {
+                    ticker.innerText = "AIRSPACE BREACH: Mutalisk Flight Wings Detected! Engage with Marksmen & Turrets!";
+                    ticker.style.color = "#ff2a4b";
+                }
+            }
+        }
+
+        // Dynamic Zerg Swarm Wave Coordination Timer
+        state.swarmWaveTimer -= dt;
+        if (state.swarmWaveTimer <= 0) {
+            state.swarmWaveTimer = 26.0;
+            let count = 0;
+            enemies.forEach(e => {
+                if (e.aiState === 'staging') {
+                    e.aiState = e.isFlanker ? 'flank' : 'charge';
+                    count++;
+                }
+            });
+            if (count > 0) {
+                spawnCombatFloat(ENEMY_STAGING_POS, `SWARM WAVE ASSAULT! (${count} BIO-UNITS)`, '#d946ef');
+            }
+        }
+
+        hudClockTimer += dt;
+        if (hudClockTimer >= 0.5) {
+            hudClockTimer = 0;
+            updateHUD();
+        }
+    }
+
+    // WASD / Arrow Keys Camera Panning
+    const panSpeed = 34 * dt;
+    const forward = new THREE.Vector3();
+    camera.getWorldDirection(forward);
+    forward.y = 0; forward.normalize();
+    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+
+    if (keysPressed['w'] || keysPressed['arrowup']) {
+        camera.position.addScaledVector(forward, panSpeed);
+        controls.target.addScaledVector(forward, panSpeed);
+    }
+    if (keysPressed['s'] || keysPressed['arrowdown']) {
+        camera.position.addScaledVector(forward, -panSpeed);
+        controls.target.addScaledVector(forward, -panSpeed);
+    }
+    if (keysPressed['a'] || keysPressed['arrowleft']) {
+        camera.position.addScaledVector(right, -panSpeed);
+        controls.target.addScaledVector(right, -panSpeed);
+    }
+    if (keysPressed['d'] || keysPressed['arrowright']) {
+        camera.position.addScaledVector(right, panSpeed);
+        controls.target.addScaledVector(right, panSpeed);
+    }
+
+    controls.update();
+
+    // Clamp View Camera & Orbit Target inside Out-of-Bounds Map Barrier & Preserve Horizontal Offset (Never collapse into top-down view!)
+    let camOffX = camera.position.x - controls.target.x;
+    let camOffZ = camera.position.z - controls.target.z;
+    let horizDist = Math.hypot(camOffX, camOffZ);
+    const minHorizDist = 18.0;
+    if (horizDist < minHorizDist) {
+        if (horizDist < 0.001) {
+            camOffX = 0;
+            camOffZ = minHorizDist;
+        } else {
+            const scaleH = minHorizDist / horizDist;
+            camOffX *= scaleH;
+            camOffZ *= scaleH;
+        }
+    }
+    const camTargetLim = 100.0;
+    controls.target.x = THREE.MathUtils.clamp(controls.target.x, -camTargetLim, camTargetLim);
+    controls.target.z = THREE.MathUtils.clamp(controls.target.z, -camTargetLim, camTargetLim);
+    const targetGroundY = getSurfaceHeightWithBridges(controls.target.x, controls.target.z);
+    if (controls.target.y < targetGroundY - 1.5 || controls.target.y > targetGroundY + 12.0) {
+        const targetYClamped = THREE.MathUtils.clamp(controls.target.y, targetGroundY - 1.5, targetGroundY + 12.0);
+        const dy = targetYClamped - controls.target.y;
+        controls.target.y = targetYClamped;
+        camera.position.y += dy;
+    }
+    camera.position.x = controls.target.x + camOffX;
+    camera.position.z = controls.target.z + camOffZ;
+    const camSurfaceY = getSurfaceHeightWithBridges(camera.position.x, camera.position.z);
+    if (camera.position.y < camSurfaceY + 8.0) {
+        camera.position.y = camSurfaceY + 8.0;
+    }
+
+    updateCameraViewportFrustum();
+
+    fowTimer -= dt;
+    if (fowTimer <= 0) {
+        _fowStepToggle = !_fowStepToggle;
+        if (_fowStepToggle) {
+            updateFogOfWarVision();
+        } else {
+            renderTacticalMinimap();
+        }
+        fowTimer = 0.09;
+    }
+
+    if (MAT.updateShaders) MAT.updateShaders(now * 0.001);
+    if (window.SHADER_ENGINE && typeof window.SHADER_ENGINE.update === 'function') {
+        window.SHADER_ENGINE.update(now * 0.001);
+    }
+    if (window.WEATHER_SYSTEM && typeof window.WEATHER_SYSTEM.update === 'function') {
+        window.WEATHER_SYSTEM.update(dt, now * 0.001, camera);
+    }
+    if (typeof updateWaterPondsAndRipples === 'function') updateWaterPondsAndRipples(dt);
+    if (typeof window.updateBiomeLandmarks === 'function') window.updateBiomeLandmarks(dt);
+    if (window.AMBIENT_AUDIO_ENGINE && typeof window.AMBIENT_AUDIO_ENGINE.update === 'function') {
+        window.AMBIENT_AUDIO_ENGINE.update(dt, camera, controls.target);
+    }
+    waterTex.offset.x += dt * 0.04;
+    waterTex.offset.y += dt * 0.025;
+    for (let ti = 0; ti < swayTrees.length; ti++) {
+        const t = swayTrees[ti];
+        if (!t || !t.crown) continue;
+        const tp = t.crown.position;
+        if (tp && !window.isWorldPosInViewport(tp.x, tp.y, tp.z, 4.5)) continue;
+        t.phase += dt * 1.6;
+        t.crown.rotation.z = Math.sin(t.phase) * 0.035;
+    }
+
+    // Dynamic Red Glow Border Frame Modulation: ONLY appears when Friendly Main Base HP is low (<= 40% HP)!
+    const redBorderEl = document.getElementById('red-border-glow-frame');
+    if (redBorderEl) {
+        const hqLowHp = !!(state.basePlaced && state.baseBuilding && state.baseBuilding.hp > 0 && (state.baseBuilding.hp / state.baseBuilding.maxHp) <= 0.40);
+        redBorderEl.classList.toggle('combat-alert', hqLowHp);
+    }
+
+    // Modulate Command & Conquer: Red Alert AI Music combat intensity based on active enemies & battle state
+    if (window.RAID_MUSIC && typeof window.RAID_MUSIC.setCombatIntensity === 'function') {
+        const enemyFactor = Math.min(1.0, enemies.length / 18);
+        const waveFactor = Math.min(1.0, (state.wave - 1) * 0.15);
+        window.RAID_MUSIC.setCombatIntensity(0.25 + enemyFactor * 0.55 + waveFactor * 0.20);
+    }
+
+    const weatherSpdMult = (window.WEATHER_SYSTEM && typeof window.WEATHER_SYSTEM.getSpeedMultiplier === 'function')
+        ? window.WEATHER_SYSTEM.getSpeedMultiplier()
+        : 1.0;
+
+    // --- ACTIVE ZERG CREEP SPREAD & ANIMATED DISAPPEARING WHEN THE MAIN ZERG BASE IS DESTROYED ---
+    // BUG FIX: You do NOT need to destroy all Zerg bases or secondary buildings to make Zerg creep disappear!
+    // As soon as the primary Main Zerg Base (`state.enemyBase`) is destroyed, Zerg Creep immediately recedes & disappears to 0!
+    const hasMainZergBase = Boolean(
+        state.enemyBase && state.enemyBase.hp > 0 && enemyBuildings.includes(state.enemyBase)
+    );
+    if (state.enemyBase && state.enemyBase.hp > 0) {
+        ENEMY_BASE_POS.x = state.enemyBase.pos.x;
+        ENEMY_BASE_POS.z = state.enemyBase.pos.z;
+    }
+    if (hasMainZergBase && !state.missionWon) {
+        // Decreased Zerg Base Creep Infect Radius (compact 16.5m–23.5m radius around the Zerg Main Base!)
+        const baseCreepGoal = state.basePlaced
+            ? (16.5 + enemyBuildings.length * 1.15 + Math.min(4.5, state.elapsedSec * 0.05))
+            : (16.5 + Math.min(2.5, (performance.now() * 0.001) * 0.04));
+        creepTargetRadius = Math.min(23.5, Math.max(16.5, baseCreepGoal));
+
+        if (typeof emitZergCreepGooParticles === 'function') {
+            emitZergCreepGooParticles(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, creepRadius, dt);
+        }
+        creepUpdateClock += dt;
+        if (creepUpdateClock >= 0.25) {
+            creepUpdateClock = 0;
+            const isReceding = creepRadius > creepTargetRadius + 0.3;
+            if (creepRadius < creepTargetRadius) {
+                creepRadius = Math.min(creepTargetRadius, creepRadius + 0.22);
+                // Spawn new creep tumor inside the compact Zerg creep radius occasionally
+                if (state.basePlaced && Math.random() < 0.14 && creepTumors.length < 16) {
+                    const ang = Math.random() * Math.PI * 2;
+                    const tr = Math.max(6.5, creepRadius - 2.2);
+                    spawnCreepTumor(ENEMY_BASE_POS.x + Math.cos(ang) * tr, ENEMY_BASE_POS.z + Math.sin(ang) * tr);
+                }
+            } else if (creepRadius > creepTargetRadius) {
+                creepRadius = Math.max(creepTargetRadius, creepRadius - 1.15);
+            }
+            updateZergCreepColors(creepRadius, isReceding, false);
+
+            // Emit dissolving spore/ember particles along receding creep edge
+            if (isReceding && particles.length < 130) {
+                for (let pIdx = 0; pIdx < 3; pIdx++) {
+                    const a = Math.random() * Math.PI * 2;
+                    const px = ENEMY_BASE_POS.x + Math.cos(a) * creepRadius;
+                    const pz = ENEMY_BASE_POS.z + Math.sin(a) * creepRadius;
+                    const py = getTerrainHeight(px, pz);
+                    if (py > -0.5) {
+                        const ember = new THREE.Mesh(SHARED_FX_GEO.goreChunk, pIdx % 2 === 0 ? MAT.volatileGlow : MAT.hiveVeinGlow);
+                        ember.scale.setScalar(0.45);
+                        ember.position.set(px, py + 0.2, pz);
+                        scene.add(ember);
+                        particles.push({
+                            mesh: ember,
+                            vel: new THREE.Vector3((Math.random() - 0.5) * 1.5, 2.2 + Math.random() * 1.8, (Math.random() - 0.5) * 1.5),
+                            gravity: -1.0,
+                            life: 0.45
+                        });
+                    }
+                }
+            }
+        }
+    } else if (creepRadius > 0.01) {
+        // Main Zerg Base is destroyed: immediately recede & dissolve Zerg Creep smoothly to 0!
+        creepTargetRadius = 0;
+        creepRadius = Math.max(0, creepRadius - dt * 9.5);
+        if (creepRadius < 0.48) creepRadius = 0;
+        creepUpdateClock += dt;
+        if (creepUpdateClock >= 0.05 || creepRadius === 0) {
+            creepUpdateClock = 0;
+            updateZergCreepColors(creepRadius, true, creepRadius === 0);
+
+            if (creepRadius > 0.8 && particles.length < 135) {
+                for (let pIdx = 0; pIdx < 4; pIdx++) {
+                    const a = Math.random() * Math.PI * 2;
+                    const px = ENEMY_BASE_POS.x + Math.cos(a) * creepRadius;
+                    const pz = ENEMY_BASE_POS.z + Math.sin(a) * creepRadius;
+                    const py = getTerrainHeight(px, pz);
+                    if (py > -0.5) {
+                        const ember = new THREE.Mesh(SHARED_FX_GEO.goreChunk, pIdx % 2 === 0 ? MAT.acidGlow : MAT.hiveVeinGlow);
+                        ember.scale.setScalar(0.5);
+                        ember.position.set(px, py + 0.2, pz);
+                        scene.add(ember);
+                        particles.push({
+                            mesh: ember,
+                            vel: new THREE.Vector3((Math.random() - 0.5) * 2.0, 2.5 + Math.random() * 2.0, (Math.random() - 0.5) * 2.0),
+                            gravity: -1.2,
+                            life: 0.42
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Keep Creep Tumors 100% Static in the Zerg Creep Zone (Only shrink/pop when enemy structures are destroyed and creep recedes)
+    for (let i = creepTumors.length - 1; i >= 0; i--) {
+        const ct = creepTumors[i];
+        if (ct.distFromHive > creepRadius + 0.5) {
+            ct.scale = (ct.scale || 1.0) - dt * 1.8;
+            ct.group.scale.setScalar(Math.max(0.01, ct.scale));
+            if (ct.scale <= 0.05) {
+                spawnGoreExplosion(ct.group.position, false, true);
+                scene.remove(ct.group);
+                creepTumors.splice(i, 1);
+            }
+        }
+    }
+
+    // --- AUTONOMOUS 3-FACTION MINERAL HARVESTING DRONES (TERRAN SCV, PROTOSS PROBE, ZERG BIO-DRONE) ---
+    syncAndUpdateAutoMiningDrones(dt);
+
+    // --- PLAYER STRUCTURE COMPLETION / FIELD REPAIR & AI ALLY REINFORCEMENTS ---
+    // NOTE: Player controls their own faction (`buildings`) manually — never auto-build structures into `buildings`!
+    // Autonomous base building is strictly for the AI Allies faction (`solarisBuildings` at `SOLARIS_BASE_POS`).
+    if (state.basePlaced && !state.missionWon) {
+        for (let bi = 0; bi < buildings.length; bi++) {
+            const b = buildings[bi];
+            if (!b || b.hp <= 0) continue;
+            if (b.buildProgress !== undefined && b.buildProgress < 1.0) {
+                // Realistic slow-start paced construction speed: ~16.5s for factory/robotics, ~14s for barracks/gate, ~10s for turrets/pylons
+                const buildRate = (b.type === 'factory' || b.type === 'solaris_robotics')
+                    ? 0.060
+                    : ((b.type === 'barracks' || b.type === 'solaris_gate') ? 0.072 : 0.095);
+                b.buildProgress = Math.min(1.0, b.buildProgress + dt * buildRate);
+                // Keep spawnTimer at full spawnDuration while under construction so unit training waits for construction to finish!
+                if (b.spawnDuration) {
+                    b.spawnTimer = b.spawnDuration;
+                }
+                if (b === state.selectedBuilding) {
+                    updateHUD();
+                    if (b.buildProgress >= 1.0) renderSC2CommandCard();
+                }
+            } else if (b.hp < b.maxHp) {
+                b.hp = Math.min(b.maxHp, b.hp + dt * 4.5);
+                if (b.hb && b.hb.bar) {
+                    b.hb.bar.style.width = `${Math.max(0, (b.hp / b.maxHp) * 100)}%`;
+                }
+            }
+        }
+
+        const allyMode = state.aiAllyMode || 'defensive';
+        if (allyMode !== 'off') {
+            if (!state.allyPlaybookStrategy || state.allyPlaybookStrategy === 'cannon_rush' || state.allyPlaybookStrategy === 'proxy_forward_base') {
+                const stratPool = ['massive_fleet', 'zealot_rush', 'combined_arms'];
+                state.allyPlaybookStrategy = stratPool[Math.floor(Math.random() * stratPool.length)];
+            }
+
+            state.aiAllyTimer = (state.aiAllyTimer === undefined ? 18.0 : state.aiAllyTimer) - dt;
+            if (state.aiAllyTimer <= 0) {
+                const allyBotCount = (state.multiplayerConfig && state.multiplayerConfig.allyBots) ? state.multiplayerConfig.allyBots.length : 1;
+                state.aiAllyTimer = Math.max(15.0, 29.0 - allyBotCount * 3.5);
+                // Spawn AI Ally Protoss reinforcements exclusively from completed Solaris Warp Gates & Robotics Bays!
+                const prodBuildings = solarisBuildings.filter(sb =>
+                    !state.solarisHostile &&
+                    (sb.role === 'gate' || sb.role === 'robotics') &&
+                    sb.hp > 0 && (sb.buildProgress === undefined || sb.buildProgress >= 1.0)
+                );
+                if (units.length < 40 && prodBuildings.length > 0) {
+                    const chosenBld = prodBuildings[Math.floor(Math.random() * prodBuildings.length)];
+                    const spawnPos = chosenBld.pos;
+                    const isFleetStrat = state.allyPlaybookStrategy === 'massive_fleet';
+                    const allyPool = chosenBld.role === 'robotics'
+                        ? ['archon', 'stalker', 'valkyrie']
+                        : (isFleetStrat ? ['archon', 'stalker'] : ['zealot', 'stalker', 'archon']);
+                    const pick1 = allyPool[Math.floor(Math.random() * allyPool.length)];
+                    spawnAlliedUnit(pick1, spawnPos);
+                    const newest = units[units.length - 1];
+                    if (newest) {
+                        if (isFleetStrat) {
+                            const stagePos = new THREE.Vector3(
+                                THREE.MathUtils.lerp(PLAYER_START_POS.x, ENEMY_BASE_POS.x, 0.36),
+                                0,
+                                THREE.MathUtils.lerp(PLAYER_START_POS.z, ENEMY_BASE_POS.z, 0.36)
+                            );
+                            newest.isFleetStaged = true;
+                            newest.order = 'attack_move';
+                            newest.orderTarget = stagePos;
+                        } else if (allyMode === 'aggressive' || state.allyPlaybookStrategy === 'zealot_rush') {
+                            newest.order = 'attack_move';
+                            newest.orderTarget = ENEMY_BASE_POS.clone();
+                        }
+                    }
+
+                    const stagedFleet = units.filter(u => u && u.hp > 0 && u.isFleetStaged);
+                    if (stagedFleet.length >= 6) {
+                        stagedFleet.forEach(fu => {
+                            fu.isFleetStaged = false;
+                            fu.order = 'attack_move';
+                            fu.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
+                        });
+                    }
+                }
+            }
+        }
+
+        // Multiplayer Enemy Bot Team Extra Wave Spawner (Only spawns from constructed Zerg Barracks / Bio-Factory, never Citadel!)
+        if (state.multiplayerConfig && state.multiplayerConfig.enemyBots && state.multiplayerConfig.enemyBots.length > 0) {
+            state.mpEnemyBotTimer = (state.mpEnemyBotTimer === undefined ? 20.0 : state.mpEnemyBotTimer) - dt;
+            if (state.mpEnemyBotTimer <= 0) {
+                const eBots = state.multiplayerConfig.enemyBots;
+                const diffMult = state.multiplayerConfig.botDifficulty === 'Brutal' ? 0.65
+                    : (state.multiplayerConfig.botDifficulty === 'Hard' ? 0.80 : 1.0);
+                state.mpEnemyBotTimer = Math.max(11.0, (24.0 - eBots.length * 2.5) * diffMult);
+                const zergSpawners = enemyBuildings.filter(eb =>
+                    (eb.role === 'barracks' || eb.role === 'factory') &&
+                    eb.hp > 0 && (eb.buildProgress === undefined || eb.buildProgress >= 1.0)
+                );
+                const dynamicEnemyCap = Math.min(72, 32 + Math.floor(units.length * 1.35));
+                if (enemies.length < dynamicEnemyCap && zergSpawners.length > 0) {
+                    const variants = ['skitterer', 'spitter', 'crusher', 'burster', 'mutalisk'];
+                    for (let bIdx = 0; bIdx < eBots.length; bIdx++) {
+                        const spawner = zergSpawners[bIdx % zergSpawners.length];
+                        const v = variants[Math.floor(Math.random() * variants.length)];
+                        spawnEnemyFromBuilding(v, spawner.pos);
+                    }
+                }
+            }
+        }
+    }
+
+    // Enemy Zerg Progressive Base Construction (Slow-start economy: Starts ONLY with Citadel, builds Spawning Pool, Bio-Factory & Defenses gradually!)
+    if (state.basePlaced && !state.missionWon && state.enemyBase && state.enemyBase.hp > 0) {
+        state.enemyBuildTimer = (state.enemyBuildTimer || 22.0) - dt;
+        if (state.enemyBuildTimer <= 0) {
+            constructNextEnemyZergStructure();
+            state.enemyBuildTimer = Math.max(19.0, 30.0 - state.wave * 1.0);
+        }
+    }
+
+    // Allied Solaris Protoss Progressive Base, Proxy Outpost, Cannon Rush & Warp Gate Construction
+    if (state.basePlaced && !state.missionWon) {
+        state.solarisBuildTimer = (state.solarisBuildTimer || 18.0) - dt;
+        if (state.solarisBuildTimer <= 0) {
+            constructNextSolarisStructure();
+            state.solarisBuildTimer = 24.0;
+        }
+
+        // Autonomous Lab Research for Zerg Evolution Chamber & Solaris Cybernetics Forge
+        const hasZergEvoChamber = enemyBuildings.some(eb => eb && eb.role === 'evolution_chamber' && eb.hp > 0 && (eb.buildProgress === undefined || eb.buildProgress >= 1.0));
+        if (hasZergEvoChamber && state.upgrades && state.upgrades.zerg) {
+            state.zergUpgradeTimer = (state.zergUpgradeTimer || 34.0) - dt;
+            if (state.zergUpgradeTimer <= 0) {
+                state.zergUpgradeTimer = 36.0;
+                const zUpg = state.upgrades.zerg;
+                if ((zUpg.weapons || 0) <= (zUpg.armor || 0) && (zUpg.weapons || 0) < 3) {
+                    zUpg.weapons = (zUpg.weapons || 0) + 1;
+                    applyFactionTechToExistingUnits('zerg');
+                } else if ((zUpg.armor || 0) < 3) {
+                    zUpg.armor = (zUpg.armor || 0) + 1;
+                    applyFactionTechToExistingUnits('zerg');
+                }
+            }
+        }
+
+        const hasSolarisCyberLab = solarisBuildings.some(sb => sb && sb.role === 'cyber_lab' && sb.hp > 0 && (sb.buildProgress === undefined || sb.buildProgress >= 1.0));
+        if (hasSolarisCyberLab && state.upgrades && state.upgrades.solaris) {
+            state.solarisUpgradeTimer = (state.solarisUpgradeTimer || 32.0) - dt;
+            if (state.solarisUpgradeTimer <= 0) {
+                state.solarisUpgradeTimer = 34.0;
+                const sUpg = state.upgrades.solaris;
+                if ((sUpg.weapons || 0) <= (sUpg.armor || 0) && (sUpg.weapons || 0) < 3) {
+                    sUpg.weapons = (sUpg.weapons || 0) + 1;
+                    applyFactionTechToExistingUnits('solaris');
+                } else if ((sUpg.armor || 0) < 3) {
+                    sUpg.armor = (sUpg.armor || 0) + 1;
+                    applyFactionTechToExistingUnits('solaris');
+                }
+            }
+        }
+
+        // Run Squad Intelligence evaluation (Defensive Phalanx vs Aggressive Hunt based on Zerg cluster proximity)
+        updateSquadIntelligence(dt);
+    }
+
+    for (let i = enemyBuildings.length - 1; i >= 0; i--) {
+        const eb = enemyBuildings[i];
+        if (eb.hp <= 0) {
+            if (typeof spawnEnemyBuildingBreakAnimation === 'function') {
+                spawnEnemyBuildingBreakAnimation(eb.pos, eb.role);
+            }
+            spawnGoreExplosion(eb.pos, true, true);
+            if (eb === state.enemyBase || eb.role === 'citadel') {
+                if (eb === state.enemyBase) {
+                    creepTargetRadius = 0;
+                }
+                if (eb.expCreepMesh && eb.expCreepMesh.userData) {
+                    eb.expCreepMesh.userData.ownerDestroyed = true;
+                }
+            }
+            scene.remove(eb.mesh);
+            if (eb.badge) eb.badge.remove();
+            if (eb.hb) eb.hb.root.remove();
+            enemyBuildings.splice(i, 1);
+            state.req += 250;
+            if (enemyBuildings.length === 0) {
+                recallAllFriendlyUnitsToMainBase();
+            }
+            updateHUD(true);
+            continue;
+        }
+
+        // Progressive Zerg Bio-Structure Metamorphosis Cocoon Animation (Full 100% HP, realistic ~12.5s gestation time)
+        if (eb.buildProgress !== undefined && eb.buildProgress < 1.0) {
+            eb.buildProgress = Math.min(1.0, eb.buildProgress + dt * 0.080);
+            if (eb.spawnDuration) eb.spawnTimer = eb.spawnDuration;
+        }
+
+        const ud = eb.mesh.userData;
+        ud.pulsePhase = (ud.pulsePhase || 0) + dt * 2.8;
+        if (typeof updateEnemyBuildingAnimationAndBreak === 'function') {
+            updateEnemyBuildingAnimationAndBreak(eb, dt, state.elapsedSec);
+        }
+        if (ud.emblem) {
+            ud.emblem.rotation.y -= dt * 0.55;
+            if (ud.emblem.userData.holoPlane) {
+                ud.emblem.userData.holoPlane.position.y = 6.6 + Math.sin(ud.pulsePhase) * 0.25;
+            }
+        }
+        if (ud.psionicRing) ud.psionicRing.rotation.y += dt * 1.6;
+        if (ud.coreGem) ud.coreGem.rotation.x += dt * 2.2;
+        if (ud.sacs) ud.sacs.forEach((s, idx) => s.scale.setScalar(1 + Math.sin(ud.pulsePhase + idx) * 0.16));
+        if (ud.claws) ud.claws.forEach(c => { c.pivot.rotation.x = c.baseRotX + Math.sin(ud.pulsePhase * 0.7 + c.idx) * 0.08; });
+
+        const ebInViewport = window.isWorldPosInViewport(eb.pos.x, eb.pos.y, eb.pos.z, 7.5);
+        eb.mesh.visible = ebInViewport;
+        if (ebInViewport && isWorldPosVisible(eb.pos.x, eb.pos.z)) {
+            eb.hb.bar.style.width = `${Math.max(0, (eb.hp / eb.maxHp) * 100)}%`;
+            projectToScreen(eb.hb.root, eb.pos, eb.role === 'citadel' ? 3.8 : 2.1);
+        } else if (eb.hb && eb.hb.root) {
+            eb.hb.root.style.display = 'none';
+        }
+
+        if (eb.buildProgress !== undefined && eb.buildProgress < 1.0) continue;
+
+        // Enemy Zerg Subterranean Spine-Whip Symbiote AI (6-Segment Coiling Muscular Tentacle & Whip-Snap Stinger)
+        if (eb.role === 'spine_turret' && state.basePlaced && !state.missionWon) {
+            eb.cooldown = (eb.cooldown || 0) - dt;
+            eb.whipAnim = Math.max(0, (eb.whipAnim || 0) - dt * 2.8);
+
+            let nearestTarget = null, minDist = 16.5;
+            units.forEach(u => {
+                const d = eb.pos.distanceTo(u.mesh.position);
+                if (d < minDist) { minDist = d; nearestTarget = u; }
+            });
+            buildings.forEach(b => {
+                const d = eb.pos.distanceTo(b.pos);
+                if (d < minDist) { minDist = d; nearestTarget = b; }
+            });
+
+            if (nearestTarget) {
+                const tPos = nearestTarget.mesh ? nearestTarget.mesh.position : nearestTarget.pos;
+                const desiredYaw = Math.atan2(tPos.x - eb.pos.x, tPos.z - eb.pos.z);
+                const angleDiff = shortestAngleDiff(eb.currentYaw || 0, desiredYaw);
+                const maxStep = 3.8 * dt;
+                eb.currentYaw = (eb.currentYaw || 0) + (Math.abs(angleDiff) <= maxStep ? angleDiff : Math.sign(angleDiff) * maxStep);
+                if (ud.yawRoot) ud.yawRoot.rotation.y = eb.currentYaw;
+                else if (ud.head) ud.head.rotation.y = eb.currentYaw;
+
+                if (Math.abs(angleDiff) < 0.38 && eb.cooldown <= 0) {
+                    const muzzle = ud.cannonBarrel
+                        ? ud.cannonBarrel.getWorldPosition(new THREE.Vector3())
+                        : eb.pos.clone().add(new THREE.Vector3(0, 1.85, 0));
+                    launchOrdProjectile(muzzle, nearestTarget, 'spine', 24 * getWaveStrengthMultiplier(), true);
+                    eb.whipAnim = 1.0;
+                    eb.cooldown = 1.25;
+                }
+            }
+
+            // Multi-segment kinematic spine articulation (Serpentine sway + S-coil windup + violent forward whip snap)
+            if (ud.spineSegments && ud.spineSegments.length > 0) {
+                const segs = ud.spineSegments;
+                const w = eb.whipAnim || 0;
+                const whipPhase = w > 0.55
+                    ? -Math.sin(((w - 0.55) / 0.45) * Math.PI) * 0.35
+                    : Math.sin((w / 0.55) * Math.PI) * 0.52;
+                const targetLean = nearestTarget ? 0.16 : 0.0;
+                for (let si = 0; si < segs.length; si++) {
+                    const segEntry = segs[si];
+                    if (!segEntry) continue;
+                    const segObj = segEntry.pivot || segEntry;
+                    if (!segObj || !segObj.rotation) continue;
+                    const baseRX = segEntry.baseRotX ?? (segObj.userData ? segObj.userData.baseRotX : 0) ?? 0;
+                    const frac = si / Math.max(1, segs.length - 1);
+                    const swayZ = Math.sin(ud.pulsePhase * 1.35 - si * 0.65) * (0.06 + frac * 0.08) * (1.0 - w * 0.6);
+                    const swayX = Math.cos(ud.pulsePhase * 1.1 - si * 0.5) * 0.05;
+                    const sCurveWhip = (si < 2 ? -whipPhase * 0.55 : whipPhase * (0.65 + frac * 0.75));
+                    segObj.rotation.x = baseRX + targetLean + swayX + sCurveWhip;
+                    segObj.rotation.z = swayZ;
+                }
+            }
+            if (ud.mawJaws) {
+                const flare = (eb.whipAnim || 0) * 0.55 + Math.sin(ud.pulsePhase * 2.2) * 0.08;
+                ud.mawJaws.forEach(j => {
+                    j.pivot.rotation.x = j.baseFlare + flare;
+                });
+            }
+        }
+
+        // Unique Enemy Subterranean Tremor Drill Defense Building: drills down into borehole & erupts upward under units in radius!
+        if (eb.role === 'drill_tower' && state.basePlaced && !state.missionWon) {
+            eb.cooldown = (eb.cooldown || 0) - dt;
+            const drillRad = eb.drillRadius || 18.5;
+            let groundTarget = null, minDist = drillRad;
+            units.forEach(u => {
+                if (u.isAir) return;
+                const d = Math.hypot(u.mesh.position.x - eb.pos.x, u.mesh.position.z - eb.pos.z);
+                if (d < minDist) { minDist = d; groundTarget = u; }
+            });
+            if (!groundTarget) {
+                buildings.forEach(b => {
+                    const d = Math.hypot(b.pos.x - eb.pos.x, b.pos.z - eb.pos.z);
+                    if (d < minDist) { minDist = d; groundTarget = b; }
+                });
+            }
+
+            if (ud.drillAssembly) {
+                const isDrilling = !!groundTarget;
+                ud.drillAssembly.rotation.y += dt * (isDrilling ? 22.0 : 4.5);
+                const targetDepth = isDrilling ? (0.48 + Math.sin(ud.pulsePhase * 5.0) * 0.28) : 1.05;
+                ud.drillAssembly.position.y = THREE.MathUtils.lerp(ud.drillAssembly.position.y, targetDepth, dt * 8.0);
+            }
+            if (ud.seismicRing) {
+                const sScale = 0.85 + (ud.pulsePhase % 1.8) * 0.35;
+                ud.seismicRing.scale.setScalar(sScale);
+            }
+
+            if (groundTarget && eb.cooldown <= 0) {
+                const tPos = (groundTarget.mesh ? groundTarget.mesh.position : groundTarget.pos).clone();
+                if (typeof spawnSubterraneanDrillEruptionFX === 'function') {
+                    spawnSubterraneanDrillEruptionFX(tPos);
+                }
+                const dmg = Math.round(34 * getWaveStrengthMultiplier());
+                units.forEach(u => {
+                    if (u.isAir) return;
+                    if (Math.hypot(u.mesh.position.x - tPos.x, u.mesh.position.z - tPos.z) <= 2.4) {
+                        recordRagdollHitImpulse(u, tPos, true);
+                        applyDamageWithTurretShield(u, dmg);
+                        spawnCombatFloat(u.mesh.position, `${dmg} DRILL`, '#ff5400');
+                    }
+                });
+                buildings.forEach(b => {
+                    if (Math.hypot(b.pos.x - tPos.x, b.pos.z - tPos.z) <= 2.8) {
+                        applyDamageWithTurretShield(b, dmg);
+                        spawnCombatFloat(b.pos, `${dmg} DRILL`, '#ff5400');
+                        if (b === state.baseBuilding) updateHUD();
+                    }
+                });
+                eb.cooldown = 2.45;
+            }
+        }
+
+        const armyScaledEnemyCap = state.isEndless
+            ? Math.min(78, 28 + Math.floor(units.length * 1.55))
+            : Math.min(54, 26 + Math.floor(units.length * 0.85));
+        if (state.basePlaced && !state.missionWon && enemies.length < armyScaledEnemyCap) {
+            if (eb.role === 'barracks') {
+                eb.spawnTimer -= dt;
+                if (eb.spawnTimer <= 0) {
+                    const r = Math.random();
+                    let v = 'skitterer';
+                    if (state.rushGraceTimer > 0 && !state.isEndless) {
+                        v = r < 0.65 ? 'skitterer' : 'spitter';
+                        eb.spawnDuration = Math.max(6.5, 9.5 - state.wave * 0.25);
+                        eb.spawnTimer = eb.spawnDuration;
+                    } else {
+                        v = r < 0.35 ? 'skitterer' : (r < 0.60 ? 'spitter' : (r < 0.78 ? 'burster' : 'mutalisk'));
+                        eb.spawnDuration = Math.max(4.2, 7.8 - state.wave * 0.25);
+                        eb.spawnTimer = eb.spawnDuration;
+                    }
+                    spawnEnemyFromBuilding(v, eb.pos);
+                }
+            } else if (eb.role === 'factory') {
+                eb.spawnTimer -= dt;
+                if (eb.spawnTimer <= 0) {
+                    if (state.rushGraceTimer > 0 && !state.isEndless) {
+                        eb.spawnDuration = 14.0;
+                        eb.spawnTimer = 14.0;
+                    } else {
+                        const r = Math.random();
+                        const v = r < 0.38 ? 'gorgon' : (r < 0.65 ? 'crusher' : (r < 0.86 ? 'behemoth' : 'mutalisk'));
+                        spawnEnemyFromBuilding(v, eb.pos);
+                        eb.spawnDuration = Math.max(7.5, 13.5 - state.wave * 0.35);
+                        eb.spawnTimer = eb.spawnDuration;
+                    }
+                }
+            }
+        }
+    }
+
+    // Update 3rd Faction: Autonomous Solaris Chrono-Synod Enclave Structures, Khaydarin Pylons, Robotics Bays, Cannon Spires & Warp Gates
+    for (let i = solarisBuildings.length - 1; i >= 0; i--) {
+        const sb = solarisBuildings[i];
+        if (!sb || sb.hp <= 0) {
+            if (sb && sb.mesh) scene.remove(sb.mesh);
+            if (sb && sb.hb && sb.hb.root) sb.hb.root.remove();
+            solarisBuildings.splice(i, 1);
+            continue;
+        }
+        if (sb.buildProgress !== undefined && sb.buildProgress < 1.0) {
+            sb.buildProgress = Math.min(1.0, sb.buildProgress + dt * 0.085);
+            if (sb.spawnTimer !== undefined) sb.spawnTimer = 13.5;
+        }
+        if (sb.maxShield && sb.maxShield > 0) {
+            sb.shieldRegenDelay = Math.max(0, (sb.shieldRegenDelay || 0) - dt);
+            if (sb.shieldRegenDelay <= 0 && (sb.shield || 0) < sb.maxShield) {
+                sb.shield = Math.min(sb.maxShield, (sb.shield || 0) + 24 * dt);
+            }
+        }
+        const sbInViewport = window.isWorldPosInViewport(sb.pos.x, sb.pos.y, sb.pos.z, 6.5);
+        sb.mesh.visible = sbInViewport;
+        if (sbInViewport) {
+            updateBuildingMechanicsAndDamage(sb, dt);
+        }
+        if (sbInViewport && isWorldPosVisible(sb.pos.x, sb.pos.z)) {
+            updateHealthPip(sb.hb, sb.hp, sb.maxHp, sb.shield || 0, sb.maxShield || 0);
+            projectToScreen(sb.hb.root, sb.pos, sb.role === 'nexus' ? 3.2 : 2.2);
+        } else if (sb.hb && sb.hb.root && sb.hb.root.style.display !== 'none') {
+            sb.hb.root.style.display = 'none';
+        }
+
+        if (sb.buildProgress !== undefined && sb.buildProgress < 1.0) continue;
+
+        if (state.basePlaced && !state.missionWon) {
+            if (sb.role === 'spire') {
+                sb.cooldown = (sb.cooldown || 0) - dt;
+                let nearestEnemy = null, minDist = 24.5;
+                enemies.forEach(e => {
+                    if (e.hp <= 0) return;
+                    const d = sb.pos.distanceTo(e.mesh.position);
+                    if (d < minDist) { minDist = d; nearestEnemy = e; }
+                });
+                if (!nearestEnemy && !state.solarisHostile) {
+                    enemyBuildings.forEach(eb => {
+                        if (eb.hp <= 0) return;
+                        const d = sb.pos.distanceTo(eb.pos);
+                        if (d < minDist) { minDist = d; nearestEnemy = eb; }
+                    });
+                }
+                if (state.solarisHostile && !nearestEnemy) {
+                    units.forEach(u => {
+                        if (u.hp <= 0) return;
+                        const d = sb.pos.distanceTo(u.mesh.position);
+                        if (d < minDist) { minDist = d; nearestEnemy = u; }
+                    });
+                }
+                if (nearestEnemy && sb.cooldown <= 0) {
+                    const muzzle = sb.pos.clone().add(new THREE.Vector3(0, 2.55, 0));
+                    launchOrdProjectile(muzzle, nearestEnemy, 'solaris_spire', 42, state.solarisHostile && units.includes(nearestEnemy));
+                    sb.cooldown = 1.15;
+                }
+            } else if ((sb.role === 'gate' || sb.role === 'robotics') && !state.solarisHostile) {
+                // Only completed Protoss Warp Gates ('gate') & Robotics Bays ('robotics') spawn Solaris Protoss units!
+                sb.spawnTimer = (sb.spawnTimer || 13.5) - dt;
+                if (sb.spawnTimer <= 0) {
+                    const activeSolUnits = units.filter(u => ['zealot', 'stalker', 'archon'].includes(u.type));
+                    if (units.length < 38 && activeSolUnits.length < 16) {
+                        const doc = state.solarisDoctrine || 'zealot_rush';
+                        const r = Math.random();
+                        const sUnit = sb.role === 'robotics'
+                            ? (r < 0.55 ? 'archon' : 'stalker')
+                            : (doc === 'zealot_rush'
+                                ? (r < 0.72 ? 'zealot' : 'stalker')
+                                : (doc === 'massive_fleet'
+                                    ? (r < 0.48 ? 'archon' : (r < 0.85 ? 'stalker' : 'zealot'))
+                                    : (r < 0.45 ? 'zealot' : (r < 0.80 ? 'stalker' : 'archon'))));
+                        spawnAlliedUnit(sUnit, sb.pos);
+                        const spawned = units[units.length - 1];
+                        if (spawned) {
+                            if (doc === 'zealot_rush' || sb.isProxy) {
+                                spawned.order = 'attack_move';
+                                spawned.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
+                            } else if (doc === 'massive_fleet' && activeSolUnits.length < 7) {
+                                spawned.isSolarisFleetStaged = true;
+                                spawned.order = 'attack_move';
+                                spawned.orderTarget = new THREE.Vector3(
+                                    THREE.MathUtils.lerp(SOLARIS_BASE_POS.x, ENEMY_BASE_POS.x, 0.42),
+                                    0,
+                                    THREE.MathUtils.lerp(SOLARIS_BASE_POS.z, ENEMY_BASE_POS.z, 0.42)
+                                );
+                            }
+                        }
+                        if (activeSolUnits.length >= 6) {
+                            units.forEach(su => {
+                                if (su && su.isSolarisFleetStaged) {
+                                    su.isSolarisFleetStaged = false;
+                                    su.order = 'attack_move';
+                                    su.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
+                                }
+                            });
+                        }
+                    }
+                    sb.spawnTimer = sb.role === 'robotics' ? 16.0 : 13.5;
+                }
+            }
+        }
+    }
+
+    if (!state.isEndless && !state.missionWon && enemyBuildings.length === 0) {
+        state.missionWon = true;
+        creepTargetRadius = 0;
+        recallAllFriendlyUnitsToMainBase();
+        updateHUD();
+        document.getElementById('victory-modal').style.display = 'block';
+    }
+
+    if (state.baseBuilding) {
+        const em = state.baseBuilding.mesh.userData.emblem;
+        if (em) {
+            em.rotation.y += dt * 0.55;
+            if (em.userData.holoPlane) {
+                em.userData.holoPlane.position.y = 2.85 + Math.sin(now * 0.003) * 0.18;
+            }
+        }
+    }
+
+    if (flashLight.intensity > 0) flashLight.intensity = Math.max(0, flashLight.intensity - dt * 28);
+    if (screenShake > 0) {
+        camera.position.x += (Math.random() - 0.5) * screenShake;
+        camera.position.y += (Math.random() - 0.5) * screenShake;
+        screenShake = Math.max(0, screenShake - dt * 2.8);
+    }
+
+    if (state.basePlaced && state.baseBuilding && state.baseBuilding.hp > 0 && !state.missionWon) {
+        if (state.isEndless) {
+            endlessSpawnClock -= dt;
+            if (endlessSpawnClock <= 0) {
+                // Scale Endless Mode enemy wave size & cap dynamically with Player Army Size!
+                const playerArmyCount = units.length;
+                const endlessEnemyCap = Math.min(85, 30 + Math.floor(playerArmyCount * 1.65));
+                const batchCount = Math.min(6, 1 + Math.floor(playerArmyCount / 6) + Math.floor(state.wave / 4));
+                const pool = ['skitterer', 'spitter', 'burster', 'mutalisk', 'crusher', 'gorgon', 'behemoth'];
+                if (enemies.length < endlessEnemyCap) {
+                    for (let bIdx = 0; bIdx < batchCount; bIdx++) {
+                        if (enemies.length >= endlessEnemyCap) break;
+                        const a = Math.random() * Math.PI * 2;
+                        const spawnDist = 46 + Math.random() * 24;
+                        const origin = new THREE.Vector3(
+                            THREE.MathUtils.clamp(state.baseBuilding.pos.x + Math.cos(a) * spawnDist, -104, 104),
+                            0,
+                            THREE.MathUtils.clamp(state.baseBuilding.pos.z + Math.sin(a) * spawnDist, -104, 104)
+                        );
+                        if (isWalkableGround(origin.x, origin.z)) {
+                            spawnEnemyFromBuilding(pool[Math.floor(Math.random() * pool.length)], origin);
+                        }
+                    }
+                }
+                const armyRateAccel = Math.min(1.3, playerArmyCount * 0.045);
+                endlessSpawnClock = Math.max(0.85, 3.6 - state.wave * 0.16 - armyRateAccel);
+            }
+        }
+
+        for (let i = buildings.length - 1; i >= 0; i--) {
+            const b = buildings[i];
+            if (b.hp <= 0) {
+                if (b.type === 'turret') {
+                    if (b.mesh.userData.mounts) {
+                        ['left', 'right', 'top'].forEach(s => {
+                            const m = b.mesh.userData.mounts[s];
+                            if (m && m.userData.repairBeam) scene.remove(m.userData.repairBeam);
+                            if (m && m.userData.mindBeam) scene.remove(m.userData.mindBeam);
+                        });
+                    }
+                    if (b.turretBadge) b.turretBadge.remove();
+                }
+                if (typeof window.spawnTerranBaseBlastCrater === 'function') {
+                    window.spawnTerranBaseBlastCrater(b.pos, b.type === 'base' ? 2.75 : 1.65);
+                }
+                spawnVehicleWreckageExplosion(b.pos, 'tank');
+                scene.remove(b.mesh);
+                b.hb.root.remove();
+                if (state.selectedBuilding === b) selectStructure(null);
+
+                if (b.type === 'hero') {
+                    state.heroPlaced = false;
+                    renderSC2CommandCard();
+                }
+                if (b.type === 'base') {
+                    // Automatic Emergency Overload Fail-Safe (or manual Emergency Repair)
+                    const nowSec = state.elapsedSec;
+                    if (!b.lastAutoOverload || (nowSec - b.lastAutoOverload) >= 25.0) {
+                        b.lastAutoOverload = nowSec;
+                        executeHQEmergencyOverloadRepair();
+                        continue;
+                    }
+                    updateHUD();
+                    document.getElementById('directive-ticker').innerText = "CRITICAL FAILURE: COMMAND HQ CRITICAL — TRIGGER EMERGENCY OVERLOAD REPAIR!";
+                    document.getElementById('directive-ticker').style.color = "#ff2a4b";
+                    break;
+                }
+                buildings.splice(i, 1);
+                continue;
+            }
+
+            if (b.maxShield && b.maxShield > 0) {
+                b.shieldRegenDelay = Math.max(0, (b.shieldRegenDelay || 0) - dt);
+                if (b.shieldRegenDelay <= 0 && (b.shield || 0) < b.maxShield) {
+                    b.shield = Math.min(b.maxShield, (b.shield || 0) + 22 * dt);
+                }
+            }
+            const bInViewport = window.isWorldPosInViewport(b.pos.x, b.pos.y, b.pos.z, 6.5);
+            if (b.mesh) b.mesh.visible = bInViewport;
+            if (bInViewport) {
+                updateBuildingMechanicsAndDamage(b, dt);
+                updateHealthPip(b.hb, b.hp, b.maxHp, b.shield || 0, b.maxShield || 0);
+                projectToScreen(b.hb.root, b.pos, b.type === 'base' ? 2.1 : 1.6);
+            } else if (b.hb && b.hb.root && b.hb.root.style.display !== 'none') {
+                b.hb.root.style.display = 'none';
+            }
+
+            // Wait for construction animation to finish (`buildProgress >= 1.0`) before spawning units or operating turrets!
+            if (b.buildProgress < 1.0) continue;
+
+            if (b.mesh.userData.rotor) b.mesh.userData.rotor.rotation.y += dt * 2.0;
+
+            if (b.type === 'barracks') {
+                const infCount = units.filter(u => ['grunt', 'ranger', 'medic', 'rocketman', 'reaper', 'firebat', 'marauder'].includes(u.type)).length;
+                if (infCount < 24) {
+                    b.spawnTimer -= dt;
+                    if (b.spawnTimer <= 0) {
+                        spawnAlliedUnit(b.unitType, b.pos);
+                        const infTimes = { grunt: 9.0, ranger: 10.0, medic: 10.5, rocketman: 11.5, reaper: 10.0, firebat: 11.0, marauder: 12.5 };
+                        b.spawnDuration = infTimes[b.unitType] || 10.0;
+                        b.spawnTimer = b.spawnDuration;
+                        b.doorHoldTimer = 1.2;
+                    }
+                }
+            }
+            else if (b.type === 'factory' || b.type === 'solaris_robotics') {
+                const hasActiveBarracks = buildings.some(allyB => (allyB.type === 'barracks' || allyB.type === 'solaris_gate') && allyB.hp > 0 && allyB.buildProgress >= 1.0);
+                if (b.unitType === 'transport' && !hasActiveBarracks) {
+                    // Dropship requires an active Barracks / Warp Gate to operate!
+                    b.spawnTimer = b.spawnDuration;
+                } else {
+                    const vehCount = units.filter(u => ['tank', 'siege_tank', 'heli', 'transport', 'valkyrie'].includes(u.type)).length;
+                    if (vehCount < 10) {
+                        b.spawnTimer -= dt;
+                        if (b.spawnTimer <= 0) {
+                            spawnAlliedUnit(b.unitType, b.pos);
+                            const vehTimes = { tank: 15.5, siege_tank: 18.0, heli: 14.0, transport: 14.0, valkyrie: 16.5 };
+                            b.spawnDuration = vehTimes[b.unitType] || 15.5;
+                            b.spawnTimer = b.spawnDuration;
+                            b.doorHoldTimer = 1.5;
+                        }
+                    }
+                }
+            }
+            else if (b.type === 'solaris_gate') {
+                const solCount = units.filter(u => ['zealot', 'stalker', 'archon'].includes(u.type)).length;
+                if (solCount < 12) {
+                    b.spawnTimer -= dt;
+                    if (b.spawnTimer <= 0) {
+                        const sType = b.unitType || 'zealot';
+                        spawnAlliedUnit(sType, b.pos);
+                        const solTimes = { zealot: 10.0, stalker: 12.0, archon: 15.5 };
+                        b.spawnDuration = solTimes[sType] || 11.0;
+                        b.spawnTimer = b.spawnDuration;
+                    }
+                }
+            }
+            else if (b.type === 'mine_drill') {
+                // Animate Deep-Core Tungsten Auger Rotation & Vertical Reciprocating Bore Stroke
+                if (b.mesh && b.mesh.userData && b.mesh.userData.drillAuger) {
+                    const auger = b.mesh.userData.drillAuger;
+                    auger.rotation.y += dt * 14.0;
+                    auger.position.y = 0.86 + Math.sin(now * 0.012) * 0.14;
+                }
+                b.mineTimer = (b.mineTimer === undefined ? 4.0 : b.mineTimer) - dt;
+                if (b.mineTimer <= 0) {
+                    b.mineTimer = 4.0;
+                    state.req += 10;
+                    const crater = b.linkedCrater;
+                    if (crater) {
+                        if (crater.isEmpty || crater.gemsRemaining <= 0) {
+                            if (!b.emptyNotified) {
+                                b.emptyNotified = true;
+                                spawnCombatFloat(b.pos, 'GEM CRATER EMPTY! (+14M ONLY — FIND ANOTHER CRATER)', '#94a3b8');
+                            } else {
+                                spawnCombatFloat(b.pos, '+14M (EMPTY CRATER)', '#00e5ff');
+                            }
+                        } else {
+                            const extracted = Math.min(15, crater.gemsRemaining);
+                            crater.gemsRemaining -= extracted;
+                            state.gems = (state.gems || 0) + extracted;
+                            b.totalMinedGems = (b.totalMinedGems || 0) + extracted;
+                            if (typeof window.updateGemCraterDepletionVisuals === 'function') {
+                                window.updateGemCraterDepletionVisuals(crater);
+                            }
+                            spawnCombatFloat(b.pos, `+14M & +${extracted} GEMS!`, '#f0abfc');
+
+                            // Every 45 Gems extracted from a rich crater automatically grants a bonus reinforcement unit or build cache!
+                            if (b.totalMinedGems > 0 && b.totalMinedGems % 45 === 0) {
+                                const bonusOrigin = state.baseBuilding ? state.baseBuilding.pos : b.pos;
+                                if (units.length < 38) {
+                                    const rewardPool = ['ranger', 'marauder', 'tank', 'siege_tank'];
+                                    const rUnit = rewardPool[Math.floor(Math.random() * rewardPool.length)];
+                                    spawnAlliedUnit(rUnit, bonusOrigin);
+                                    spawnCombatFloat(bonusOrigin, `GEM BONUS TROOP: +1 ${rUnit.toUpperCase()}!`, '#00ff66');
+                                } else {
+                                    state.req += 110;
+                                    spawnCombatFloat(b.pos, 'GEM BONUS CACHE: +110 MINERALS!', '#00ff66');
+                                }
+                            }
+
+                            if (crater.gemsRemaining <= 0) {
+                                if (typeof window.depleteGemCraterVisuals === 'function') {
+                                    window.depleteGemCraterVisuals(crater);
+                                }
+                                spawnCombatFloat(b.pos, 'GEM CRATER DEPLETED (NOW EMPTY) — SCOUT FOR MORE!', '#ffaa00');
+                            }
+                        }
+                    } else {
+                        spawnCombatFloat(b.pos, '+14 MINERALS', '#00e5ff');
+                    }
+                    if (state.selectedBuilding === b) renderSC2CommandCard();
+                    updateHUD();
+                }
+            }
+            else if (b.type === 'turret') {
+                // Defensive null-guards for turret weapons, cooldowns, and mount sockets
+                if (!b.weapons) b.weapons = { left: 'none', right: 'none', top: 'none' };
+                if (!b.cooldowns) b.cooldowns = { left: 0, right: 0, top: 0 };
+                if (b.currentYaw === undefined) b.currentYaw = 0;
+                const mounts = (b.mesh && b.mesh.userData && b.mesh.userData.mounts) ? b.mesh.userData.mounts : {};
+
+                // 1. Update Autonomous Fixing Drones on any slot (Patches up friendly MECHANICAL UNITS and STRUCTURES with 3D Nano-Weld Beam!)
+                ['left', 'right', 'top'].forEach(slot => {
+                    if (b.weapons[slot] !== 'drone') return;
+                    b.cooldowns[slot] -= dt;
+                    const pod = mounts[slot];
+                    if (!pod || !pod.userData.droneMesh) return;
+
+                    const drone = pod.userData.droneMesh;
+                    pod.userData.dronePhase = (pod.userData.dronePhase || 0) + dt * 4.5;
+                    drone.position.y = 0.68 + Math.sin(pod.userData.dronePhase) * 0.14;
+                    drone.position.x = Math.cos(pod.userData.dronePhase * 0.6) * 0.22;
+                    if (pod.userData.droneRotors) {
+                        pod.userData.droneRotors.forEach(r => { r.rotation.y += dt * 32; });
+                    }
+
+                    // Fixing Drone patches up damaged friendly Mechanical Units (Tanks, Siege Tanks, Gunships, Dropships, Valkyries) AND friendly Buildings within 19.5m!
+                    let repairTarget = null, lowestRatio = 1.0, isUnitTarget = false;
+                    units.forEach(allyU => {
+                        if (allyU && allyU.isMechanical && allyU.hp > 0 && allyU.hp < allyU.maxHp && allyU.mesh) {
+                            if (b.pos.distanceTo(allyU.mesh.position) <= 19.5) {
+                                const r = allyU.hp / allyU.maxHp;
+                                if (r < lowestRatio) {
+                                    lowestRatio = r;
+                                    repairTarget = allyU;
+                                    isUnitTarget = true;
+                                }
+                            }
+                        }
+                    });
+                    buildings.forEach(allyB => {
+                        if (allyB.hp > 0 && allyB.hp < allyB.maxHp && b.pos.distanceTo(allyB.pos) <= 19.5) {
+                            const r = allyB.hp / allyB.maxHp;
+                            if (r < lowestRatio) {
+                                lowestRatio = r;
+                                repairTarget = allyB;
+                                isUnitTarget = false;
+                            }
+                        }
+                    });
+
+                    let rBeam = pod.userData.repairBeam;
+                    if (rBeam && !rBeam.userData?.coreMesh && typeof window.createRepairBeamAssembly === 'function') {
+                        scene.remove(rBeam);
+                        rBeam = window.createRepairBeamAssembly();
+                        scene.add(rBeam);
+                        pod.userData.repairBeam = rBeam;
+                    }
+
+                    if (repairTarget) {
+                        repairTarget.hp = Math.min(repairTarget.maxHp, repairTarget.hp + 38 * dt);
+                        repairTarget.isBeingRepairedTimer = 0.55;
+                        if (repairTarget.hb) {
+                            updateHealthPip(repairTarget.hb, repairTarget.hp, repairTarget.maxHp, repairTarget.shield || 0, repairTarget.maxShield || 0);
+                        }
+                        if (
+                            window.PORTRAIT_3D_VIEWER &&
+                            typeof window.PORTRAIT_3D_VIEWER.setRepairing === 'function' &&
+                            (state.selectedUnits.includes(repairTarget) || state.selectedBuilding === repairTarget || state.selectedBuilding === b)
+                        ) {
+                            window.PORTRAIT_3D_VIEWER.setRepairing(true, 0.75);
+                        }
+
+                        const dWorld = drone.getWorldPosition(new THREE.Vector3());
+                        const rawTargetPos = isUnitTarget ? repairTarget.mesh.position : repairTarget.pos;
+                        const tWorld = rawTargetPos.clone().add(new THREE.Vector3(0, isUnitTarget && repairTarget.isAir ? 0.0 : 0.85, 0));
+                        if (rBeam) {
+                            if (typeof window.updateRepairBeamAssembly === 'function' && rBeam.userData?.coreMesh) {
+                                window.updateRepairBeamAssembly(rBeam, dWorld, tWorld, dt);
+                            } else {
+                                const dist = dWorld.distanceTo(tWorld);
+                                const pulseThick = 0.9 + Math.sin(pod.userData.dronePhase * 4) * 0.35;
+                                rBeam.visible = true;
+                                rBeam.position.lerpVectors(dWorld, tWorld, 0.5);
+                                rBeam.scale.set(pulseThick, pulseThick, dist);
+                                rBeam.lookAt(tWorld);
+                            }
+                        }
+                        if (b.cooldowns[slot] <= 0) {
+                            spawnNanoWeldSparkFX(tWorld);
+                            if (window.SFX) window.SFX.playHeal();
+                            b.cooldowns[slot] = 0.85;
+                        }
+                    } else if (rBeam) {
+                        rBeam.visible = false;
+                    }
+                });
+
+                // 1B. Update Shield Dome Generator, Mind Control Emitter Slots & Procedural Hardpoint Snap Animation
+                ['left', 'right', 'top'].forEach(slot => {
+                    const w = b.weapons[slot];
+                    const pod = mounts[slot];
+                    if (pod && pod.userData.snapAnim > 0 && pod.userData.snapBasePos && pod.userData.snapNormal) {
+                        pod.userData.snapAnim = Math.max(0, pod.userData.snapAnim - dt * 6.5);
+                        const s = pod.userData.snapAnim * 0.14;
+                        pod.position.set(
+                            pod.userData.snapBasePos.x + pod.userData.snapNormal.x * s,
+                            pod.userData.snapBasePos.y + pod.userData.snapNormal.y * s,
+                            pod.userData.snapBasePos.z + pod.userData.snapNormal.z * s
+                        );
+                    }
+                    if (w === 'shield' && pod) {
+                        b.cooldowns[slot] -= dt;
+                        if (pod.userData.shieldRings) {
+                            pod.userData.shieldRings.forEach((r, idx) => {
+                                r.rotation.z += dt * (idx % 2 === 0 ? 3.5 : -3.5);
+                            });
+                        }
+                        if (b.maxShieldHp > 0) {
+                            if (b.shieldBrokenTimer > 0) {
+                                b.shieldBrokenTimer = Math.max(0, b.shieldBrokenTimer - dt);
+                                b.shieldHp = 0;
+                                if (b.shieldBrokenTimer <= 0) {
+                                    b.shieldHp = 160;
+                                    spawnCombatFloat(b.pos, 'SHIELD BARRIER ONLINE!', '#00e5ff');
+                                }
+                            } else {
+                                b.shieldHp = Math.min(b.maxShieldHp, (b.shieldHp || 0) + 22 * dt);
+                            }
+                            if (b.shieldDomeMesh) {
+                                b.shieldDomeMesh.visible = b.shieldHp > 15 && !(b.shieldBrokenTimer > 0);
+                                b.shieldDomeMesh.rotation.y += dt * 0.45;
+                            }
+                        }
+                    } else if (w === 'mindcontrol' && pod) {
+                        b.cooldowns[slot] -= dt;
+                        if (pod.userData.psiRings) {
+                            pod.userData.psiRings.forEach((r, idx) => {
+                                r.rotation.z += dt * (idx % 2 === 0 ? 4.2 : -4.2);
+                            });
+                        }
+                        const mBeam = pod.userData.mindBeam;
+                        if (mBeam && b.cooldowns[slot] < 4.8) mBeam.visible = false;
+                    }
+                });
+
+                // Rotate visual range sector arcs to match turret heading
+                if (b.mesh && b.mesh.userData && b.mesh.userData.rangeGroup) {
+                    b.mesh.userData.rangeGroup.rotation.y = b.currentYaw || 0;
+                }
+
+                // 2. Smart Target Selection up to 22.0m for Equipped Combat Weapons
+                const hasSniper = ['left', 'right', 'top'].some(s => b.weapons[s] === 'sniper');
+                const hasAoE = ['left', 'right', 'top'].some(s => ['flame', 'plasma', 'mortar', 'rocket'].includes(b.weapons[s]));
+                const nearest = selectSmartTarget(b.pos, 22.0, true, hasSniper, hasAoE);
+                const minDist = nearest ? b.pos.distanceTo(nearest.mesh ? nearest.mesh.position : nearest.pos) : Infinity;
+
+                if (nearest && minDist <= 22.0) {
+                    const head = (b.mesh && b.mesh.userData) ? b.mesh.userData.head : null;
+                    const tPos = nearest.mesh ? nearest.mesh.position : nearest.pos;
+
+                    const dx = tPos.x - b.pos.x;
+                    const dz = tPos.z - b.pos.z;
+                    const desiredYaw = Math.atan2(dx, dz);
+                    const angleDiff = shortestAngleDiff(b.currentYaw, desiredYaw);
+                    const maxStep = TURRET_TURN_SPEED * dt;
+
+                    if (Math.abs(angleDiff) <= maxStep) b.currentYaw = desiredYaw;
+                    else b.currentYaw += Math.sign(angleDiff) * maxStep;
+                    if (head) head.rotation.y = b.currentYaw;
+
+                    const isAimed = Math.abs(angleDiff) < 0.35;
+
+                    ['left', 'right', 'top'].forEach(slot => {
+                        const w = b.weapons[slot];
+                        if (!w || w === 'none' || w === 'drone' || w === 'shield') return;
+                        b.cooldowns[slot] -= dt;
+
+                        const pod = mounts[slot];
+                        const basePodZ = (pod && pod.userData.snapBasePos) ? pod.userData.snapBasePos.z : 0;
+                        if (pod && !(pod.userData.snapAnim > 0)) {
+                            pod.position.z = THREE.MathUtils.lerp(pod.position.z, basePodZ, dt * 12);
+                            if (pod.userData.barrelCluster && isAimed) pod.userData.barrelCluster.rotation.z += dt * 18;
+                        }
+                        if (!isAimed) return;
+
+                        const muzzle = pod ? pod.getWorldPosition(new THREE.Vector3()) : b.pos.clone();
+
+                        if (w === 'mg' && minDist <= 14.0 && b.cooldowns[slot] <= 0) {
+                            launchOrdProjectile(muzzle, nearest, 'mg', 16);
+                            triggerMuzzleFlash(muzzle);
+                            ejectBrassCasing(muzzle);
+                            if (pod) pod.position.z = basePodZ - 0.09;
+                            b.cooldowns[slot] = 0.2;
+                        }
+                        else if (w === 'flame' && minDist <= 7.5 && b.cooldowns[slot] <= 0) {
+                            if (particles.length < 140) {
+                                const fireBall = new THREE.Mesh(
+                                    SHARED_FX_GEO.fireBall,
+                                    Math.random() > 0.4 ? MAT.amberGlow : MAT.crimsonTank
+                                );
+                                fireBall.position.copy(muzzle);
+                                scene.add(fireBall);
+                                const dir = tPos.clone().sub(muzzle).normalize();
+                                particles.push({
+                                    mesh: fireBall,
+                                    vel: dir.multiplyScalar(11).add(new THREE.Vector3((Math.random()-0.5)*2, 1, (Math.random()-0.5)*2)),
+                                    gravity: -2,
+                                    life: 0.32
+                                });
+                            }
+                            recordRagdollHitImpulse(nearest, muzzle, false);
+                            nearest.hp -= 9;
+                            b.cooldowns[slot] = 0.08;
+                        }
+                        else if (w === 'plasma' && minDist <= 16.5 && b.cooldowns[slot] <= 0) {
+                            launchOrdProjectile(muzzle, nearest, 'plasma', 42);
+                            triggerMuzzleFlash(muzzle);
+                            if (pod) pod.position.z = basePodZ - 0.14;
+                            b.cooldowns[slot] = 0.72;
+                        }
+                        else if (w === 'rocket' && minDist <= 20.0 && b.cooldowns[slot] <= 0) {
+                            // Swarm Rocket Missile Pod: Fires twin ballistic high-explosive missiles!
+                            const leftMuzzle = muzzle.clone().add(new THREE.Vector3(-0.12, 0.06, 0));
+                            const rightMuzzle = muzzle.clone().add(new THREE.Vector3(0.12, 0.06, 0));
+                            launchOrdProjectile(leftMuzzle, nearest, 'rocket', 55);
+                            launchOrdProjectile(rightMuzzle, nearest, 'rocket', 55);
+                            triggerMuzzleFlash(muzzle);
+                            if (pod) pod.position.z = basePodZ - 0.18;
+                            b.cooldowns[slot] = 1.65;
+                        }
+                        else if (w === 'sniper' && minDist <= 22.0 && b.cooldowns[slot] <= 0) {
+                            launchOrdProjectile(muzzle, nearest, 'sniper', 125);
+                            triggerMuzzleFlash(muzzle);
+                            ejectBrassCasing(muzzle);
+                            if (pod) pod.position.z = basePodZ - 0.26;
+                            b.cooldowns[slot] = 2.1;
+                        }
+                        else if (w === 'mortar' && minDist <= 18.0 && b.cooldowns[slot] <= 0) {
+                            launchOrdProjectile(muzzle, nearest, 'mortar', 70);
+                            triggerMuzzleFlash(muzzle);
+                            if (pod) pod.position.z = basePodZ - 0.22;
+                            b.cooldowns[slot] = 2.3;
+                        }
+                        else if (w === 'mindcontrol' && minDist <= 19.0 && b.cooldowns[slot] <= 0) {
+                            // Strictly enforce MAX_MIND_CONTROL_UNITS (3 units) cap!
+                            if (getActiveMindControlledCount() < MAX_MIND_CONTROL_UNITS) {
+                                let domCandidate = null, bestDomScore = -1;
+                                enemies.forEach(e => {
+                                    if (e.hp <= 0) return;
+                                    const d = b.pos.distanceTo(e.mesh.position);
+                                    if (d <= 19.0 && e.maxHp > bestDomScore) {
+                                        bestDomScore = e.maxHp;
+                                        domCandidate = e;
+                                    }
+                                });
+                                if (domCandidate) {
+                                    const mBeam = pod ? pod.userData.mindBeam : null;
+                                    if (mBeam) {
+                                        const end = domCandidate.mesh.position.clone().add(new THREE.Vector3(0, 0.8, 0));
+                                        const dist = muzzle.distanceTo(end);
+                                        mBeam.visible = true;
+                                        mBeam.position.lerpVectors(muzzle, end, 0.5);
+                                        mBeam.scale.set(1.3, 1.3, dist);
+                                        mBeam.lookAt(end);
+                                    }
+                                    convertEnemyWithMindControl(domCandidate, muzzle);
+                                    b.cooldowns[slot] = 5.5;
+                                }
+                            } else {
+                                // At 3/3 Mind Control capacity: fire psionic neural overload zap without converting a 4th unit
+                                const mBeam = pod ? pod.userData.mindBeam : null;
+                                if (mBeam && nearest.mesh) {
+                                    const end = nearest.mesh.position.clone().add(new THREE.Vector3(0, 0.8, 0));
+                                    const dist = muzzle.distanceTo(end);
+                                    mBeam.visible = true;
+                                    mBeam.position.lerpVectors(muzzle, end, 0.5);
+                                    mBeam.scale.set(0.95, 0.95, dist);
+                                    mBeam.lookAt(end);
+                                }
+                                nearest.hp -= 28;
+                                spawnCombatFloat(tPos, 'PSI ZAP (3/3 MAX)', '#d946ef');
+                                b.cooldowns[slot] = 2.2;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Throttle selection HUD updates to ~4.5Hz (0.22s) instead of every frame (60Hz) to prevent multi-unit SVG DOM innerHTML lag!
+        state._hudRefreshTimer = (state._hudRefreshTimer || 0) + dt;
+        if ((state.selectedBuilding || state.selectedUnits.length > 0) && state._hudRefreshTimer >= 0.22) {
+            state._hudRefreshTimer = 0;
+            updateHUD();
+        }
+
+        // Update Allied Units (With Weather Speed Mult, Smart Targeting, Tactical Formations, Dropship Anti-Air Retreat & 360° Heli Belly Turret Aiming)
+        const mainBaseAnchor = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+
+        units.forEach((u, unitIdx) => {
+            u.cooldown -= dt;
+            if (u.maxShield && u.maxShield > 0) {
+                u.shieldRegenDelay = Math.max(0, (u.shieldRegenDelay || 0) - dt);
+                if (u.shieldRegenDelay <= 0 && (u.shield || 0) < u.maxShield) {
+                    u.shield = Math.min(u.maxShield, (u.shield || 0) + 16 * dt);
+                }
+            }
+            const inViewport = window.isWorldPosInViewport(u.mesh.position.x, u.mesh.position.y, u.mesh.position.z, 3.8);
+            u.mesh.visible = inViewport;
+            let moving = false;
+            const envTactical = (!u.isAir && typeof window.getEnvironmentalTacticalModifiers === 'function')
+                ? window.getEnvironmentalTacticalModifiers(u.mesh.position.x, u.mesh.position.z, false, !!u.isVehicle)
+                : null;
+            const roadSpdMult = (envTactical && envTactical.speedMult) ? envTactical.speedMult : 1.0;
+            const effSpeed = (u.type === 'siege_tank' && u.siegeMode) ? 0 : (u.speed * weatherSpdMult * roadSpdMult);
+
+            if (u.selCircle && u.isAir) {
+                const gh = getTerrainHeight(u.mesh.position.x, u.mesh.position.z);
+                u.selCircle.position.y = gh - u.mesh.position.y + 0.12;
+            }
+
+            // Initial post-spawn walk-out step so newly trained ground units immediately clear the building doorway without double-moving
+            if (!u.isAir && !(u.type === 'siege_tank' && u.siegeMode) && u.spawnRallyTimer > 0 && u.spawnRallyTarget && u.order === 'auto') {
+                u.spawnRallyTimer -= dt;
+                const dRally = Math.hypot(u.spawnRallyTarget.x - u.mesh.position.x, u.spawnRallyTarget.z - u.mesh.position.z);
+                if (dRally > 0.55) {
+                    const stepDir = computeSafeGroundStep(u.mesh.position, u.spawnRallyTarget, effSpeed, dt, u, units, buildings, enemyBuildings);
+                    if (stepDir.lengthSq() > 0.0001) {
+                        u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                        alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                        moving = true;
+                        if (inViewport) {
+                            updateUnitAnimation(u.mesh, dt, moving, null);
+                            updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                            projectToScreen(u.hb.root, u.mesh.position, 1.55);
+                        } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                            u.hb.root.style.display = 'none';
+                        }
+                        return;
+                    }
+                } else {
+                    u.spawnRallyTimer = 0;
+                }
+            }
+
+            // --- FORWARD DROPSHIP AI WITH ANTI-AIR THREAT EVASION ('transport') ---
+            // Flies near enemy territory (dedicated slot outside enemy perimeter) to deploy troops,
+            // and automatically GOES BACK toward friendly base if any air-shooting enemy threatens it (or when enemy base is destroyed)!
+            if (u.type === 'transport') {
+                const allDropships = units.filter(x => x.type === 'transport');
+                const myIndex = Math.max(0, allDropships.indexOf(u));
+
+                // Detect if any air-shooting enemy (spitter, mutalisk, behemoth, or spine_turret) is within threat radius (17.5m)
+                let airShootingThreat = null;
+                let minThreatDist = 17.5;
+                enemies.forEach(e => {
+                    if (e.hp <= 0) return;
+                    const shootsAir = (e.variant === 'spitter' || e.variant === 'mutalisk' || e.variant === 'behemoth' || e.range >= 4.0);
+                    if (!shootsAir) return;
+                    const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                    if (d < minThreatDist) {
+                        minThreatDist = d;
+                        airShootingThreat = e;
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (eb.hp <= 0 || eb.role !== 'spine_turret') return;
+                    const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                    if (d < minThreatDist) {
+                        minThreatDist = d;
+                        airShootingThreat = eb;
+                    }
+                });
+
+                const slotAngles = [0.78, 1.32, 0.35, 1.75, 2.15];
+                const slotAng = slotAngles[myIndex % slotAngles.length];
+
+                // Determine Forward Enemy Territory Drop Zone vs Safe Friendly Base Fallback Position
+                const hasEnemyTerritory = enemyBuildings.length > 0;
+                const enemyAnchor = hasEnemyTerritory ? enemyBuildings[0].pos : ENEMY_BASE_POS;
+                const standoffDist = 19.5 + (myIndex % 2) * 4.5;
+                const forwardDropX = THREE.MathUtils.clamp(enemyAnchor.x + Math.cos(slotAng) * standoffDist, -102, 102);
+                const forwardDropZ = THREE.MathUtils.clamp(enemyAnchor.z + Math.sin(slotAng) * standoffDist, -102, 102);
+
+                const safeHomeX = THREE.MathUtils.clamp(mainBaseAnchor.x + Math.cos(slotAng) * (7.5 + myIndex * 2.5), -102, 102);
+                const safeHomeZ = THREE.MathUtils.clamp(mainBaseAnchor.z + Math.sin(slotAng) * (7.5 + myIndex * 2.5), -102, 102);
+
+                if (airShootingThreat) {
+                    u.evasionTimer = 3.6; // Sustain pullback toward friendly base when air-shooting enemy is near
+                } else if (u.evasionTimer > 0) {
+                    u.evasionTimer = Math.max(0, u.evasionTimer - dt);
+                }
+
+                const shouldGoBackToBase = (u.evasionTimer > 0) || !hasEnemyTerritory || u.order === 'retreat';
+
+                let targetX = shouldGoBackToBase ? safeHomeX : forwardDropX;
+                let targetZ = shouldGoBackToBase ? safeHomeZ : forwardDropZ;
+                if ((u.order === 'move' || u.order === 'attack_move' || u.order === 'retreat') && u.orderTarget && !airShootingThreat) {
+                    targetX = u.orderTarget.x;
+                    targetZ = u.orderTarget.z;
+                }
+
+                const dx = targetX - u.mesh.position.x;
+                const dz = targetZ - u.mesh.position.z;
+                const distToDest = Math.hypot(dx, dz);
+
+                let lookX = hasEnemyTerritory && !shouldGoBackToBase ? enemyAnchor.x : mainBaseAnchor.x;
+                let lookZ = hasEnemyTerritory && !shouldGoBackToBase ? enemyAnchor.z : mainBaseAnchor.z;
+
+                if (distToDest > 1.35 && u.order !== 'hold') {
+                    const stepSpd = Math.min(effSpeed, distToDest * 2.2);
+                    u.mesh.position.x += (dx / distToDest) * stepSpd * dt;
+                    u.mesh.position.z += (dz / distToDest) * stepSpd * dt;
+                    lookX = targetX;
+                    lookZ = targetZ;
+                    moving = true;
+                } else {
+                    moving = false;
+                    if (u.order === 'move' || u.order === 'attack_move' || u.order === 'retreat') {
+                        u.order = 'auto';
+                        u.orderTarget = null;
+                    }
+                }
+
+                smoothAirVehicleTransform(u, lookX, lookZ, 6.2, moving, dt);
+
+                // Deploy Infantry Squads when near enemy territory (or rapid drop right as it turns back from an anti-air threat)
+                u.dropTimer -= dt;
+                const nearDropArea = (!shouldGoBackToBase && distToDest < 8.5) || (airShootingThreat && u.dropTimer <= 0.8);
+                if (u.dropTimer <= 0 && nearDropArea && hasEnemyTerritory) {
+                    const hasActiveBarracks = buildings.some(b => b.type === 'barracks' && b.hp > 0 && b.buildProgress >= 1.0);
+                    if (!hasActiveBarracks) {
+                        u.dropTimer = 4.5;
+                    } else if (units.filter(x => !x.isAir).length < 24) {
+                        const clearDrop = typeof findClearSpawnPoint === 'function'
+                            ? findClearSpawnPoint(u.mesh.position.x, u.mesh.position.z, enemyAnchor.x, enemyAnchor.z, 0.55, buildings, enemyBuildings, units)
+                            : new THREE.Vector3(u.mesh.position.x, getTerrainHeight(u.mesh.position.x, u.mesh.position.z), u.mesh.position.z);
+                        if (isWalkableGround(clearDrop.x, clearDrop.z)) {
+                            if (u.mesh.userData) u.mesh.userData.dropAnim = 1.0;
+                            spawnAlliedUnit('grunt', clearDrop);
+                            spawnAlliedUnit('ranger', clearDrop);
+                            u.dropTimer = 9.5;
+                        }
+                    }
+                }
+
+                updateUnitAnimation(u.mesh, dt, moving, null);
+                u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
+                projectToScreen(u.hb.root, u.mesh.position, 1.25);
+                return;
+            }
+
+            if (u.type === 'medic') {
+                if ((u.order === 'move' || u.order === 'retreat' || u.order === 'attack_move') && u.orderTarget) {
+                    const distToOrder = Math.hypot(u.orderTarget.x - u.mesh.position.x, u.orderTarget.z - u.mesh.position.z);
+                    if (distToOrder > 1.35) {
+                        const navPt = getGroundNavigationWaypoint(u.mesh.position, u.orderTarget, u);
+                        const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                            alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(u, navPt, dt);
+                        }
+                        u.healBeam.visible = false;
+                        updateUnitAnimation(u.mesh, dt, moving, null);
+                        u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
+                        projectToScreen(u.hb.root, u.mesh.position, 1.5);
+                        return;
+                    } else {
+                        u.order = 'auto';
+                        u.orderTarget = null;
+                    }
+                }
+
+                let injuredBioAlly = null, minAllyDist = Infinity, bestMedicScore = -Infinity;
+                let isTargetBridgeCongested = false;
+
+                units.forEach(ally => {
+                    if (ally !== u && ally.isBiological && !ally.isMechanical && ally.type !== 'medic') {
+                        const d = u.mesh.position.distanceTo(ally.mesh.position);
+                        const missingRatio = Math.max(0, (ally.maxHp - ally.hp) / Math.max(1, ally.maxHp));
+                        const nearBridgeRear = typeof getRiverDist === 'function'
+                            && getRiverDist(ally.mesh.position.x, ally.mesh.position.z) < (RIVER_HALF_WIDTH + 9.5)
+                            && ally.mesh.position.z > -1.0;
+                        const isRearQueuedOrStuck = (ally.stuckTimer || 0) > 0.08 || (nearBridgeRear && (ally.stuckTimer || 0) > 0.03);
+
+                        // Prioritize injured allies first, plus a strong assist bonus for units stuck/queued at the back of the bridge
+                        if (missingRatio > 0.01 || isRearQueuedOrStuck) {
+                            const score = missingRatio * 120 + (isRearQueuedOrStuck ? 48 : 0) + (nearBridgeRear ? 18 : 0) - d * 1.35;
+                            if (score > bestMedicScore) {
+                                bestMedicScore = score;
+                                injuredBioAlly = ally;
+                                minAllyDist = d;
+                                isTargetBridgeCongested = isRearQueuedOrStuck || nearBridgeRear;
+                            }
+                        }
+                    }
+                });
+                if (!injuredBioAlly) {
+                    units.forEach(ally => {
+                        if (ally !== u && ally.isBiological && !ally.isMechanical && ally.type !== 'medic') {
+                            const d = u.mesh.position.distanceTo(ally.mesh.position);
+                            const nearBridgeRear = typeof getRiverDist === 'function'
+                                && getRiverDist(ally.mesh.position.x, ally.mesh.position.z) < (RIVER_HALF_WIDTH + 10.5)
+                                && ally.mesh.position.z > 0;
+                            // Bias toward escorting units at the rear of a bridge crossing if they are still trying to cross
+                            const effectiveDist = nearBridgeRear ? d * 0.55 : d;
+                            if (effectiveDist < minAllyDist) {
+                                minAllyDist = d;
+                                injuredBioAlly = ally;
+                                isTargetBridgeCongested = nearBridgeRear || (ally.stuckTimer || 0) > 0.06;
+                            }
+                        }
+                    });
+                }
+
+                if (injuredBioAlly) {
+                    const rawDest = injuredBioAlly.mesh.position;
+                    // Move much closer when an ally is injured or queued/unable to cross at the back of the bridge!
+                    const desiredApproachDist = isTargetBridgeCongested ? 1.35 : (injuredBioAlly.hp < injuredBioAlly.maxHp ? u.range * 0.58 : u.range * 0.72);
+
+                    if (minAllyDist <= u.range && injuredBioAlly.hp < injuredBioAlly.maxHp) {
+                        alignGroundUnitToTerrain(u.mesh, rawDest.x, rawDest.z, dt);
+                        injuredBioAlly.hp = Math.min(injuredBioAlly.maxHp, injuredBioAlly.hp + 28 * dt);
+
+                        const start = u.mesh.position.clone().add(new THREE.Vector3(0, 0.75, 0));
+                        const end = rawDest.clone().add(new THREE.Vector3(0, 0.75, 0));
+                        const dist = start.distanceTo(end);
+                        const bioPulse = 0.85 + Math.sin(now * 0.015) * 0.35;
+                        u.healBeam.visible = true;
+                        u.healBeam.position.lerpVectors(start, end, 0.5);
+                        u.healBeam.scale.set(bioPulse, bioPulse, dist);
+                        u.healBeam.lookAt(end);
+
+                        if (u.cooldown <= 0) {
+                            spawnMedicBioPulseFX(rawDest);
+                            spawnCombatFloat(rawDest, '+BIO REGEN', '#00ff66');
+                            if (window.SFX) window.SFX.playHeal();
+                            u.cooldown = 0.85;
+                        }
+
+                        // Even while healing in range, step closer if the target is queued at the back of the bridge
+                        if (minAllyDist > desiredApproachDist && u.order !== 'hold') {
+                            const navPt = getGroundNavigationWaypoint(u.mesh.position, rawDest, u);
+                            const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed * 0.85, dt, u, units, buildings, enemyBuildings);
+                            if (stepDir.lengthSq() > 0.0001) {
+                                u.mesh.position.addScaledVector(stepDir, effSpeed * 0.85 * dt);
+                                moving = true;
+                            }
+                        }
+                    } else if (minAllyDist > desiredApproachDist && u.order !== 'hold') {
+                        const navPt = getGroundNavigationWaypoint(u.mesh.position, rawDest, u);
+                        const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                            alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(u, navPt, dt);
+                        }
+                        u.healBeam.visible = false;
+                    } else {
+                        u.healBeam.visible = false;
+                    }
+                } else {
+                    u.healBeam.visible = false;
+                }
+
+                updateUnitAnimation(u.mesh, dt, moving, null);
+                u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
+                projectToScreen(u.hb.root, u.mesh.position, 1.5);
+                return;
+            }
+
+            // --- SMARTER VALKYRIE VARIABLE-FIGHTER & SEMI-MECH AI ---
+            // Automatically chooses Flight Mode to traverse long distances, rivers, bridges, or complex obstructed terrain fast,
+            // intercepts Air threats in Flight Mode, and smoothly lands into Semi-Mech Walker Mode when arriving at Ground targets!
+            if (u.type === 'valkyrie') {
+                u.modeSwitchCooldown = Math.max(0, (u.modeSwitchCooldown || 0) - dt);
+                if (u.manualModeLockTimer > 0) {
+                    u.manualModeLockTimer = Math.max(0, u.manualModeLockTimer - dt);
+                }
+
+                // Scan for closest Air threat and closest Ground target across the battlefield
+                let closestAirEnemy = null, minAirDist = Infinity;
+                let closestGroundEnemy = null, minGroundDist = Infinity;
+                for (let ei = 0; ei < enemies.length; ei++) {
+                    const en = enemies[ei];
+                    if (!en || en.hp <= 0) continue;
+                    const d = Math.hypot(en.mesh.position.x - u.mesh.position.x, en.mesh.position.z - u.mesh.position.z);
+                    if (en.isAir) {
+                        if (d < minAirDist) { minAirDist = d; closestAirEnemy = en; }
+                    } else {
+                        if (d < minGroundDist) { minGroundDist = d; closestGroundEnemy = en; }
+                    }
+                }
+                let closestEnemyBld = null, minBldDist = Infinity;
+                for (let bi = 0; bi < enemyBuildings.length; bi++) {
+                    const eb = enemyBuildings[bi];
+                    if (!eb || eb.hp <= 0) continue;
+                    const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                    if (d < minBldDist) { minBldDist = d; closestEnemyBld = eb; }
+                }
+
+                // Determine primary tactical destination for navigation/terrain analysis
+                let navGoalPos = null;
+                if ((u.order === 'move' || u.order === 'retreat' || u.order === 'attack_move') && u.orderTarget) {
+                    navGoalPos = u.orderTarget;
+                } else if (closestAirEnemy && minAirDist <= 44.0) {
+                    navGoalPos = closestAirEnemy.mesh.position;
+                } else if (closestGroundEnemy) {
+                    navGoalPos = closestGroundEnemy.mesh.position;
+                } else if (closestEnemyBld) {
+                    navGoalPos = closestEnemyBld.pos;
+                }
+
+                if (!(u.manualModeLockTimer > 0) && u.modeSwitchCooldown <= 0 && u.order !== 'hold') {
+                    const airThreatActive = closestAirEnemy && minAirDist <= 44.0;
+                    const nearestGroundCombatDist = Math.min(minGroundDist, minBldDist);
+                    const distToGoal = navGoalPos
+                        ? Math.hypot(navGoalPos.x - u.mesh.position.x, navGoalPos.z - u.mesh.position.z)
+                        : 0;
+
+                    // Detect complex terrain between Valkyrie and its destination (river crossing, bridge detour, cliff slope, or stuck)
+                    let complexTerrainAhead = false;
+                    if (navGoalPos && distToGoal > 9.5) {
+                        if (typeof getRiverCoords === 'function') {
+                            const rcCur = getRiverCoords(u.mesh.position.x, u.mesh.position.z);
+                            const rcGoal = getRiverCoords(navGoalPos.x, navGoalPos.z);
+                            if ((rcCur.u - rcCur.centerU) * (rcGoal.u - rcGoal.centerU) < 0 || Math.abs(rcCur.u - rcCur.centerU) < RIVER_HALF_WIDTH + 3.5) {
+                                complexTerrainAhead = true;
+                            }
+                        }
+                        if (!complexTerrainAhead && typeof getGroundNavigationWaypoint === 'function') {
+                            const wp = getGroundNavigationWaypoint(u.mesh.position, navGoalPos, u);
+                            const directAng = Math.atan2(navGoalPos.z - u.mesh.position.z, navGoalPos.x - u.mesh.position.x);
+                            const wpAng = Math.atan2(wp.z - u.mesh.position.z, wp.x - u.mesh.position.x);
+                            if (Math.abs(shortestAngleDiff(directAng, wpAng)) > 0.38) {
+                                complexTerrainAhead = true;
+                            }
+                        }
+                        if ((u.stuckTimer || 0) > 0.20) {
+                            complexTerrainAhead = true;
+                        }
+                    }
+
+                    const shouldFlyFast =
+                        airThreatActive ||
+                        ((u.order === 'move' || u.order === 'retreat') && distToGoal > 8.5) ||
+                        (nearestGroundCombatDist > 15.8 && (distToGoal > 16.0 || complexTerrainAhead));
+
+                    const canLandHere = isWalkableGround(u.mesh.position.x, u.mesh.position.z, 0.55);
+                    const shouldLandToFight =
+                        !airThreatActive &&
+                        canLandHere &&
+                        (nearestGroundCombatDist <= 15.2 || (distToGoal <= 12.5 && nearestGroundCombatDist <= 18.0));
+
+                    if (u.mechMode && shouldFlyFast) {
+                        setValkyrieCombatMode(u, false, false);
+                    } else if (!u.mechMode && shouldLandToFight) {
+                        setValkyrieCombatMode(u, true, false);
+                    }
+                }
+            }
+
+            // CRUCIO SIEGE TANK AUTO-SIEGE ARTILLERY TRANSFORMATION (< 5s), MINIMUM RANGE DEADZONE (7.5m),
+            // AND TACTICAL TANK RETREAT / ESCORT AI (FOR BOTH TANK & SIEGE TANK):
+            const SIEGE_MIN_RANGE = 7.5;
+            let isSiegeTransitioning = false;
+            if (u.type === 'siege_tank') {
+                u.siegeSwitchCooldown = Math.max(0, (u.siegeSwitchCooldown || 0) - dt);
+                u.siegeCooldown = u.siegeSwitchCooldown;
+                u.siegeTransitionTimer = Math.max(0, (u.siegeTransitionTimer || 0) - dt);
+                u.manualSiegeLockTimer = Math.max(0, (u.manualSiegeLockTimer || 0) - dt);
+                const targetTr = u.siegeMode ? 1.0 : 0.0;
+                const curTr = u.mesh.userData.siegeTransition || 0.0;
+                // Smooth 3.6-second (under 5s) hydraulic Siege / Unsiege animation
+                if (Math.abs(targetTr - curTr) > 0.001) {
+                    u.mesh.userData.siegeTransition = curTr + Math.sign(targetTr - curTr) * Math.min(Math.abs(targetTr - curTr), dt / 3.6);
+                } else {
+                    u.mesh.userData.siegeTransition = targetTr;
+                }
+                isSiegeTransitioning = (u.siegeTransitionTimer > 0) || (Math.abs(targetTr - (u.mesh.userData.siegeTransition || 0)) > 0.02);
+
+                // When in Siege Mode or mid-transition, hard-anchor the tank chassis at u.anchoredPos and u.anchoredYaw so the tank body CANNOT move or rotate at all!
+                if (u.siegeMode || isSiegeTransitioning) {
+                    if (!u.anchoredPos) u.anchoredPos = u.mesh.position.clone();
+                    if (u.anchoredYaw === undefined) {
+                        u.anchoredYaw = (u.mesh.userData && u.mesh.userData.smoothYaw !== undefined)
+                            ? u.mesh.userData.smoothYaw
+                            : u.mesh.rotation.y;
+                    }
+                    u.mesh.position.x = u.anchoredPos.x;
+                    u.mesh.position.z = u.anchoredPos.z;
+                    u.mesh.rotation.y = u.anchoredYaw;
+                    if (u.mesh.userData) u.mesh.userData.smoothYaw = u.anchoredYaw;
+                }
+            }
+
+            // --- TANK & SIEGE TANK TACTICAL RETREAT & ESCORT AI ---
+            // If too many enemies charge the tank while too few friendly defenders escort it, the tank automatically
+            // retreats toward friendly defenders (or Main Base HQ) until enough friendly units are nearby to defend it, then advances to shoot!
+            if ((u.type === 'tank' || u.type === 'siege_tank') && u.order !== 'hold' && u.order !== 'move') {
+                let chargingEnemies = 0;
+                let closeDeadzoneEnemies = 0;
+                let threatSumX = 0, threatSumZ = 0;
+                for (let ei = 0; ei < enemies.length; ei++) {
+                    const en = enemies[ei];
+                    if (!en || en.hp <= 0 || en.isAir) continue;
+                    const dE = Math.hypot(en.mesh.position.x - u.mesh.position.x, en.mesh.position.z - u.mesh.position.z);
+                    if (dE <= 10.0) {
+                        chargingEnemies++;
+                        threatSumX += en.mesh.position.x;
+                        threatSumZ += en.mesh.position.z;
+                        if (dE < SIEGE_MIN_RANGE) closeDeadzoneEnemies++;
+                    }
+                }
+
+                let escortAllies = 0;
+                let nearestDefenderClusterPos = null;
+                let bestDefDist = Infinity;
+                for (let ai = 0; ai < units.length; ai++) {
+                    const ally = units[ai];
+                    if (!ally || ally === u || ally.hp <= 0 || ally.type === 'transport') continue;
+                    const dA = Math.hypot(ally.mesh.position.x - u.mesh.position.x, ally.mesh.position.z - u.mesh.position.z);
+                    if (dA <= 10.5 && ally.type !== 'tank' && ally.type !== 'siege_tank') {
+                        escortAllies++;
+                    }
+                    if (dA > 5.0 && dA < bestDefDist && ally.type !== 'tank' && ally.type !== 'siege_tank') {
+                        bestDefDist = dA;
+                        nearestDefenderClusterPos = ally.mesh.position;
+                    }
+                }
+
+                const overwhelmedBySwarm =
+                    (chargingEnemies >= 3 && escortAllies < 2) ||
+                    (chargingEnemies >= 2 && u.hp < u.maxHp * 0.65 && escortAllies < 2) ||
+                    (u.type === 'siege_tank' && closeDeadzoneEnemies >= 1 && escortAllies < 2);
+
+                if (overwhelmedBySwarm) {
+                    u.tankTacticalRetreat = true;
+                    // If Siege Tank is in Siege Mode while overwhelmed at close range, immediately unsiege so it can retreat!
+                    if (u.type === 'siege_tank' && u.siegeMode && !isSiegeTransitioning && u.siegeSwitchCooldown <= 0) {
+                        setSiegeTankMode(u, false, false);
+                        isSiegeTransitioning = true;
+                    }
+                } else if (u.tankTacticalRetreat && (escortAllies >= 3 || chargingEnemies === 0)) {
+                    // Enough friendly units are now defending the tank (or threat cleared) — advance back near the enemy to shoot!
+                    u.tankTacticalRetreat = false;
+                }
+
+                // Execute Tank Tactical Retreat movement when mobile and not locked in Siege Mode
+                if (u.tankTacticalRetreat && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning)) && effSpeed > 0.01) {
+                    const fallbackDest = nearestDefenderClusterPos || mainBaseAnchor;
+                    let retreatPt = fallbackDest;
+                    if (chargingEnemies > 0) {
+                        const avgEx = threatSumX / chargingEnemies;
+                        const avgEz = threatSumZ / chargingEnemies;
+                        const awayX = u.mesh.position.x - avgEx;
+                        const awayZ = u.mesh.position.z - avgEz;
+                        const awayLen = Math.hypot(awayX, awayZ) || 1;
+                        const toBaseX = fallbackDest.x - u.mesh.position.x;
+                        const toBaseZ = fallbackDest.z - u.mesh.position.z;
+                        const toBaseLen = Math.hypot(toBaseX, toBaseZ) || 1;
+                        const rx = THREE.MathUtils.clamp(u.mesh.position.x + ((awayX / awayLen) * 0.55 + (toBaseX / toBaseLen) * 0.45) * 9.0, -100, 100);
+                        const rz = THREE.MathUtils.clamp(u.mesh.position.z + ((awayZ / awayLen) * 0.55 + (toBaseZ / toBaseLen) * 0.45) * 9.0, -100, 100);
+                        retreatPt = new THREE.Vector3(rx, getTerrainHeight(rx, rz), rz);
+                    }
+                    const navPt = getGroundNavigationWaypoint(u.mesh.position, retreatPt, u);
+                    const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                    if (stepDir.lengthSq() > 0.0001) {
+                        u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                        alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                        moving = true;
+                        checkAndUnstickGroundUnit(u, navPt, dt);
+                    }
+                }
+            }
+
+            if (u.type === 'siege_tank' && !u.tankTacticalRetreat) {
+                // Auto-Siege AI when cooldown & transition are ready and not manually locked
+                if (!isSiegeTransitioning && u.siegeSwitchCooldown <= 0 && u.manualSiegeLockTimer <= 0) {
+                    if ((u.order === 'move' || u.order === 'retreat') && u.orderTarget) {
+                        if (u.siegeMode) setSiegeTankMode(u, false, false);
+                    } else {
+                        let validSiegeBandDist = Infinity;
+                        let closestEnemyDist = Infinity;
+                        enemies.forEach(e => {
+                            if (e.hp <= 0 || e.isAir) return;
+                            const ex = e.mesh.position.x, ez = e.mesh.position.z;
+                            const d = Math.hypot(ex - u.mesh.position.x, ez - u.mesh.position.z);
+                            if (d > 28.5 && !isWorldPosVisible(ex, ez)) return;
+                            if (d < closestEnemyDist) closestEnemyDist = d;
+                            if (d >= SIEGE_MIN_RANGE && d <= 28.5 && d < validSiegeBandDist) {
+                                validSiegeBandDist = d;
+                            }
+                        });
+                        enemyBuildings.forEach(eb => {
+                            const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                            if (d > 28.5 && !isWorldPosVisible(eb.pos.x, eb.pos.z)) return;
+                            if (d < closestEnemyDist) closestEnemyDist = d;
+                            if (d >= SIEGE_MIN_RANGE && d <= 28.5 && d < validSiegeBandDist) {
+                                validSiegeBandDist = d;
+                            }
+                        });
+
+                        if (!u.siegeMode && validSiegeBandDist <= 28.0 && closestEnemyDist >= SIEGE_MIN_RANGE + 1.0) {
+                            setSiegeTankMode(u, true, false);
+                        } else if (u.siegeMode && (validSiegeBandDist === Infinity && (closestEnemyDist < SIEGE_MIN_RANGE || closestEnemyDist > 29.5))) {
+                            // Unsiege if enemy is inside the 7.5m deadzone with no valid long-range target, or if all targets left range!
+                            setSiegeTankMode(u, false, false);
+                        }
+                    }
+                }
+            }
+
+            // In Endless Mode (or when all enemy buildings are destroyed), if ANY enemy is alive on the map, cancel auto-recall so units attack the enemy instead of returning to base!
+            if (u.order === 'retreat' && u.isAutoRecall && enemies.some(e => e && e.hp > 0)) {
+                u.order = 'auto';
+                u.orderTarget = null;
+                u.isAutoRecall = false;
+            }
+
+            // Pure Move OR Retreat Order: march/fly straight to destination before re-engaging (Siege Tank in Siege Mode or mid-transition cannot move!)
+            if ((u.order === 'move' || u.order === 'retreat') && u.orderTarget && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning))) {
+                const distToDest = Math.hypot(u.orderTarget.x - u.mesh.position.x, u.orderTarget.z - u.mesh.position.z);
+                if (distToDest > 1.35) {
+                    const navPt = u.isAir ? u.orderTarget : getGroundNavigationWaypoint(u.mesh.position, u.orderTarget, u);
+                    if (u.isAir) {
+                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
+                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        smoothAirVehicleTransform(u, navPt.x, navPt.z, 6.0, true, dt);
+                        moving = true;
+                    } else if (effSpeed > 0.01) {
+                        const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                            alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(u, navPt, dt);
+                        }
+                    }
+                    if (inViewport) {
+                        updateUnitAnimation(u.mesh, dt, moving, null);
+                        updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                        projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55);
+                    } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                        u.hb.root.style.display = 'none';
+                    }
+                    return;
+                } else {
+                    u.order = 'auto';
+                    u.orderTarget = null;
+                    u.isAutoRecall = false;
+                }
+            }
+
+            // Realistic Vision & Sensor-Based Target Acquisition (Units DO NOT instantly know hidden enemy locations across the map!)
+            let target = null;
+            let minDist = Infinity;
+            let valkGroundApproachPos = null;
+            const localSensorRad = u.order === 'hold' ? (u.range + 2.5) : Math.max(u.range + 4.0, 22.0);
+            const sharedFowRad = u.order === 'hold' ? (u.range + 2.5) : 38.0;
+
+            if (u.type === 'valkyrie') {
+                if (!u.mechMode) {
+                    // VALKYRIE FLIGHT MODE: STRICTLY AIR-ONLY ATTACK!
+                    enemies.forEach(e => {
+                        if (e.hp <= 0 || !e.isAir) return;
+                        const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                        const isDetected = d <= localSensorRad || (d <= sharedFowRad && isWorldPosVisible(e.mesh.position.x, e.mesh.position.z));
+                        if (isDetected && d < minDist) {
+                            minDist = d;
+                            target = e;
+                        }
+                    });
+                    if (!target && u.order !== 'hold') {
+                        let bestGndDist = Infinity;
+                        enemies.forEach(e => {
+                            if (e.hp <= 0 || e.isAir) return;
+                            const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                            const isDetected = d <= localSensorRad || (d <= sharedFowRad && isWorldPosVisible(e.mesh.position.x, e.mesh.position.z));
+                            if (isDetected && d < bestGndDist) { bestGndDist = d; valkGroundApproachPos = e.mesh.position; }
+                        });
+                        if ((!valkGroundApproachPos || bestGndDist > 18) && enemyBuildings.length > 0) {
+                            enemyBuildings.forEach(eb => {
+                                const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                                const isDetected = d <= localSensorRad || (d <= sharedFowRad && isWorldPosVisible(eb.pos.x, eb.pos.z));
+                                if (isDetected && d < bestGndDist) { bestGndDist = d; valkGroundApproachPos = eb.pos; }
+                            });
+                        }
+                    }
+                } else {
+                    // VALKYRIE SEMI-MECH WALKER MODE: Target visible GROUND enemies and enemy buildings!
+                    enemies.forEach(e => {
+                        if (e.hp <= 0 || e.isAir) return;
+                        const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                        const isDetected = d <= localSensorRad || (d <= sharedFowRad && isWorldPosVisible(e.mesh.position.x, e.mesh.position.z));
+                        if (isDetected && d < minDist) {
+                            minDist = d;
+                            target = e;
+                        }
+                    });
+                    if (u.order !== 'hold' && (!target || minDist > 18) && enemyBuildings.length > 0) {
+                        enemyBuildings.forEach(eb => {
+                            const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                            const isDetected = d <= localSensorRad || (d <= sharedFowRad && isWorldPosVisible(eb.pos.x, eb.pos.z));
+                            if (isDetected && d < minDist) { minDist = d; target = eb; }
+                        });
+                    }
+                }
+            } else if (u.type === 'siege_tank' && u.siegeMode) {
+                // SIEGE TANK IN SIEGE MODE: Cannot target or shoot enemies closer than SIEGE_MIN_RANGE (6.5m)!
+                enemies.forEach(e => {
+                    if (e.hp <= 0 || e.isAir) return;
+                    const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                    if (d < SIEGE_MIN_RANGE) return; // Inside minimum range deadzone — cannot shoot!
+                    const isDetected = d <= u.range + 2.0 || (d <= sharedFowRad && isWorldPosVisible(e.mesh.position.x, e.mesh.position.z));
+                    if (isDetected && d < minDist) {
+                        minDist = d;
+                        target = e;
+                    }
+                });
+                if (!target || minDist > u.range) {
+                    enemyBuildings.forEach(eb => {
+                        const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                        if (d < SIEGE_MIN_RANGE) return;
+                        const isDetected = d <= u.range + 3.0 || (d <= sharedFowRad && isWorldPosVisible(eb.pos.x, eb.pos.z));
+                        if (isDetected && d < minDist) {
+                            minDist = d;
+                            target = eb;
+                        }
+                    });
+                }
+            } else {
+                const isMeleeUnit = (u.type === 'grunt' || u.type === 'zealot' || u.type === 'skitterer' || u.type === 'crusher' || u.type === 'burster');
+                const canHitAir = !isMeleeUnit && !(u.range < 2.5 || u.type === 'tank' || u.type === 'siege_tank');
+                const preferHeavy = (u.type === 'tank' || u.type === 'siege_tank' || u.type === 'heli' || u.type === 'behemoth' || u.type === 'crusher');
+
+                // Immediate Retaliation Priority: If an enemy is attacking this unit (especially Mind-Controlled Zerg!), hit back immediately!
+                if (u.retaliateTarget && u.retaliateTarget.hp > 0 && (!u.retaliateTarget.isAir || canHitAir)) {
+                    const rtPos = u.retaliateTarget.mesh ? u.retaliateTarget.mesh.position : u.retaliateTarget.pos;
+                    const rtDist = Math.hypot(rtPos.x - u.mesh.position.x, rtPos.z - u.mesh.position.z);
+                    if (rtDist <= Math.max(localSensorRad, 24.0)) {
+                        target = u.retaliateTarget;
+                        minDist = rtDist;
+                    } else {
+                        u.retaliateTarget = null;
+                    }
+                } else {
+                    u.retaliateTarget = null;
+                }
+
+                if (!target) {
+                    const effectiveSensorRad = u.isMindControlled ? Math.max(localSensorRad, 28.0) : localSensorRad;
+                    target = selectSmartTarget(u.mesh.position, effectiveSensorRad, canHitAir, preferHeavy, isMeleeUnit);
+                    minDist = target ? Math.hypot((target.mesh ? target.mesh.position.x : target.pos.x) - u.mesh.position.x, (target.mesh ? target.mesh.position.z : target.pos.z) - u.mesh.position.z) : Infinity;
+                }
+
+                // Prioritize defending the Main Base & friendly structures if any enemy is attacking within 32m of HQ!
+                if (u.order !== 'hold' && (!target || minDist > 16)) {
+                    let hqThreat = null;
+                    let bestHqDist = 32.0;
+                    enemies.forEach(e => {
+                        if (e.hp <= 0 || (e.isAir && !canHitAir)) return;
+                        const dHq = Math.hypot(e.mesh.position.x - mainBaseAnchor.x, e.mesh.position.z - mainBaseAnchor.z);
+                        if (dHq < bestHqDist) {
+                            bestHqDist = dHq;
+                            hqThreat = e;
+                        }
+                    });
+                    if (hqThreat) {
+                        target = hqThreat;
+                        minDist = Math.hypot(hqThreat.mesh.position.x - u.mesh.position.x, hqThreat.mesh.position.z - u.mesh.position.z);
+                    }
+                }
+
+                // Check enemies/structures visible in Fog of War within shared tactical radar range (38m)
+                if (u.order !== 'hold' && !target) {
+                    enemies.forEach(e => {
+                        if (e.hp <= 0 || (e.isAir && !canHitAir)) return;
+                        if (!u.isMindControlled && !isWorldPosVisible(e.mesh.position.x, e.mesh.position.z)) return;
+                        const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                        if (d <= (u.isMindControlled ? 65.0 : sharedFowRad) && d < minDist) { minDist = d; target = e; }
+                    });
+                }
+                if (u.order !== 'hold' && !target && enemyBuildings.length > 0) {
+                    enemyBuildings.forEach(eb => {
+                        const distEb = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
+                        if (distEb <= localSensorRad + 4.0) {
+                            notifyEnemyBaseDiscovered(eb.pos);
+                        }
+                        if (!u.isMindControlled && !state.enemyBaseDiscovered && !isWorldPosVisible(eb.pos.x, eb.pos.z) && distEb > localSensorRad) return;
+                        if (distEb <= (u.isMindControlled || state.enemyBaseDiscovered ? 95.0 : sharedFowRad) && distEb < minDist) {
+                            minDist = distEb;
+                            target = eb;
+                        }
+                    });
+                }
+                // ENDLESS MODE / NO ENEMY BUILDINGS: If any enemy unit exists anywhere on the map, acquire it immediately so units hunt & attack instead of walking back to base!
+                if (u.order !== 'hold' && !target && (state.isEndless || enemyBuildings.length === 0) && enemies.length > 0) {
+                    enemies.forEach(e => {
+                        if (!e || e.hp <= 0 || (e.isAir && !canHitAir)) return;
+                        const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                        if (d < minDist) {
+                            minDist = d;
+                            target = e;
+                        }
+                    });
+                }
+            }
+
+            // Also check if this unit's scouting sensor has spotted any enemy building!
+            if (!state.enemyBaseDiscovered && enemyBuildings.length > 0) {
+                for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                    const eb = enemyBuildings[ebi];
+                    if (Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z) <= localSensorRad + 5.0) {
+                        notifyEnemyBaseDiscovered(eb.pos);
+                        break;
+                    }
+                }
+            }
+
+            let aimTargetPos = null;
+            const unitFlyAlt = u.type === 'reaper' ? 2.65 : 6.0;
+            const hasAttackMoveDest = (u.order === 'attack_move' && u.orderTarget);
+            const enemyInImmediateRange = target && minDist <= Math.max(u.range + 3.5, 11.0);
+
+            // GUNSHIP HELICOPTER UNDER-BELLY MINIGUN TURRET:
+            if (u.type === 'heli' && target && minDist <= u.range + 2.5) {
+                const tPos = target.mesh ? target.mesh.position : target.pos;
+                aimTargetPos = tPos.clone().add(new THREE.Vector3(0, 0.5, 0));
+                u.bellyCooldown = (u.bellyCooldown || 0) - dt;
+                if (u.bellyCooldown <= 0) {
+                    const bellyMuzzleObj = u.mesh.userData.bellyMuzzle || u.mesh.userData.bellyTurret;
+                    const bellyMuzzle = bellyMuzzleObj
+                        ? bellyMuzzleObj.getWorldPosition(new THREE.Vector3())
+                        : u.mesh.position.clone().add(new THREE.Vector3(0, -0.38, 0));
+                    launchOrdProjectile(bellyMuzzle, target, 'mg', 11);
+                    if (typeof triggerHeliBellyMinigunFlash === 'function') {
+                        triggerHeliBellyMinigunFlash(u.mesh);
+                    }
+                    triggerMuzzleFlash(bellyMuzzle);
+                    ejectBrassCasing(bellyMuzzle);
+                    u.bellyCooldown = 0.16;
+                }
+            }
+
+            // TANK & SIEGE TANK TURRET FIRE CONTROL:
+            // - Enforces Siege Mode 7.5m minimum range deadzone (cannot shoot when enemies are near!)
+            // - Strictly blocks turret shooting during BOTH Siege and Unsiege animations (`!isSiegeTransitioning`) until the 3.6s animation is 100% finished!
+            const canSiegeFireAtDist = !(u.type === 'siege_tank' && u.siegeMode && minDist < SIEGE_MIN_RANGE);
+            if ((u.type === 'tank' || u.type === 'siege_tank') && target && canSiegeFireAtDist && minDist <= u.range + (enemyBuildings.includes(target) ? 2.5 : 0)) {
+                const tPos = target.mesh ? target.mesh.position : target.pos;
+                const trReady = u.type !== 'siege_tank' || !isSiegeTransitioning;
+                if (trReady) {
+                    aimTargetPos = tPos.clone().add(new THREE.Vector3(0, 0.5, 0));
+                }
+                if (u.damage > 0 && u.cooldown <= 0 && trReady) {
+                    u.mesh.userData.attackAnim = 1.0;
+                    const muzzleObj = u.mesh.userData.tankMuzzleFlash || u.mesh.userData.cannonBarrel || u.mesh.userData.cannonPivot;
+                    const muzzle = muzzleObj
+                        ? muzzleObj.getWorldPosition(new THREE.Vector3())
+                        : u.mesh.position.clone().add(new THREE.Vector3(0, 0.75, 0));
+                    launchOrdProjectile(muzzle, target, u.type, u.damage);
+                    if (typeof triggerTankCannonMuzzleFlash === 'function') {
+                        triggerTankCannonMuzzleFlash(u.mesh, muzzle, tPos);
+                    } else {
+                        triggerMuzzleFlash(muzzle);
+                    }
+                    ejectBrassCasing(muzzle);
+                    u.cooldown = u.fireRate;
+                }
+            }
+
+            if (hasAttackMoveDest && !enemyInImmediateRange) {
+                const distToDest = Math.hypot(u.orderTarget.x - u.mesh.position.x, u.orderTarget.z - u.mesh.position.z);
+                if (distToDest > 1.4) {
+                    const navPt = u.isAir ? u.orderTarget : getGroundNavigationWaypoint(u.mesh.position, u.orderTarget, u);
+                    if (u.isAir) {
+                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
+                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
+                        moving = true;
+                    } else if (effSpeed > 0.01) {
+                        const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                            alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(u, navPt, dt);
+                        }
+                    }
+                } else {
+                    u.order = 'auto';
+                    u.orderTarget = null;
+                }
+            } else if (target) {
+                const tPos = target.mesh ? target.mesh.position : target.pos;
+                if (!aimTargetPos) aimTargetPos = tPos.clone().add(new THREE.Vector3(0, target.isAir ? 0.0 : 0.5, 0));
+                const targetFootprint = enemyBuildings.includes(target) ? 2.5 : ((u.radius || 0.55) + (target.radius || 0.65) + 0.55);
+                const stopRange = enemyBuildings.includes(target) ? u.range + 2.5 : Math.max(u.range, targetFootprint);
+                const flatDist = Math.hypot(tPos.x - u.mesh.position.x, tPos.z - u.mesh.position.z);
+
+                // Engage immediately when within stopRange without backtracking
+                if (flatDist <= stopRange) {
+                    if (u.isAir) {
+                        if (u.type === 'heli') {
+                            const holdLookX = u.mesh.position.x + Math.sin(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                            const holdLookZ = u.mesh.position.z + Math.cos(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                            smoothAirVehicleTransform(u, holdLookX, holdLookZ, unitFlyAlt, false, dt);
+                        } else {
+                            smoothAirVehicleTransform(u, tPos.x, tPos.z, unitFlyAlt, false, dt);
+                        }
+                    } else if (u.type !== 'tank' && u.type !== 'siege_tank') {
+                        alignGroundUnitToTerrain(u.mesh, tPos.x, tPos.z, dt);
+                    }
+
+                    if (u.damage > 0 && u.cooldown <= 0 && u.type !== 'tank' && u.type !== 'siege_tank') {
+                        u.mesh.userData.attackAnim = 1.0;
+                        let muzzle = u.mesh.position.clone().add(new THREE.Vector3(0, u.isAir ? (u.type === 'reaper' ? 0.65 : -0.25) : 0.75, 0));
+                        if (u.type === 'heli' && u.mesh.userData.bellyMuzzle) {
+                            muzzle = u.mesh.userData.bellyMuzzle.getWorldPosition(new THREE.Vector3());
+                        } else if (u.type === 'hero' && u.mesh.userData.gunMuzzle) {
+                            muzzle = u.mesh.userData.gunMuzzle.getWorldPosition(new THREE.Vector3());
+                        }
+                        const isMeleeStrike = (u.type === 'grunt' || u.type === 'zealot' || u.type === 'skitterer' || u.type === 'crusher' || u.type === 'burster');
+                        if (!isMeleeStrike && u.range > 2.35) {
+                            if (u.type === 'valkyrie') {
+                                const rightVec = new THREE.Vector3(Math.cos(u.currentYaw || u.mesh.rotation.y || 0), 0, -Math.sin(u.currentYaw || u.mesh.rotation.y || 0));
+                                if (!u.mechMode) {
+                                    if (target && target.isAir) {
+                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.95), target, 'valk_aa', u.damage);
+                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.95), target, 'valk_aa', u.damage);
+                                    }
+                                } else {
+                                    if (target && !target.isAir) {
+                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.58), target, 'valk_mech', u.damage);
+                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.58), target, 'valk_mech', u.damage);
+                                        ejectBrassCasing(muzzle);
+                                    }
+                                }
+                            } else if (u.type === 'hero') {
+                                launchOrdProjectile(muzzle, target, 'sunlance', u.damage);
+                                u.heroShotCounter = ((u.heroShotCounter || 0) + 1) % 3;
+                                if (u.heroShotCounter === 0) {
+                                    const shoulderPos = u.mesh.position.clone().add(new THREE.Vector3(0, 1.35, 0));
+                                    launchOrdProjectile(shoulderPos, target, 'rocket', Math.round(u.damage * 0.85));
+                                }
+                            } else if (u.type === 'firebat') {
+                                if (typeof triggerFirebatFlameStreamFX === 'function') {
+                                    triggerFirebatFlameStreamFX(muzzle, tPos);
+                                }
+                                enemies.forEach(e => {
+                                    const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
+                                    if (d <= 3.0) {
+                                        recordRagdollHitImpulse(e, u.mesh.position, false);
+                                        e.hp -= u.damage;
+                                        spawnCombatFloat(e.mesh.position, u.damage, '#ff5500');
+                                    }
+                                });
+                                enemyBuildings.forEach(eb => {
+                                    const d = Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z);
+                                    if (d <= 3.2) {
+                                        eb.hp -= u.damage;
+                                        spawnCombatFloat(eb.pos, u.damage, '#ff5500');
+                                        updateHUD();
+                                    }
+                                });
+                            } else if (u.type === 'marauder') {
+                                launchOrdProjectile(muzzle, target, 'marauder', u.damage);
+                            } else if (u.type === 'rocketman') {
+                                launchOrdProjectile(muzzle, target, 'rocket', u.damage);
+                            } else if (u.type === 'reaper') {
+                                const rightVec = new THREE.Vector3(Math.cos(u.currentYaw || 0), 0, -Math.sin(u.currentYaw || 0));
+                                launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.22), target, 'reaper', u.damage);
+                                launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.22), target, 'reaper', Math.round(u.damage * 0.65));
+                            } else {
+                                // Friendly ranged unit or Mind-Controlled Zerg ranged bio-unit (isEnemyAcid = false so it damages enemies!)
+                                launchOrdProjectile(muzzle, target, u.type, u.damage, false);
+                            }
+                            if (u.type === 'heli' && typeof triggerHeliBellyMinigunFlash === 'function') {
+                                triggerHeliBellyMinigunFlash(u.mesh);
+                            }
+                            if (!u.isMindControlled) {
+                                triggerMuzzleFlash(muzzle);
+                            }
+                            if (!u.isAir && !u.isMindControlled && u.type !== 'rocketman' && u.type !== 'hero' && u.type !== 'firebat' && u.type !== 'marauder') ejectBrassCasing(muzzle);
+                        } else {
+                            // Close-Quarter Melee Strike (Grunt Shock-Blade, Zealot Psi-Blades, or Mind-Controlled Zerg Claws/Burster!)
+                            recordRagdollHitImpulse(target, u.mesh.position, u.type === 'crusher' || u.type === 'burster');
+                            target.hp -= u.damage;
+                            if (typeof triggerSparks === 'function' && !u.isMindControlled) {
+                                triggerSparks(tPos);
+                            } else if (u.isMindControlled && typeof spawnEnemyGooSplashFX === 'function') {
+                                spawnEnemyGooSplashFX(tPos, u.type);
+                            }
+                            spawnCombatFloat(tPos, u.damage, u.isMindControlled ? '#d946ef' : '#00ff66');
+                            if (enemyBuildings.includes(target)) updateHUD();
+                        }
+                        u.cooldown = u.fireRate;
+                    }
+
+                    // WALKING & SHOOTING RANK-STEPPING FOR NON-MELEE ARMED UNITS:
+                    // Ranged non-melee units continue advancing closer toward the enemy (down to ~56% of their max weapon range)
+                    // while shooting on the move so that units behind them can step into range and shoot as well instead of being blocked!
+                    const isRangedGroundShooter = !u.isAir && u.order !== 'hold' && u.range > 2.35 && u.type !== 'tank' && u.type !== 'siege_tank';
+                    if (isRangedGroundShooter && effSpeed > 0.01) {
+                        const desiredAdvanceBand = Math.max(3.0, u.range * 0.56);
+                        if (flatDist > desiredAdvanceBand) {
+                            const navPt = getGroundNavigationWaypoint(u.mesh.position, tPos, u);
+                            const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed * 0.74, dt, u, units, buildings, enemyBuildings);
+                            if (stepDir.lengthSq() > 0.0001) {
+                                u.mesh.position.addScaledVector(stepDir, effSpeed * 0.74 * dt);
+                                alignGroundUnitToTerrain(u.mesh, tPos.x, tPos.z, dt);
+                                moving = true;
+                            }
+                        }
+                    }
+                } else if (u.order !== 'hold' && !u.tankTacticalRetreat && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning))) {
+                    const navPt = u.isAir ? tPos : getGroundNavigationWaypoint(u.mesh.position, tPos, u);
+                    if (u.isAir) {
+                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
+                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
+                        moving = true;
+                    } else if (effSpeed > 0.01) {
+                        const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                            alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(u, navPt, dt);
+                        }
+                    }
+                } else if (u.isAir) {
+                    const holdLookX = u.mesh.position.x + Math.sin(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                    const holdLookZ = u.mesh.position.z + Math.cos(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                    smoothAirVehicleTransform(u, holdLookX, holdLookZ, unitFlyAlt, false, dt);
+                }
+            } else if (u.type === 'valkyrie' && !u.mechMode && valkGroundApproachPos && u.order !== 'hold') {
+                // Flight Mode has no flying targets: fly toward the ground combat zone so it can land into Mech Mode (never fires from air!)
+                const distToGnd = Math.hypot(valkGroundApproachPos.x - u.mesh.position.x, valkGroundApproachPos.z - u.mesh.position.z);
+                if (distToGnd > 8.0) {
+                    const dir = new THREE.Vector3(valkGroundApproachPos.x - u.mesh.position.x, 0, valkGroundApproachPos.z - u.mesh.position.z).normalize();
+                    u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                    smoothAirVehicleTransform(u, valkGroundApproachPos.x, valkGroundApproachPos.z, 6.0, true, dt);
+                    moving = true;
+                } else {
+                    smoothAirVehicleTransform(u, valkGroundApproachPos.x, valkGroundApproachPos.z, 6.0, false, dt);
+                }
+            } else if (u.order !== 'hold' && !(u.type === 'siege_tank' && u.siegeMode)) {
+                // AUTO-SCOUT BASE CHECK & ENDLESS MODE BEHAVIOR:
+                // In Endless Mode (or when enemyBuildings.length === 0): ONLY come back to main base when there are NO enemies on the map;
+                // as soon as any enemy exists, march directly to attack the enemy instead of returning to the main base!
+                if (enemyBuildings.length === 0) {
+                    let nearestEnemy = null;
+                    let bestEDist = Infinity;
+                    for (let ei = 0; ei < enemies.length; ei++) {
+                        const e = enemies[ei];
+                        if (!e || e.hp <= 0 || !e.mesh) continue;
+                        const dE = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
+                        if (dE < bestEDist) {
+                            bestEDist = dE;
+                            nearestEnemy = e;
+                        }
+                    }
+                    if (nearestEnemy) {
+                        u.patrolTarget = new THREE.Vector3(
+                            nearestEnemy.mesh.position.x,
+                            getTerrainHeight(nearestEnemy.mesh.position.x, nearestEnemy.mesh.position.z),
+                            nearestEnemy.mesh.position.z
+                        );
+                    } else {
+                        const arcAngle = -Math.PI * 0.5 + ((unitIdx % 10) - 4.5) * 0.22;
+                        const guardRad = 7.2 + Math.floor(unitIdx / 10) * 2.4;
+                        u.patrolTarget = new THREE.Vector3(
+                            mainBaseAnchor.x + Math.sin(arcAngle) * guardRad,
+                            0,
+                            mainBaseAnchor.z + Math.cos(arcAngle) * guardRad
+                        );
+                    }
+                } else if (state.enemyBaseDiscovered) {
+                    // Enemy Base is discovered: converge all auto units directly on the active Enemy Zerg Base structures!
+                    const activeEnemyBld = enemyBuildings[unitIdx % enemyBuildings.length] || enemyBuildings[0];
+                    const targetBldPos = activeEnemyBld ? activeEnemyBld.pos : (state.discoveredEnemyBasePos || ENEMY_BASE_POS);
+                    u.patrolTarget = new THREE.Vector3(
+                        targetBldPos.x,
+                        getTerrainHeight(targetBldPos.x, targetBldPos.z),
+                        targetBldPos.z
+                    );
+                } else {
+                    // Direct Forward Recon Progression toward Enemy Base (never orbit unwalkable ruin centers or loop back!)
+                    const distToPatrol = u.patrolTarget
+                        ? Math.hypot(u.patrolTarget.x - u.mesh.position.x, u.patrolTarget.z - u.mesh.position.z)
+                        : 0;
+                    if (!u.patrolTarget || distToPatrol <= 8.5) {
+                        const toEnemyX = ENEMY_BASE_POS.x - mainBaseAnchor.x;
+                        const toEnemyZ = ENEMY_BASE_POS.z - mainBaseAnchor.z;
+                        const perpX = -toEnemyZ;
+                        const perpZ = toEnemyX;
+                        const perpLen = Math.hypot(perpX, perpZ) || 1;
+                        const laneOffset = ((unitIdx % 3) - 1) * 16.0;
+
+                        const midReconX = mainBaseAnchor.x + toEnemyX * 0.52 + (perpX / perpLen) * laneOffset;
+                        const midReconZ = mainBaseAnchor.z + toEnemyZ * 0.52 + (perpZ / perpLen) * laneOffset;
+                        const reconWaypoints = [
+                            { x: midReconX, z: midReconZ },
+                            { x: ENEMY_BASE_POS.x, z: ENEMY_BASE_POS.z }
+                        ];
+
+                        if (u.patrolStep === undefined) {
+                            u.patrolStep = 0;
+                        } else if (u.patrolStep < reconWaypoints.length - 1) {
+                            u.patrolStep++;
+                        }
+                        const chosenWP = reconWaypoints[Math.min(u.patrolStep, reconWaypoints.length - 1)];
+                        const rawPx = THREE.MathUtils.clamp(chosenWP.x + ((unitIdx % 5) - 2) * 2.2, -96, 96);
+                        const rawPz = THREE.MathUtils.clamp(chosenWP.z + ((unitIdx % 3) - 1) * 2.2, -96, 96);
+                        const clearPt = typeof findClearSpawnPoint === 'function'
+                            ? findClearSpawnPoint(rawPx, rawPz, u.mesh.position.x, u.mesh.position.z, 0.85, buildings, enemyBuildings, [])
+                            : { x: rawPx, z: rawPz };
+                        u.patrolTarget = new THREE.Vector3(clearPt.x, getTerrainHeight(clearPt.x, clearPt.z), clearPt.z);
+                    }
+                }
+
+                if (u.patrolTarget && effSpeed > 0.01) {
+                    const distToPatrol = Math.hypot(u.patrolTarget.x - u.mesh.position.x, u.patrolTarget.z - u.mesh.position.z);
+                    if (distToPatrol > 2.2) {
+                        const navPt = u.isAir ? u.patrolTarget : getGroundNavigationWaypoint(u.mesh.position, u.patrolTarget, u);
+                        if (u.isAir) {
+                            const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
+                            u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                            smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
+                            moving = true;
+                        } else {
+                            const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
+                            if (stepDir.lengthSq() > 0.0001) {
+                                u.mesh.position.addScaledVector(stepDir, effSpeed * dt);
+                                alignGroundUnitToTerrain(u.mesh, u.mesh.position.x + stepDir.x, u.mesh.position.z + stepDir.z, dt);
+                                moving = true;
+                                checkAndUnstickGroundUnit(u, navPt, dt);
+                            }
+                        }
+                    }
+                }
+            } else if (u.isAir) {
+                const holdLookX = u.mesh.position.x + Math.sin(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                const holdLookZ = u.mesh.position.z + Math.cos(u.currentYaw || u.mesh.rotation.y || 0) * 5.0;
+                smoothAirVehicleTransform(u, holdLookX, holdLookZ, unitFlyAlt, false, dt);
+            }
+
+            // Enforce Siege Tank body lock after any combat/patrol branch so only the turret head rotates!
+            if (u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning)) {
+                moving = false;
+                if (u.anchoredPos) {
+                    u.mesh.position.x = u.anchoredPos.x;
+                    u.mesh.position.z = u.anchoredPos.z;
+                }
+                if (u.anchoredYaw !== undefined) {
+                    u.mesh.rotation.y = u.anchoredYaw;
+                    if (u.mesh.userData) u.mesh.userData.smoothYaw = u.anchoredYaw;
+                }
+            }
+
+            if (inViewport) {
+                if (u.isMechanical && typeof window.updateMechanicalUnitDamageDeformation === 'function') {
+                    window.updateMechanicalUnitDamageDeformation(u);
+                } else if (u.isMindControlled && !u.isAir && typeof window.updateZergUnitBruiseDamage === 'function') {
+                    window.updateZergUnitBruiseDamage(u);
+                }
+                updateUnitAnimation(u.mesh, dt, moving, aimTargetPos);
+                updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55);
+            } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                u.hb.root.style.display = 'none';
+            }
+        });
+
+        // --- ZERG OVERMIND TACTICAL EVALUATION: Detect When Losing & Coordinate Multi-Corridor Flanking ---
+        const isZergLosing = (units.length > enemies.length * 1.05) || (enemyBuildings.length < 4) || (state.kills >= 12);
+
+        // Update Enemy Zerg Units (Ground Bio-Swarm + Flying Mutalisk Leviathans + Adaptive Flanking AI + Stuck Babyspot Calibration)
+        for (let i = enemies.length - 1; i >= 0; i--) {
+            const e = enemies[i];
+            if (e.slowTimer && e.slowTimer > 0) e.slowTimer = Math.max(0, e.slowTimer - dt);
+            const concussiveSlowMult = (e.slowTimer && e.slowTimer > 0) ? 0.52 : 1.0;
+            const enemyEnvMod = (!e.isAir && typeof window.getEnvironmentalTacticalModifiers === 'function')
+                ? window.getEnvironmentalTacticalModifiers(e.mesh.position.x, e.mesh.position.z, false, false)
+                : null;
+            const enemyRoadMult = (enemyEnvMod && enemyEnvMod.speedMult) ? enemyEnvMod.speedMult : 1.0;
+            const effEnemySpeed = e.speed * weatherSpdMult * concussiveSlowMult * enemyRoadMult;
+            if (e.hp <= 0) {
+                spawnXenoBugGoreExplosion(e.mesh.position, e.variant === 'crusher' || e.variant === 'behemoth', e.variant === 'burster');
+                e.hb.root.remove();
+                if (e.variant === 'burster') {
+                    if (typeof spawnScavengerPostDeathDebris === 'function') {
+                        spawnScavengerPostDeathDebris(e.mesh.position, 'infantry', true, false);
+                    }
+                    scene.remove(e.mesh);
+                } else {
+                    spawnDeathCorpse(e.mesh, true, e.lastHitImpulse, e.lastHitHeavy);
+                }
+                enemies.splice(i, 1);
+
+                state.req += e.reward;
+                state.kills++;
+                if (state.kills % 10 === 0) {
+                    state.wave++;
+                    if (state.baseBuilding) {
+                        spawnCombatFloat(state.baseBuilding.pos, `WAVE #${state.wave} (${getWaveStrengthMultiplier()}x)`, '#ffaa00');
+                    }
+                }
+                updateHUD();
+                continue;
+            }
+
+            e.cooldown -= dt;
+
+            // Assign or adapt tactical flanking doctrine when Zerg is losing or unit is a designated flanker
+            if ((isZergLosing || e.isFlanker) && !e.flankTactic) {
+                e.isFlanker = true;
+                const tactics = ['west_bridge_pincer', 'east_bridge_pincer', 'canyon_rim_envelopment', 'rear_eco_raid'];
+                e.flankTactic = tactics[i % tactics.length];
+                e.flankSign = (i % 2 === 0) ? 1 : -1;
+            }
+
+            // Periodically calibrate preferred bridge based on stuck babyspot heatmap + player turret concentration
+            e.bridgeCalibTimer = (e.bridgeCalibTimer || 0) - dt;
+            if (!e.isAir && e.bridgeCalibTimer <= 0 && typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 0) {
+                e.bridgeCalibTimer = 2.8 + Math.random() * 1.4;
+                let bestBrIdx = e.preferredBridgeIdx ?? (i % RIVER_BRIDGES.length);
+                let bestScore = Infinity;
+                for (let bi = 0; bi < RIVER_BRIDGES.length; bi++) {
+                    const bWorld = typeof riverCoordsToWorld === 'function' ? riverCoordsToWorld(RIVER_BRIDGES[bi].sCoord, 0) : { x: 0, z: 0 };
+                    const stuckPen = typeof window.getNavStuckPenalty === 'function' ? window.getNavStuckPenalty(bWorld.x, bWorld.z) * 14.0 : 0;
+                    // Count player defensive turrets near this bridge exit
+                    let turretThreat = 0;
+                    for (let k = 0; k < buildings.length; k++) {
+                        const b = buildings[k];
+                        if (b && b.type === 'turret' && b.hp > 0) {
+                            const dB = Math.hypot(b.pos.x - bWorld.x, b.pos.z - bWorld.z);
+                            if (dB < 22.0) turretThreat += (22.0 - dB) * 1.4;
+                        }
+                    }
+                    // Tactical corridor bias so flanking squads split across West and East bridges
+                    const tacticBias = (e.flankTactic === 'west_bridge_pincer' && bi === 0) ? -12.0
+                        : ((e.flankTactic === 'east_bridge_pincer' && bi === RIVER_BRIDGES.length - 1) ? -12.0 : 0);
+                    const totalScore = stuckPen + turretThreat + tacticBias;
+                    if (totalScore < bestScore) {
+                        bestScore = totalScore;
+                        bestBrIdx = bi;
+                    }
+                }
+                if (bestBrIdx !== e.preferredBridgeIdx) {
+                    e.preferredBridgeIdx = bestBrIdx;
+                    e.navWaypoints = null; // Recompute path through calibrated bridge
+                }
+            }
+
+            let bestTarget = null, bestDist = Infinity, isBuildingTarget = false;
+            // Multi-Pronged Enemy Zerg Base Assault: Split enemy squads across Player Terran Base(s) AND Allied Solaris Base!
+            const preferSolarisBase = (!state.solarisHostile && typeof solarisBuildings !== 'undefined' && solarisBuildings.length > 0 && (i % 3 === 0));
+
+            units.forEach(u => {
+                if (u.isAir && e.range < 4.0) return;
+                const d = Math.hypot(u.mesh.position.x - e.mesh.position.x, u.mesh.position.z - e.mesh.position.z);
+                const effectiveD = (isZergLosing && e.flankTactic === 'rear_eco_raid' && d > 7.5) ? d * 1.45 : d;
+                if (effectiveD < bestDist) { bestDist = effectiveD; bestTarget = u; isBuildingTarget = false; }
+            });
+
+            buildings.forEach(b => {
+                if (!b || b.hp <= 0) return;
+                let d = Math.hypot(b.pos.x - e.mesh.position.x, b.pos.z - e.mesh.position.z);
+                if (isZergLosing && e.isFlanker && b.type !== 'turret') {
+                    d *= 0.78;
+                }
+                if (preferSolarisBase && d > 14.0) d *= 1.38;
+                if (d < bestDist) { bestDist = d; bestTarget = b; isBuildingTarget = true; }
+            });
+
+            if (!state.solarisHostile && typeof solarisBuildings !== 'undefined') {
+                solarisBuildings.forEach(sb => {
+                    if (!sb || sb.hp <= 0) return;
+                    let d = Math.hypot(sb.pos.x - e.mesh.position.x, sb.pos.z - e.mesh.position.z);
+                    if (preferSolarisBase) d *= 0.65;
+                    if (d < bestDist) { bestDist = d; bestTarget = sb; isBuildingTarget = true; }
+                });
+            }
+
+            // Target Fallback: Always target player's main base HQ, allied Solaris Nexus, or spawn location so enemies NEVER halt stuck!
+            if (!bestTarget) {
+                if (state.baseBuilding && state.baseBuilding.hp > 0) {
+                    bestTarget = state.baseBuilding;
+                    isBuildingTarget = true;
+                    bestDist = Math.hypot(state.baseBuilding.pos.x - e.mesh.position.x, state.baseBuilding.pos.z - e.mesh.position.z);
+                } else {
+                    bestTarget = { pos: (state.baseBuilding && state.baseBuilding.pos) || PLAYER_START_POS, hp: 1000, maxHp: 1000 };
+                    isBuildingTarget = true;
+                    bestDist = Math.hypot(bestTarget.pos.x - e.mesh.position.x, bestTarget.pos.z - e.mesh.position.z);
+                }
+            }
+
+            // Recalculate true Euclidean distance to bestTarget for engagement range checks
+            if (bestTarget) {
+                const trueTPos = isBuildingTarget ? bestTarget.pos : bestTarget.mesh.position;
+                bestDist = Math.hypot(trueTPos.x - e.mesh.position.x, trueTPos.z - e.mesh.position.z);
+            }
+
+            // --- DYNAMIC ENEMY AI: STAGING, BURROW AMBUSH, TACTICAL FLANKING & RELENTLESS ASSAULT ---
+            let moving = false;
+
+            // Burrow Ambush for Skitterers (Zerglings) and Bursters (Banelings)
+            if ((e.variant === 'skitterer' || e.variant === 'burster') && !e.isAir) {
+                e.burrowCooldown = (e.burrowCooldown || 0) - dt;
+                if (!e.burrowed && e.burrowCooldown <= 0 && bestDist > 16.0 && Math.abs(e.mesh.position.z) < 22 && Math.random() < 0.05) {
+                    e.burrowed = true;
+                    e.mesh.position.y -= 0.45;
+                }
+                if (e.burrowed) {
+                    if (bestDist <= 7.2) {
+                        e.burrowed = false;
+                        e.mesh.position.y += 0.45;
+                        e.burrowCooldown = 14.0;
+                        e.aiState = 'charge';
+                        spawnCombatFloat(e.mesh.position, 'AMBUSH!', '#ff2a4b');
+                    } else {
+                        updateUnitAnimation(e.mesh, dt, false, null);
+                        continue;
+                    }
+                }
+            }
+
+            // Staging AI: transition quickly to assault so units never stay idle
+            if (e.aiState === 'staging' && !e.isAir) {
+                if (bestDist <= 24.0 || state.rushGraceTimer <= 0 || state.isEndless || isZergLosing) {
+                    e.aiState = 'charge';
+                } else {
+                    e.stagingTimer = (e.stagingTimer || 4.0) - dt;
+                    if (e.stagingTimer <= 0) {
+                        e.aiState = 'charge';
+                    }
+                }
+            }
+
+            // Assault & Flanking Navigation: compute lateral pincer / envelopment waypoint when losing or flanking
+            let rawTargetPos = isBuildingTarget ? (bestTarget.pos || PLAYER_START_POS) : (bestTarget.mesh ? bestTarget.mesh.position : bestTarget.pos);
+            if (!rawTargetPos) {
+                rawTargetPos = PLAYER_START_POS;
+            }
+            let attackNavTarget = rawTargetPos;
+
+            if ((isZergLosing || e.isFlanker) && bestDist > 10.5) {
+                const toTargetX = rawTargetPos.x - e.mesh.position.x;
+                const toTargetZ = rawTargetPos.z - e.mesh.position.z;
+                const toLen = Math.hypot(toTargetX, toTargetZ) || 1;
+                const perpX = -toTargetZ / toLen;
+                const perpZ = toTargetX / toLen;
+                const flankSign = e.flankSign || 1;
+                let lateralSpread = 0;
+                if (e.flankTactic === 'west_bridge_pincer') lateralSpread = -12.5;
+                else if (e.flankTactic === 'east_bridge_pincer') lateralSpread = 12.5;
+                else if (e.flankTactic === 'canyon_rim_envelopment') lateralSpread = flankSign * 15.0;
+                else if (e.flankTactic === 'rear_eco_raid') lateralSpread = flankSign * 11.5;
+
+                // Blend lateral flank offset so the unit sweeps wide around the front line and hooks into the flank
+                const blend = Math.min(1.0, (bestDist - 9.0) / 22.0);
+                const candidateX = rawTargetPos.x + perpX * lateralSpread * blend;
+                const candidateZ = rawTargetPos.z + perpZ * lateralSpread * blend;
+                if (e.isAir || (typeof isWalkableGround === 'function' && isWalkableGround(candidateX, candidateZ, (e.radius || 0.50) * 0.6))) {
+                    attackNavTarget = new THREE.Vector3(candidateX, rawTargetPos.y || 0, candidateZ);
+                }
+            }
+
+            let enemyAimPos = null;
+            if (bestTarget && attackNavTarget) {
+                let tPos = isBuildingTarget ? bestTarget.pos : bestTarget.mesh.position;
+                enemyAimPos = tPos;
+                let targetRad = isBuildingTarget ? 1.45 : (bestTarget.radius || 0.55);
+                let engageRange = e.range + targetRad + 0.35;
+
+                // Physical Turret Shield Barrier Check:
+                // If an active turret shield dome (9.5m radius) protects the target OR blocks this enemy at the perimeter,
+                // the enemy CANNOT enter the 9.5m radius and instead attacks the shield barrier at the perimeter until destroyed!
+                let blockingShieldTurret = null;
+                for (let bi = 0; bi < buildings.length; bi++) {
+                    const b = buildings[bi];
+                    if (!b || b.type !== 'turret' || b.hp <= 0 || !(b.maxShieldHp > 0 && b.shieldHp > 15) || b.shieldBrokenTimer > 0) continue;
+                    const dEnemyToTurret = Math.hypot(e.mesh.position.x - b.pos.x, e.mesh.position.z - b.pos.z);
+                    const dTargetToTurret = Math.hypot(tPos.x - b.pos.x, tPos.z - b.pos.z);
+                    if (dTargetToTurret <= 9.5 || dEnemyToTurret <= 9.5 + (e.radius || 0.55) + 1.2) {
+                        blockingShieldTurret = b;
+                        break;
+                    }
+                }
+                if (blockingShieldTurret) {
+                    const dToTurret = Math.hypot(e.mesh.position.x - blockingShieldTurret.pos.x, e.mesh.position.z - blockingShieldTurret.pos.z);
+                    const shieldPerimeter = 9.5 + (e.radius || 0.55);
+                    if (dToTurret <= shieldPerimeter + Math.max(e.range, 0.85)) {
+                        // Enemy has reached the shield perimeter (or is in ranged weapon reach of the shield dome): attack the shield barrier!
+                        bestTarget = blockingShieldTurret;
+                        isBuildingTarget = true;
+                        tPos = blockingShieldTurret.pos;
+                        enemyAimPos = tPos;
+                        bestDist = dToTurret;
+                        engageRange = shieldPerimeter + Math.max(e.range, 0.85);
+                    }
+                }
+
+                // BEHEMOTH & GORGON MOBILE BIO-ARTILLERY: Fire Dorsal Bio-Plasma or Scorpion Tail-Catapult Bile Meteor while marching!
+                if ((e.variant === 'behemoth' || e.variant === 'gorgon') && bestDist <= Math.max(e.range, engageRange)) {
+                    if (e.cooldown <= 0) {
+                        e.mesh.userData.attackAnim = 1.0;
+                        const muzzleOffset = new THREE.Vector3(0, e.variant === 'gorgon' ? 1.55 : 1.1, 0);
+                        launchOrdProjectile(e.mesh.position.clone().add(muzzleOffset), bestTarget, e.variant, e.damage, true);
+                        e.cooldown = e.fireRate;
+                    }
+                    if (bestDist > (blockingShieldTurret ? 11.2 : 5.5)) {
+                        const navPt = getGroundNavigationWaypoint(e.mesh.position, attackNavTarget, e);
+                        const stepDir = computeSafeGroundStep(e.mesh.position, navPt, effEnemySpeed, dt, e, enemies, buildings, enemyBuildings);
+                        if (stepDir.lengthSq() > 0.0001) {
+                            e.mesh.position.addScaledVector(stepDir, effEnemySpeed * dt);
+                            alignGroundUnitToTerrain(e.mesh, e.mesh.position.x + stepDir.x, e.mesh.position.z + stepDir.z, dt);
+                            moving = true;
+                            checkAndUnstickGroundUnit(e, navPt, dt);
+                        }
+                    }
+                } else if (bestDist <= engageRange) {
+                    // Close-Range or Shield-Perimeter Engagement
+                    if (e.isAir) {
+                        smoothAirVehicleTransform(e, tPos.x, tPos.z, 5.8, false, dt);
+                    } else {
+                        alignGroundUnitToTerrain(e.mesh, tPos.x, tPos.z, dt);
+                    }
+
+                    if (e.variant === 'burster') {
+                        if (!isBuildingTarget) {
+                            recordRagdollHitImpulse(bestTarget, e.mesh.position, true);
+                        }
+                        if (typeof spawnBombCrater === 'function') spawnBombCrater( e.mesh.position, 0.55);
+                        applyDamageWithTurretShield(bestTarget, e.damage, e.mesh.position);
+                        spawnCombatFloat(e.mesh.position, e.damage, '#ff5400');
+                        if (bestTarget === state.baseBuilding) updateHUD();
+                        e.hp = 0;
+                        continue;
+                    } else if (e.cooldown <= 0) {
+                        e.mesh.userData.attackAnim = 1.0;
+                        if (!isBuildingTarget && bestTarget) {
+                            bestTarget.retaliateTarget = e;
+                        }
+                        if (e.variant === 'spitter' || e.variant === 'behemoth' || e.variant === 'gorgon' || e.variant === 'mutalisk') {
+                            const muzzleOffset = e.isAir ? new THREE.Vector3(0, -0.15, 0) : new THREE.Vector3(0, e.variant === 'gorgon' ? 1.55 : 0.7, 0);
+                            launchOrdProjectile(e.mesh.position.clone().add(muzzleOffset), bestTarget, e.variant, e.damage, true);
+                        } else {
+                            if (!isBuildingTarget) {
+                                recordRagdollHitImpulse(bestTarget, e.mesh.position, e.variant === 'crusher');
+                            }
+                            applyDamageWithTurretShield(bestTarget, e.damage, e.mesh.position);
+                            spawnCombatFloat(blockingShieldTurret ? e.mesh.position : tPos, e.damage, blockingShieldTurret ? '#38bdf8' : '#ff2a4b');
+                            if (bestTarget === state.baseBuilding) updateHUD();
+                        }
+                        e.cooldown = e.fireRate;
+                    }
+                } else if (e.isAir) {
+                    // Flying Mutalisk Sky-Leviathan glides across terrain & executes wide aerial flanking arcs when losing
+                    const dir = new THREE.Vector3(attackNavTarget.x - e.mesh.position.x, 0, attackNavTarget.z - e.mesh.position.z).normalize();
+                    e.mesh.position.addScaledVector(dir, effEnemySpeed * dt);
+                    smoothAirVehicleTransform(e, attackNavTarget.x, attackNavTarget.z, 5.8, true, dt);
+                    moving = true;
+                } else {
+                    const navPt = getGroundNavigationWaypoint(e.mesh.position, attackNavTarget, e);
+                    const stepDir = computeSafeGroundStep(e.mesh.position, navPt, effEnemySpeed, dt, e, enemies, buildings, enemyBuildings);
+                    if (stepDir.lengthSq() > 0.0001) {
+                        e.mesh.position.addScaledVector(stepDir, effEnemySpeed * dt);
+                        alignGroundUnitToTerrain(e.mesh, e.mesh.position.x + stepDir.x, e.mesh.position.z + stepDir.z, dt);
+                        moving = true;
+                        checkAndUnstickGroundUnit(e, navPt, dt);
+                    }
+                }
+            }
+
+            const eVisFow = isWorldPosVisible(e.mesh.position.x, e.mesh.position.z);
+            const eInViewport = eVisFow && window.isWorldPosInViewport(e.mesh.position.x, e.mesh.position.y, e.mesh.position.z, 3.8);
+            e.mesh.visible = eInViewport;
+            if (eInViewport) {
+                if (!e.isAir && typeof window.updateZergUnitBruiseDamage === 'function') {
+                    window.updateZergUnitBruiseDamage(e);
+                }
+                updateUnitAnimation(e.mesh, dt, moving, enemyAimPos);
+                e.hb.bar.style.width = `${Math.max(0, (e.hp / e.maxHp) * 100)}%`;
+                projectToScreen(e.hb.root, e.mesh.position, e.isAir ? 1.25 : (e.variant === 'behemoth' ? 1.8 : 1.15));
+            } else if (e.hb && e.hb.root && e.hb.root.style.display !== 'none') {
+                e.hb.root.style.display = 'none';
+            }
+        }
+
+        resolveAllUnitCollisions();
+
+        // Cleanup Defeated Allied Units (Blood splash ONLY on ground unit death & 50% Gunship Crash Animation without labels!)
+        let selectionChanged = false;
+        for (let i = units.length - 1; i >= 0; i--) {
+            const u = units[i];
+            if (u.hp <= 0) {
+                if (u.type === 'hero' && state.heroPlaced) {
+                    u.hp = u.maxHp;
+                    u.mesh.position.copy(u.homePos);
+                } else {
+                    if (state.selectedUnits.includes(u)) {
+                        state.selectedUnits = state.selectedUnits.filter(item => item !== u);
+                        selectionChanged = true;
+                    }
+                    if (u.healBeam) scene.remove(u.healBeam);
+                    if (u.selCircle) u.mesh.remove(u.selCircle);
+                    u.hb.root.remove();
+                    if (u.type === 'heli' && typeof startHelicopterTailDestroyCrash === 'function' && Math.random() < 0.50) {
+                        // 50% chance: Gunship Helicopter spins/crashes downward (no floating crash text!)
+                        startHelicopterTailDestroyCrash(u);
+                    } else if (u.isVehicle || u.isAir) {
+                        spawnVehicleWreckageExplosion(u.mesh.position, u.type);
+                        scene.remove(u.mesh);
+                    } else {
+                        // Ground biological unit died: trigger subtle blood splash ONLY on death!
+                        if (!u.isMindControlled) {
+                            spawnAlliedBloodPhysicsSplash(u.mesh.position, u.lastHitImpulse);
+                        }
+                        spawnGoreExplosion(u.mesh.position, false, false, false);
+                        spawnDeathCorpse(u.mesh, !!u.isMindControlled, u.lastHitImpulse, u.lastHitHeavy);
+                    }
+                    units.splice(i, 1);
+                    if (state.selectedBuilding && state.selectedBuilding.type === 'turret') {
+                        renderSC2CommandCard();
+                    }
+                    updateHUD();
+                }
+            }
+        }
+        if (selectionChanged) {
+            renderSC2CommandCard();
+            updateHUD();
+        }
+    }
+
+    // Animate Out-Of-Control Tail-Destroyed Crashing Helicopters
+    if (typeof updateCrashingHelicopters === 'function') {
+        updateCrashingHelicopters(dt);
+    }
+
+    // Animate Articulated Ragdoll Death Corpses
+    for (let i = corpses.length - 1; i >= 0; i--) {
+        const c = corpses[i];
+        updateRagdollCorpse(c, dt);
+        if (c.life <= 0) {
+            disposeHierarchy(c.mesh);
+            corpses.splice(i, 1);
+        }
+    }
+
+    // Animate Scattered Flaming Vehicle Wreckage & Detached Weapon/Chitin Parts
+    for (let i = wreckageParts.length - 1; i >= 0; i--) {
+        const wp = wreckageParts[i];
+        wp.life -= dt;
+        const groundY = getTerrainHeight(wp.mesh.position.x, wp.mesh.position.z) + 0.14;
+
+        if (wp.mesh.position.y > groundY || wp.vel.y > 0) {
+            wp.mesh.position.addScaledVector(wp.vel, dt);
+            wp.vel.y -= 18 * dt;
+            wp.mesh.rotation.x += wp.rotVel.x * dt;
+            wp.mesh.rotation.y += wp.rotVel.y * dt;
+            wp.mesh.rotation.z += wp.rotVel.z * dt;
+        }
+        if (wp.mesh.position.y <= groundY) {
+            wp.mesh.position.y = groundY;
+            if (Math.abs(wp.vel.y) > 1.5) {
+                wp.vel.y *= -0.38;
+                wp.vel.x *= 0.65;
+                wp.vel.z *= 0.65;
+                wp.rotVel.multiplyScalar(0.6);
+            } else {
+                wp.vel.set(0, 0, 0);
+            }
+        }
+
+        if (wp.hasFire && wp.life > 3.0) {
+            wp.smokeTimer -= dt;
+            if (wp.smokeTimer <= 0 && smokeClouds.length < 60) {
+                const sm = new THREE.Mesh(
+                    SHARED_FX_GEO.smoke,
+                    Math.random() > 0.35 ? SHARED_FX_MAT.smokeDark : SHARED_FX_MAT.smokeFire
+                );
+                sm.scale.setScalar(0.75);
+                sm.position.copy(wp.mesh.position).add(new THREE.Vector3(0, 0.2, 0));
+                scene.add(sm);
+                smokeClouds.push({ mesh: sm, vel: new THREE.Vector3((Math.random()-0.5)*0.6, 1.8, (Math.random()-0.5)*0.6), life: 0.6 });
+                wp.smokeTimer = 0.22;
+            }
+        }
+
+        if (wp.life < 1.5) wp.mesh.position.y -= dt * 0.4;
+        if (wp.life <= 0) {
+            scene.remove(wp.mesh);
+            wreckageParts.splice(i, 1);
+        }
+    }
+
+    // Update Projectiles (Tracks fast-moving air targets so Barracks anti-air infantry reliably hit flying Mutalisks!)
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        p.progress += dt * p.speed;
+        if (p.isAirTarget && p.targetObj && p.targetObj.hp > 0 && p.targetObj.mesh) {
+            p.landingPos.copy(p.targetObj.mesh.position);
+        }
+        const tPos = p.landingPos;
+
+        const prevPos = p.mesh.position.clone();
+        p.mesh.position.lerpVectors(p.start, tPos, Math.min(1, p.progress));
+        if (p.wType === 'mortar' || p.isBioGoo || p.isEnemyAcid || p.wType === 'siege_tank') {
+            p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'mortar' ? 6.2 : (p.wType === 'siege_tank' ? 4.8 : 2.6));
+            if (p.wType === 'siege_tank' && typeof emitThrusterExhaustParticles === 'function') {
+                const trailDir = prevPos.clone().sub(p.mesh.position).normalize();
+                emitThrusterExhaustParticles(p.mesh.position, trailDir, 0.92, true);
+            }
+        } else if (p.wType === 'rocket' || p.wType === 'heli' || p.wType === 'rocketman' || p.wType === 'valkyrie' || p.wType === 'valk_aa' || p.wType === 'marauder') {
+            p.mesh.position.y += Math.sin(p.progress * Math.PI) * 1.45;
+            // Pure Particle Engine Rocket Booster Plume (NO flat square smoke quad!)
+            if (typeof emitThrusterExhaustParticles === 'function') {
+                const trailDir = prevPos.clone().sub(p.mesh.position).normalize();
+                emitThrusterExhaustParticles(p.mesh.position, trailDir, 0.85, false);
+                emitThrusterExhaustParticles(prevPos, trailDir, 0.65, false);
+            }
+        } else if (p.wType === 'stalker' || p.wType === 'archon' || p.wType === 'solaris_spire') {
+            p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'archon' ? 0.25 : 0.45);
+            if (p.mesh.userData) {
+                if (p.mesh.userData.gyroRing1) p.mesh.userData.gyroRing1.rotation.z += dt * 18.0;
+                if (p.mesh.userData.gyroRing2) p.mesh.userData.gyroRing2.rotation.y -= dt * 22.0;
+            }
+            if (Math.random() < 0.65 && particles.length < 110 && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
+                const wake = new THREE.Mesh(
+                    SHARED_FX_GEO.weldSpark,
+                    Math.random() > 0.4 ? (MAT.solarisPrismGlow || MAT.cyanGlow) : (MAT.solarisGold || MAT.amberGlow)
+                );
+                wake.scale.setScalar(p.wType === 'archon' ? 1.15 : 0.78);
+                wake.position.copy(p.mesh.position);
+                scene.add(wake);
+                particles.push({
+                    mesh: wake,
+                    vel: new THREE.Vector3((Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2, (Math.random() - 0.5) * 1.2),
+                    gravity: 0,
+                    life: 0.16
+                });
+            }
+        } else if (p.wType === 'tank' || p.wType === 'sunlance') {
+            // Flat, high-velocity supersonic trajectory with glowing plasma wake
+            p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'sunlance' ? 0.35 : 0.65);
+            if (Math.random() < 0.55 && particles.length < 105 && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
+                const wake = new THREE.Mesh(SHARED_FX_GEO.weldSpark, p.wType === 'sunlance' ? MAT.amberGlow : MAT.cyanGlow);
+                wake.scale.setScalar(p.wType === 'sunlance' ? 0.95 : 0.85);
+                wake.position.copy(p.mesh.position);
+                scene.add(wake);
+                particles.push({
+                    mesh: wake,
+                    vel: new THREE.Vector3((Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.8, (Math.random() - 0.5) * 0.8),
+                    gravity: 0,
+                    life: 0.15
+                });
+            }
+        } else if (p.wType === 'valk_mech') {
+            // Direct ballistic cannon trajectory without pulse/plasma wake
+            p.mesh.position.y += Math.sin(p.progress * Math.PI) * 0.25;
+        }
+        const deltaVec = p.mesh.position.clone().sub(prevPos);
+        if (deltaVec.lengthSq() > 0.00001) {
+            p.mesh.lookAt(p.mesh.position.clone().add(deltaVec));
+            if (p.mesh.userData && p.mesh.userData.wakeRing) {
+                p.mesh.userData.wakeRing.rotation.z += dt * 20.0;
+            }
+        }
+
+        // Algorithmic Viscoelastic Spit / Goo / Jelly Wobble & Dripping Trail Synthesis
+        if (p.mesh.userData && p.mesh.userData.isBioGooProj) {
+            p.gooTime = (p.gooTime || 0) + dt * 22.0;
+            const gt = p.gooTime;
+            const ud = p.mesh.userData;
+            if (ud.coreBlob) {
+                // Volume-preserving peristaltic jelly squash-and-stretch
+                const sx = 1.0 + Math.sin(gt) * 0.26;
+                const sy = 1.0 + Math.cos(gt * 1.25) * 0.26;
+                const sz = 1.28 - Math.sin(gt) * 0.22;
+                ud.coreBlob.scale.set(sx, sy, sz);
+                ud.coreBlob.rotation.z = gt * 0.45;
+            }
+            if (ud.satelliteBlobs) {
+                for (let si = 0; si < ud.satelliteBlobs.length; si++) {
+                    const sat = ud.satelliteBlobs[si];
+                    const ph = gt * 1.15 + sat.phase;
+                    const pulse = 1.0 + Math.sin(ph * 1.6) * 0.34;
+                    sat.mesh.position.set(
+                        sat.baseX * (0.75 + Math.sin(ph) * 0.45),
+                        sat.baseY * (0.75 + Math.cos(ph * 1.1) * 0.45),
+                        sat.baseZ + Math.sin(ph * 0.9) * 0.06
+                    );
+                    sat.mesh.scale.set(pulse, 2.0 - pulse * 0.7, 1.15 + Math.cos(ph) * 0.25);
+                }
+            }
+            if (ud.gooStrands) {
+                for (let st = 0; st < ud.gooStrands.length; st++) {
+                    const strand = ud.gooStrands[st];
+                    const sp = gt * 1.4 + strand.phase;
+                    strand.mesh.position.x = strand.baseX + Math.sin(sp) * 0.04;
+                    strand.mesh.position.y = strand.baseY + Math.cos(sp) * 0.04;
+                    strand.mesh.scale.set(0.85 + Math.sin(sp) * 0.2, 0.85 + Math.cos(sp) * 0.2, 1.15 + Math.sin(sp * 0.8) * 0.35);
+                }
+            }
+            // Shed small algorithmic viscoelastic goo droplets along flight trajectory
+            if (Math.random() < 0.32 && particles.length < 95 && ud.dripGeo && ud.dripMat) {
+                const drip = new THREE.Mesh(ud.dripGeo, ud.dripMat);
+                const s = 0.55 + Math.random() * 0.45;
+                drip.scale.set(s, s, s * 1.45);
+                drip.position.copy(p.mesh.position).add(new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.14,
+                    (Math.random() - 0.5) * 0.14,
+                    (Math.random() - 0.5) * 0.14
+                ));
+                scene.add(drip);
+                particles.push({
+                    mesh: drip,
+                    vel: new THREE.Vector3((Math.random() - 0.5) * 1.1, 0.4 + Math.random() * 0.9, (Math.random() - 0.5) * 1.1),
+                    gravity: 11.5,
+                    life: 0.24 + Math.random() * 0.14
+                });
+            }
+        }
+
+        if (p.progress >= 1) {
+            if (typeof triggerWaterRippleFX === 'function' && !(typeof isOnRiverBridge === 'function' && isOnRiverBridge(tPos.x, tPos.z, 0.65))) {
+                const isHeavySplash = (p.wType === 'mortar' || p.wType === 'tank' || p.wType === 'siege_tank' || p.wType === 'rocket' || p.wType === 'heli' || p.wType === 'behemoth' || p.wType === 'sunlance' || p.wType === 'valk_mech');
+                triggerWaterRippleFX(tPos.x, tPos.z, isHeavySplash ? 1.45 : 0.82, true);
+            }
+            // High-Ground Elevation Tactical Advantage (+12% damage when firing from elevated plateau/ridge > 1.6m above target)
+            if (p.start && !p.isAirTarget && (p.start.y - tPos.y) > 1.6) {
+                p.damage = Math.round(p.damage * 1.12);
+            }
+            // Real-Time Destructible Environment: Heavy ordnance & explosive projectiles damage/collapse procedural buildings & fell trees
+            if (!p.isAirTarget && typeof window.damageEnvironmentalStructuresAt === 'function') {
+                const isExplosiveOrd = ['tank', 'siege_tank', 'mortar', 'rocket', 'sunlance', 'valk_mech', 'marauder', 'plasma', 'behemoth', 'gorgon', 'archon'].includes(p.wType);
+                if (isExplosiveOrd) {
+                    const envRad = (p.wType === 'siege_tank' || p.wType === 'mortar') ? 5.2 : 3.4;
+                    window.damageEnvironmentalStructuresAt(tPos, envRad, p.damage);
+                }
+            }
+            if (p.wType === 'tank' || p.wType === 'siege_tank') {
+                // Distinct 120mm / 180mm APFSDS-HEAT & Shock-Artillery Detonation (Hits GROUND units & buildings only, carves 3D crater depression & scorch!)
+                if (typeof detonateTankKineticShell === 'function') {
+                    detonateTankKineticShell(tPos, p.wType === 'siege_tank');
+                } else {
+                    detonateArtilleryBomb(tPos, true);
+                }
+                const splashRad = p.wType === 'siege_tank' ? 4.8 : 4.0;
+                const bldRad = p.wType === 'siege_tank' ? 6.5 : 5.5;
+                const tag = p.wType === 'siege_tank' ? 'SIEGE' : 'AP';
+                enemies.forEach(e => {
+                    if (e.isAir) return; // Tank & Siege Tank shells only hit ground units!
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= splashRad) {
+                        recordRagdollHitImpulse(e, p.start, true);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, `${p.damage} ${tag}`, '#00e5ff');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= bldRad) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, `${p.damage} ${tag}`, '#00e5ff');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'sunlance') {
+                // Bespoke Hero Vanguard Aegis-X9 Sunlance Rail-Bolt Impact: 3D Solar-Ion Particle Burst + Permanent Scorch & Crater Decal!
+                if (typeof spawnBombCrater === 'function' && !p.isAirTarget) spawnBombCrater(tPos, 0.56);
+                if (typeof window.spawnParticleBlastWaveFX === 'function') {
+                    window.spawnParticleBlastWaveFX(tPos, 0xffaa00, 1.05, 16);
+                }
+                enemies.forEach(e => {
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 2.8) {
+                        recordRagdollHitImpulse(e, p.start, true);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, `${p.damage} SUNLANCE`, '#ffaa00');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 3.6) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, `${p.damage} SUNLANCE`, '#ffaa00');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'valk_mech') {
+                // Valkyrie Semi-Mech 35mm Ground-Assault Explosive Shell (Hits GROUND units & buildings only, no pulse ring!)
+                if (typeof spawnBombCrater === 'function') spawnBombCrater(tPos, 0.48);
+                triggerSparks(tPos);
+                enemies.forEach(e => {
+                    if (e.isAir) return; // Semi-Mech ground autocannon only hits ground units!
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 2.6) {
+                        recordRagdollHitImpulse(e, p.start, false);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, `${p.damage} MECH`, '#38bdf8');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 3.8) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, `${p.damage} MECH`, '#38bdf8');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'valk_aa') {
+                // Valkyrie Flight Mode Anti-Air Halo Missile: STRICTLY hits flying units ONLY (no pulse ring!)
+                triggerSparks(tPos);
+                enemies.forEach(e => {
+                    if (!e.isAir) return; // Strict Air-Only damage!
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 3.6) {
+                        recordRagdollHitImpulse(e, p.start, true);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, `${p.damage} AA`, '#38bdf8');
+                    }
+                });
+            } else if (p.wType === 'rocket') {
+                // Explosive Rocket Missile Detonation (3D Particle Blast Burst + Scorch Crater Decal!)
+                if (typeof spawnBombCrater === 'function' && !p.isAirTarget) spawnBombCrater(tPos, 0.58);
+                if (typeof window.spawnParticleBlastWaveFX === 'function') {
+                    window.spawnParticleBlastWaveFX(tPos, 0xff4500, 1.15, 16);
+                }
+                enemies.forEach(e => {
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 3.4) {
+                        recordRagdollHitImpulse(e, p.start, true);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, `${p.damage} MIS`, '#ff2a4b');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 4.2) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, `${p.damage} MIS`, '#ff2a4b');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'mortar') {
+                detonateArtilleryBomb(tPos, true);
+                enemies.forEach(e => {
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 4.2) {
+                        recordRagdollHitImpulse(e, tPos, true);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, p.damage, '#ffaa00');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 5.5) {
+                        eb.hp -= p.damage;
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'marauder') {
+                // Marauder Punisher Concussive Grenade: 2.4m splash + 48% movement slow + 1.35x bonus damage vs armored/structures!
+                if (typeof detonateMarauderConcussiveShell === 'function') {
+                    detonateMarauderConcussiveShell(tPos);
+                }
+                enemies.forEach(e => {
+                    const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
+                    if (d <= 2.4 + (e.radius || 0.5)) {
+                        const isArmored = (e.variant === 'crusher' || e.variant === 'behemoth');
+                        const finalDmg = isArmored ? Math.round(p.damage * 1.35) : p.damage;
+                        recordRagdollHitImpulse(e, p.start, true);
+                        e.hp -= finalDmg;
+                        e.slowTimer = 3.5;
+                        spawnCombatFloat(e.mesh.position, finalDmg, '#ffaa00');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 3.2) {
+                        const bldDmg = Math.round(p.damage * 1.35);
+                        eb.hp -= bldDmg;
+                        spawnCombatFloat(eb.pos, bldDmg, '#ffaa00');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'plasma') {
+                // Plasma Gun splash ionization + simulated plasma combustion plume + permanent scorch crater
+                if (typeof spawnBombCrater === 'function') spawnBombCrater(tPos, 0.52);
+                if (typeof spawnSimulatedVolumetricExplosion === 'function') {
+                    spawnSimulatedVolumetricExplosion(tPos, 0.58, 1.38, 1.0, 6, 10);
+                } else if (typeof window.spawnParticleBlastWaveFX === 'function') {
+                    window.spawnParticleBlastWaveFX(tPos, 0x00e5ff, 0.95, 14);
+                }
+                enemies.forEach(e => {
+                    if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 2.5) {
+                        recordRagdollHitImpulse(e, p.start, false);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, p.damage, '#00e5ff');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    if (Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z) <= 3.2) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, p.damage, '#00e5ff');
+                        updateHUD();
+                    }
+                });
+            } else if (p.isEnemyAcid) {
+                // Enemy Acid / Glaive / Bio-Plasma / Gorgon Bile-Web / Spine impact at landing spot:
+                // Burst 3D viscoelastic goo droplets & slime particles (Zero expanding white block quads!)
+                if (typeof spawnEnemyGooSplashFX === 'function') {
+                    spawnEnemyGooSplashFX(tPos, p.wType);
+                }
+                const splashRad = p.wType === 'behemoth' ? 3.2 : (p.wType === 'gorgon' ? 2.85 : 1.95);
+                units.forEach(u => {
+                    const d = Math.hypot(u.mesh.position.x - tPos.x, u.mesh.position.z - tPos.z);
+                    if (d <= splashRad + (u.radius || 0.5)) {
+                        recordRagdollHitImpulse(u, p.start, p.wType === 'behemoth' || p.wType === 'gorgon');
+                        applyDamageWithTurretShield(u, p.damage);
+                        if (p.wType === 'gorgon') u.slowTimer = 2.6;
+                        spawnCombatFloat(u.mesh.position, p.damage, '#84cc16');
+                    }
+                });
+                buildings.forEach(b => {
+                    const d = Math.hypot(b.pos.x - tPos.x, b.pos.z - tPos.z);
+                    if (d <= splashRad + 1.6) {
+                        applyDamageWithTurretShield(b, p.damage);
+                        spawnCombatFloat(b.pos, p.damage, '#84cc16');
+                        if (b === state.baseBuilding) updateHUD();
+                    }
+                });
+                if (!state.solarisHostile && typeof solarisBuildings !== 'undefined') {
+                    solarisBuildings.forEach(sb => {
+                        if (!sb || sb.hp <= 0) return;
+                        const d = Math.hypot(sb.pos.x - tPos.x, sb.pos.z - tPos.z);
+                        if (d <= splashRad + 1.8) {
+                            applyDamageWithTurretShield(sb, p.damage, tPos);
+                            spawnCombatFloat(sb.pos, p.damage, '#84cc16');
+                        }
+                    });
+                }
+            } else if (p.isBioGoo && !p.isEnemyAcid) {
+                // Mind-Controlled Friendly Zerg Bio-Goo / Glaive / Bile-Web / Bio-Plasma Impact:
+                // Hits and damages ENEMY Zerg units and ENEMY Zerg buildings!
+                if (typeof spawnEnemyGooSplashFX === 'function') {
+                    spawnEnemyGooSplashFX(tPos, p.wType);
+                }
+                const splashRad = p.wType === 'behemoth' ? 3.4 : (p.wType === 'gorgon' ? 3.0 : 2.15);
+                enemies.forEach(e => {
+                    const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
+                    if (d <= splashRad + (e.radius || 0.55)) {
+                        recordRagdollHitImpulse(e, p.start, p.wType === 'behemoth' || p.wType === 'gorgon');
+                        e.hp -= p.damage;
+                        if (p.wType === 'gorgon') e.slowTimer = 2.8;
+                        spawnCombatFloat(e.mesh.position, p.damage, '#d946ef');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    const d = Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z);
+                    if (d <= splashRad + 2.2) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, p.damage, '#d946ef');
+                        updateHUD();
+                    }
+                });
+            } else if (p.wType === 'stalker' || p.wType === 'archon' || p.wType === 'solaris_spire') {
+                // Protoss Solaris Phase-Disruptor / Psionic Shock-Orb Impact: 3D Particle System Burst (Zero flat square planes!)
+                triggerSparks(tPos);
+                const isArchonOrb = (p.wType === 'archon');
+                if (typeof window.spawnParticleBlastWaveFX === 'function') {
+                    window.spawnParticleBlastWaveFX(tPos, isArchonOrb ? 0xf5b932 : 0x38bdf8, isArchonOrb ? 1.25 : 0.85, isArchonOrb ? 18 : 12);
+                }
+                const splashRad = isArchonOrb ? 2.85 : 1.75;
+                enemies.forEach(e => {
+                    const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
+                    if (d <= splashRad + (e.radius || 0.55)) {
+                        recordRagdollHitImpulse(e, p.start, isArchonOrb);
+                        e.hp -= p.damage;
+                        spawnCombatFloat(e.mesh.position, p.damage, isArchonOrb ? '#f5b932' : '#38bdf8');
+                    }
+                });
+                enemyBuildings.forEach(eb => {
+                    const d = Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z);
+                    if (d <= splashRad + 2.2) {
+                        eb.hp -= p.damage;
+                        spawnCombatFloat(eb.pos, p.damage, isArchonOrb ? '#f5b932' : '#38bdf8');
+                        updateHUD();
+                    }
+                });
+            } else {
+                // Friendly ballistic/sniper/rifle/reaper/heli rocket round hitting whatever enemy is at the landing coordinate
+                if ((p.wType === 'heli' || p.wType === 'reaper') && typeof spawnBombCrater === 'function' && !p.isAirTarget) {
+                    spawnBombCrater(tPos, p.wType === 'heli' ? 0.48 : 0.36);
+                    if (p.wType === 'heli' && typeof spawnSimulatedVolumetricExplosion === 'function') {
+                        spawnSimulatedVolumetricExplosion(tPos, 0.52, 1.32, 0.0, 5, 8);
+                    }
+                }
+                const isSniper = p.wType === 'sniper';
+                let hitEnemy = null, bestD = 1.95;
+                enemies.forEach(e => {
+                    const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
+                    if (d <= bestD + (e.radius || 0.55)) { bestD = d; hitEnemy = e; }
+                });
+                if (hitEnemy) {
+                    recordRagdollHitImpulse(hitEnemy, p.start, isSniper);
+                    hitEnemy.hp -= p.damage;
+                    spawnCombatFloat(
+                        hitEnemy.mesh.position,
+                        isSniper ? `${p.damage} CRIT` : p.damage,
+                        isSniper ? '#00ff66' : '#e8e6df'
+                    );
+                } else {
+                    enemyBuildings.forEach(eb => {
+                        const d = Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z);
+                        if (d <= 3.0) {
+                            eb.hp -= p.damage;
+                            spawnCombatFloat(eb.pos, p.damage, isSniper ? '#00ff66' : '#e8e6df');
+                            updateHUD();
+                        }
+                    });
+                }
+            }
+            scene.remove(p.mesh);
+            projectiles.splice(i, 1);
+        }
+    }
+
+    // Update Physics Blood Droplets, Bomb Impact Craters & Scavenger Post-Death Debris
+    if (typeof updateBloodPhysicsDrops === 'function') updateBloodPhysicsDrops(dt);
+    if (typeof updateBombCraters === 'function') updateBombCraters(dt);
+    if (typeof updateScavengerDebris === 'function') updateScavengerDebris(dt);
+    if (typeof updateBasePlacementBarriers === 'function') updateBasePlacementBarriers(dt);
+
+    // Update Casings, Ballistic Spark Streaks, Gore Particles, Simulated Combustion Plumes & Blast Waves
+    for (let i = shellCasings.length - 1; i >= 0; i--) {
+        const c = shellCasings[i];
+        c.life -= dt;
+        c.mesh.position.addScaledVector(c.vel, dt);
+        c.vel.y -= 15 * dt;
+        c.mesh.rotation.x += c.rotVel.x * dt;
+        c.mesh.rotation.z += c.rotVel.z * dt;
+        const groundY = getTerrainHeight(c.mesh.position.x, c.mesh.position.z) + 0.03;
+        if (c.mesh.position.y < groundY) {
+            c.mesh.position.y = groundY;
+            c.vel.y *= -0.4; c.vel.x *= 0.6; c.vel.z *= 0.6;
+        }
+        if (c.life <= 0) { scene.remove(c.mesh); shellCasings.splice(i, 1); }
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const pt = particles[i];
+        pt.life -= dt;
+        if (pt.drag) {
+            const dragMult = Math.max(0, 1.0 - pt.drag * dt);
+            pt.vel.x *= dragMult;
+            pt.vel.z *= dragMult;
+        }
+        pt.mesh.position.addScaledVector(pt.vel, dt);
+        pt.vel.y -= pt.gravity * dt;
+
+        if (pt.isWaterDrop) {
+            if (pt.vel.lengthSq() > 0.001) {
+                pt.mesh.lookAt(
+                    pt.mesh.position.x + pt.vel.x,
+                    pt.mesh.position.y + pt.vel.y,
+                    pt.mesh.position.z + pt.vel.z
+                );
+            }
+            pt.mesh.scale.multiplyScalar(0.985);
+            if (pt.waterY !== undefined && pt.vel.y < 0 && pt.mesh.position.y <= pt.waterY) {
+                pt.life = 0;
+            }
+        } else if (pt.isBallisticSpark) {
+            if (pt.vel.lengthSq() > 0.002) {
+                pt.mesh.lookAt(
+                    pt.mesh.position.x + pt.vel.x,
+                    pt.mesh.position.y + pt.vel.y,
+                    pt.mesh.position.z + pt.vel.z
+                );
+            }
+            const gY = getTerrainHeight(pt.mesh.position.x, pt.mesh.position.z) + 0.03;
+            if (pt.mesh.position.y < gY && pt.vel.y < 0) {
+                pt.mesh.position.y = gY;
+                if ((pt.bounces || 0) < 2) {
+                    pt.vel.y = -pt.vel.y * 0.42;
+                    pt.vel.x *= 0.68;
+                    pt.vel.z *= 0.68;
+                    pt.bounces = (pt.bounces || 0) + 1;
+                } else {
+                    pt.life = 0;
+                }
+            }
+        } else if (pt.isThrustParticle) {
+            if (pt.vel.lengthSq() > 0.002) {
+                pt.mesh.lookAt(
+                    pt.mesh.position.x + pt.vel.x,
+                    pt.mesh.position.y + pt.vel.y,
+                    pt.mesh.position.z + pt.vel.z
+                );
+            }
+            // Smooth needle-cone taper as thruster plasma stream cools
+            pt.mesh.scale.x *= 0.88;
+            pt.mesh.scale.y *= 0.88;
+            pt.mesh.scale.z *= 0.94;
+        } else {
+            pt.mesh.scale.multiplyScalar(0.95);
+        }
+        if (pt.life <= 0) { scene.remove(pt.mesh); particles.splice(i, 1); }
+    }
+
+    for (let i = smokeClouds.length - 1; i >= 0; i--) {
+        const sm = smokeClouds[i];
+        sm.life -= dt;
+        sm.age = (sm.age || 0) + dt;
+        if (sm.buoyancy) {
+            sm.vel.y += sm.buoyancy * dt;
+        }
+        if (sm.drag) {
+            const dragMult = Math.max(0, 1.0 - sm.drag * dt);
+            sm.vel.x *= dragMult;
+            sm.vel.z *= dragMult;
+            sm.vel.y *= Math.max(0, 1.0 - sm.drag * 0.45 * dt);
+        }
+        sm.mesh.position.addScaledVector(sm.vel, dt);
+        sm.mesh.scale.multiplyScalar(1 + dt * (sm.expandRate || 1.2));
+
+        if (sm.mesh.material && sm.mesh.material.uniforms && sm.mesh.material.uniforms.uAge) {
+            sm.mesh.material.uniforms.uAge.value = sm.age;
+            sm.mesh.material.uniforms.uLife.value = sm.maxLife || 1.0;
+        }
+
+        if (sm.life <= 0) {
+            scene.remove(sm.mesh);
+            if (sm.ownsMaterial && sm.mesh.material) {
+                sm.mesh.material.dispose();
+            }
+            smokeClouds.splice(i, 1);
+        }
+    }
+
+    for (let i = shockwaves.length - 1; i >= 0; i--) {
+        const sw = shockwaves[i];
+        sw.scale += dt * (sw.speed || 15);
+        if (sw.riseY) sw.mesh.position.y += dt * sw.riseY;
+        sw.alpha -= dt * 2.2;
+        sw.mesh.scale.setScalar(sw.scale);
+        const clampedAlpha = Math.max(0, sw.alpha);
+        sw.mesh.material.opacity = clampedAlpha;
+        if (sw.mesh.material && sw.mesh.material.uniforms && sw.mesh.material.uniforms.uOpacity) {
+            sw.mesh.material.uniforms.uOpacity.value = clampedAlpha;
+        }
+        if (sw.alpha <= 0) { scene.remove(sw.mesh); sw.mesh.material.dispose(); shockwaves.splice(i, 1); }
+    }
+
+    // Animate 3D Tactical Order Waypoint Markers (Converging 4-Chevron Reticle + Descending Beacon Pin)
+    for (let i = tacticalWaypoints.length - 1; i >= 0; i--) {
+        const tw = tacticalWaypoints[i];
+        tw.age += dt;
+        const t = Math.min(1.0, tw.age / tw.maxLife);
+        // Smooth ease-out convergence from 0.92m radius inward to 0.22m lock point
+        const ease = 1.0 - Math.pow(1.0 - t, 3.0);
+        const rad = THREE.MathUtils.lerp(0.92, 0.22, ease);
+        for (let ci = 0; ci < tw.chevrons.length; ci++) {
+            const c = tw.chevrons[ci];
+            c.mesh.position.set(Math.sin(c.ang) * rad, 0.04 + Math.sin(t * Math.PI) * 0.06, Math.cos(c.ang) * rad);
+        }
+        if (tw.beaconPin) {
+            tw.beaconPin.position.y = THREE.MathUtils.lerp(1.15, 0.22, ease);
+            tw.beaconPin.rotation.y += dt * 7.5;
+            const s = 1.0 - t * 0.35;
+            tw.beaconPin.scale.set(0.85 * s, 2.4 * (1.0 - t * 0.45), 0.85 * s);
+        }
+        if (tw.mat) {
+            tw.mat.opacity = Math.max(0, 1.0 - Math.pow(t, 1.8));
+        }
+        if (tw.age >= tw.maxLife) {
+            scene.remove(tw.root);
+            if (tw.mat) tw.mat.dispose();
+            tacticalWaypoints.splice(i, 1);
+        }
+    }
+
+    _portrait3DAccum += dt;
+    if (_portrait3DAccum >= 0.065) {
+        if (window.PORTRAIT_3D_VIEWER && typeof window.PORTRAIT_3D_VIEWER.update === 'function') {
+            window.PORTRAIT_3D_VIEWER.update(_portrait3DAccum);
+        }
+        _portrait3DAccum = 0;
+    }
+
+    renderer.render(scene, camera);
+    } catch (err) {
+        if (window.APP_ERROR_HANDLER) window.APP_ERROR_HANDLER.record('animate', err);
+        try { renderer.render(scene, camera); } catch (_) {}
+    }
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Spawns real, functioning Faction Bases at BASE_TERRAIN_ZONES for all added AI/Players from the Multiplayer/Skirmish Lobby!
+// Strictly groups Friendly Allies (Team 1) in our corner near PLAYER_START_POS and places Hostile AI Enemies FAR AWAY (>= 100m)!
+function spawnLobbyExpansionBases(lobbyPlayers) {
+    if (!Array.isArray(lobbyPlayers) || lobbyPlayers.length <= 2) return;
+    const zones = Array.isArray(window.BASE_TERRAIN_ZONES) ? window.BASE_TERRAIN_ZONES : [];
+    const expansionZones = zones.filter(z => z && z.id && (z.id.startsWith('faction_expansion_') || z.id.startsWith('corner_ramp_platform_')));
+    if (expansionZones.length === 0) return;
+
+    const usedZoneIds = new Set();
+    // Filter extra commanders beyond the primary human host and primary Zerg Hive
+    const extraCommanders = lobbyPlayers.slice(1);
+    for (let i = 0; i < extraCommanders.length; i++) {
+        const cmdr = extraCommanders[i];
+        if (!cmdr) continue;
+        const isAlly = (cmdr.team === 1);
+
+        // Sort available platforms by distance to PLAYER_START_POS:
+        // - Allied Team 1 commanders pick platforms CLOSEST to PLAYER_START_POS (grouped team in our corner!)
+        // - Hostile AI Enemies pick platforms FARTHEST from PLAYER_START_POS (never spawning near us!)
+        const availableZones = expansionZones
+            .filter(z => !usedZoneIds.has(z.id))
+            .filter(z => {
+                const distToPlayer = Math.hypot(z.x - PLAYER_START_POS.x, z.z - PLAYER_START_POS.z);
+                return isAlly ? (distToPlayer < 125.0) : (distToPlayer >= 92.0);
+            })
+            .sort((a, b) => {
+                const da = Math.hypot(a.x - PLAYER_START_POS.x, a.z - PLAYER_START_POS.z);
+                const db = Math.hypot(b.x - PLAYER_START_POS.x, b.z - PLAYER_START_POS.z);
+                return isAlly ? (da - db) : (db - da);
+            });
+
+        const ez = availableZones[0];
+        if (!ez) continue;
+        usedZoneIds.add(ez.id);
+
+        const basePos = new THREE.Vector3(ez.x, getTerrainHeight(ez.x, ez.z), ez.z);
+        if (typeof window.flattenTerrainUnderBuilding === 'function') {
+            basePos.y = window.flattenTerrainUnderBuilding(basePos.x, basePos.z, 3.8, 2.2);
+        }
+
+        const fac = String(cmdr.faction || '').toLowerCase();
+
+        if (!isAlly) {
+            // Hostile AI / Player Expansion Base (Team 2 or FFA - strictly far from Player corner! Starts with MAIN BASE ONLY!)
+            if (fac.includes('zerg')) {
+                let expCreepMesh = null;
+                if (typeof window.spawnZergExpansionCreepBlanket === 'function') {
+                    expCreepMesh = window.spawnZergExpansionCreepBlanket(basePos.x, basePos.z, 13.5);
+                }
+                const citMesh = createLeviathanCitadel();
+                citMesh.position.copy(basePos);
+                scene.add(citMesh);
+                const cBadge = document.createElement('div'); cBadge.style.display = 'none';
+                const cHb = makeHealthPip('#ff2a4b', true);
+                enemyBuildings.push({
+                    role: 'citadel', isExpansionCitadel: true, expCreepMesh,
+                    mesh: citMesh, pos: basePos.clone(),
+                    footprintRadius: 3.4, hp: 2800, maxHp: 2800, buildProgress: 1.0, badge: cBadge, hb: cHb
+                });
+            } else {
+                // Hostile Protoss or Terran Commander Base added in Lobby (Main Base Only at Start!)
+                const isProtoss = fac.includes('protoss') || fac.includes('solaris');
+                const hqMesh = createEngineeredBuilding(isProtoss ? 'solaris_nexus' : 'base', false);
+                hqMesh.position.copy(basePos);
+                scene.add(hqMesh);
+                const hBadge = document.createElement('div'); hBadge.style.display = 'none';
+                enemyBuildings.push({
+                    role: 'citadel', isExpansionCitadel: true,
+                    mesh: hqMesh, pos: basePos.clone(),
+                    footprintRadius: 3.1, hp: 2600, maxHp: 2600, buildProgress: 1.0,
+                    badge: hBadge, hb: makeHealthPip('#ff5400', true)
+                });
+            }
+        } else {
+            // Allied AI / Player Expansion Base (Team 1 - Starts with Main Nexus/HQ Only!)
+            const isTerranAlly = fac.includes('terran');
+            const allyHqType = isTerranAlly ? 'base' : 'solaris_nexus';
+
+            const hqMesh = createEngineeredBuilding(allyHqType, false);
+            hqMesh.position.copy(basePos);
+            scene.add(hqMesh);
+            solarisBuildings.push({
+                type: allyHqType, role: 'nexus', bpIdx: 10 + i,
+                mesh: hqMesh, pos: basePos.clone(), footprintRadius: 2.8,
+                hp: 2200, maxHp: 2200, shield: 900, maxShield: 900, shieldRegenDelay: 0,
+                buildProgress: 1.0, hb: makeHealthPip('#00e5ff', true),
+                spawnTimer: 9.0, spawnDuration: 12.0
+            });
+        }
+    }
+}
+
+// Expose Playtest & Game Shell API for React HUD
+window.GAME_API = {
+    getState: () => {
+        const primarySelected = (state && Array.isArray(state.selectedUnits) && state.selectedUnits.length > 0)
+            ? state.selectedUnits[0]
+            : (state ? state.selectedBuilding : null);
+        const safeStats = primarySelected ? {
+            type: primarySelected.type || 'unit',
+            hp: primarySelected.hp ?? 100,
+            maxHp: primarySelected.maxHp ?? 100,
+            damage: primarySelected.damage ?? 0,
+            range: primarySelected.range ?? 0,
+            rad: primarySelected.radius ?? 0.55
+        } : null;
+        const safeUserData = (primarySelected && primarySelected.mesh && primarySelected.mesh.userData)
+            ? primarySelected.mesh.userData
+            : null;
+        return {
+            basePlaced: !!(state && state.basePlaced),
+            hqDead: !!(state && state.basePlaced && state.baseBuilding && state.baseBuilding.hp <= 0),
+            hqHp: (state && state.baseBuilding) ? Math.max(0, Math.floor(state.baseBuilding.hp)) : 1500,
+            missionWon: !!(state && state.missionWon),
+            isEndless: !!(state && state.isEndless),
+            req: (state && typeof state.req === 'number') ? state.req : 200,
+            gems: (state && typeof state.gems === 'number') ? state.gems : 0,
+            wave: (state && typeof state.wave === 'number') ? state.wave : 1,
+            kills: (state && typeof state.kills === 'number') ? state.kills : 0,
+            unitsCount: Array.isArray(units) ? units.length : 0,
+            selectedUnitsCount: (state && Array.isArray(state.selectedUnits)) ? state.selectedUnits.length : 0,
+            enemiesCount: Array.isArray(enemies) ? enemies.length : 0,
+            fowRevealAll: !!window.fowRevealAll,
+            aiAllyMode: (state && state.aiAllyMode) || 'defensive',
+            stats: safeStats,
+            userData: safeUserData
+        };
+    },
+    startMission: (config = null) => {
+        window.titleScreenActive = false;
+        window.loadingCameraSweep = false;
+        window.gamePaused = false;
+        if (config && typeof config === 'object') {
+            state.multiplayerConfig = config;
+            if (config.startingMinerals && typeof config.startingMinerals === 'number') {
+                state.req = config.startingMinerals;
+            }
+            if (config.aiAllyMode) {
+                state.aiAllyMode = config.aiAllyMode;
+                syncAiAllyButtons();
+            }
+        }
+        if (!state.enemyBase || enemyBuildings.length === 0) {
+            initEnemyHiveCluster();
+        }
+        if (config && Array.isArray(config.lobbyPlayers) && config.lobbyPlayers.length > 2) {
+            spawnLobbyExpansionBases(config.lobbyPlayers);
+        }
+        if (config && config.autoDeployBase && !state.basePlaced) {
+            deployBaseAtBarrier(selectedBaseBarrierId || 'alpha');
+        }
+        const targetPos = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+        controls.target.set(targetPos.x, getTerrainHeight(targetPos.x, targetPos.z), targetPos.z);
+        if (IS_MOBILE) {
+            camera.position.set(targetPos.x + 6, 52, targetPos.z + 46);
+        } else {
+            camera.position.set(targetPos.x + 4, 38, targetPos.z + 34);
+        }
+        controls.update();
+        updateHUD(true);
+        if (window.SFX) window.SFX.playBuild();
+        if (window.RAID_MUSIC && !window.RAID_MUSIC.muted) {
+            window.RAID_MUSIC.start();
+        }
+    },
+    addMinerals: (amount = 500) => {
+        const clamped = Math.max(0, Math.min(2500, Math.floor(Number(amount) || 0)));
+        state.req += clamped;
+        updateHUD(true);
+        if (window.SFX) window.SFX.playClick();
+    },
+    spendResourcesForShare: (minerals = 0, gems = 0) => {
+        const m = Math.max(0, Math.floor(Number(minerals) || 0));
+        const g = Math.max(0, Math.floor(Number(gems) || 0));
+        if ((state.req || 0) < m || (state.gems || 0) < g) return false;
+        state.req -= m;
+        state.gems = Math.max(0, (state.gems || 0) - g);
+        updateHUD(true);
+        if (window.SFX) window.SFX.playClick();
+        return true;
+    },
+    receiveSharedResources: (minerals = 0, gems = 0, senderName = 'ALLY') => {
+        const m = Math.max(0, Math.min(5000, Math.floor(Number(minerals) || 0)));
+        const g = Math.max(0, Math.min(1000, Math.floor(Number(gems) || 0)));
+        state.req = (state.req || 0) + m;
+        state.gems = (state.gems || 0) + g;
+        updateHUD(true);
+        if (window.SFX) window.SFX.playHeal();
+        const ticker = document.getElementById('directive-ticker');
+        if (ticker) {
+            ticker.innerText = `RESOURCE TRANSFER RECEIVED FROM ${String(senderName).toUpperCase()}: +${m} MINERALS${g > 0 ? ` & +${g} GEMS` : ''}!`;
+            ticker.style.color = '#00ff66';
+        }
+    },
+    getAntiCheatDigest: () => {
+        const reqVal = Math.floor(state.req || 0);
+        const gemsVal = Math.floor(state.gems || 0);
+        const unitsVal = Array.isArray(units) ? units.length : 0;
+        const bldsVal = Array.isArray(buildings) ? buildings.length : 0;
+        const waveVal = Math.floor(state.wave || 1);
+        const checksum = ((reqVal * 31 + gemsVal * 97 + unitsVal * 131 + bldsVal * 193 + waveVal * 257) ^ 0x5a7f31) >>> 0;
+        return {
+            req: reqVal,
+            gems: gemsVal,
+            unitsCount: unitsVal,
+            buildingsCount: bldsVal,
+            wave: waveVal,
+            checksum
+        };
+    },
+    toggleFogReveal: () => {
+        window.fowRevealAll = !window.fowRevealAll;
+        updateFogOfWarVision();
+        renderTacticalMinimap();
+        if (window.SFX) window.SFX.playClick();
+        return window.fowRevealAll;
+    },
+    spawnTestSquad: () => {
+        const origin = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
+        if (!state.basePlaced) {
+            setMode('base');
+            deployStructure(PLAYER_START_POS);
+        }
+        spawnAlliedUnit('grunt', origin);
+        spawnAlliedUnit('ranger', origin);
+        spawnAlliedUnit('medic', origin);
+        spawnAlliedUnit('tank', origin);
+        spawnAlliedUnit('heli', origin);
+        if (window.SFX) window.SFX.playBuild();
+    },
+    spawnEnemyWaveNow: () => {
+        if (!state.basePlaced) {
+            setMode('base');
+            deployStructure(PLAYER_START_POS);
+        }
+        const origin = state.enemyBase ? state.enemyBase.pos : ENEMY_BASE_POS;
+        ['skitterer', 'spitter', 'burster', 'mutalisk', 'crusher', 'behemoth'].forEach(v => {
+            spawnEnemyFromBuilding(v, origin);
+        });
+        state.wave++;
+        updateHUD();
+        if (window.SFX) window.SFX.playExplosion(false);
+    },
+    repairHQ: () => {
+        if (state.baseBuilding) {
+            executeHQEmergencyOverloadRepair();
+        }
+    },
+    focusCamera: (zone) => {
+        let tx = PLAYER_START_POS.x, tz = PLAYER_START_POS.z;
+        if (zone === 'hq' && state.baseBuilding) {
+            tx = state.baseBuilding.pos.x; tz = state.baseBuilding.pos.z;
+        } else if (zone === 'bridge') {
+            tx = BRIDGES.length > 0 ? BRIDGES[0].center.x : 0;
+            tz = BRIDGES.length > 0 ? BRIDGES[0].center.z : 0;
+        } else if (zone === 'hive') {
+            tx = ENEMY_BASE_POS.x; tz = ENEMY_BASE_POS.z;
+        }
+        const offset = camera.position.clone().sub(controls.target);
+        controls.target.set(tx, getTerrainHeight(tx, tz), tz);
+        camera.position.copy(controls.target).add(offset);
+        controls.update();
+        if (window.SFX) window.SFX.playClick();
+    },
+    getBaseBarriers: () => BASE_PLACEMENT_BARRIERS,
+    getSelectedBaseBarrier: () => selectedBaseBarrierId,
+    selectBaseBarrierZone: (id) => {
+        selectBaseBarrierZone(id, true);
+    },
+    deployBaseAtBarrier: (id) => {
+        return deployBaseAtBarrier(id);
+    },
+    regenerateMap: (customSeed, lobbyPlayers) => {
+        if (typeof window.regenerateDynamicSectorMap === 'function') {
+            return window.regenerateDynamicSectorMap(customSeed, lobbyPlayers);
+        }
+    },
+    handleNetworkOrder: (order, senderId) => {
+        if (!order) return;
+        if (order.type === 'ping' && order.pos) {
+            const h = getTerrainHeight(order.pos.x, order.pos.z) + 1.2;
+            spawnCombatFloat(new THREE.Vector3(order.pos.x, h, order.pos.z), `+1`, '#00f2ff');
+            if (typeof triggerRadarPulseFx === 'function') triggerRadarPulseFx(new THREE.Vector3(order.pos.x, 0, order.pos.z));
+            if (window.SFX) window.SFX.playClick();
+        } else if (order.type === 'spawn_allied' && order.unitType) {
+            const spawnPos = order.pos || (state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS);
+            spawnAlliedUnit(order.unitType, spawnPos);
+        } else if (order.type === 'base_barrier' && order.barrierId) {
+            selectBaseBarrierZone(order.barrierId, false);
+        }
+    }
+};
+
+// ============================================================================
+// DYNAMIC MAP REGENERATION MATCH RESET & HUD / MOBILE UI VISIBILITY TOGGLES
+// Completely resets all match progress (buildings, units, enemies, resources,
+// wave, timers, FOW) and starts fresh on the newly generated terrain algorithm!
+// ============================================================================
+window.resetMatchForNewMap = function(newSeed) {
+    // 0. Clear active autonomous mining drones
+    if (typeof clearAutoMiningDrones === 'function') {
+        clearAutoMiningDrones();
+    }
+
+    // 1. Remove & clean up all player buildings
+    buildings.forEach(b => {
+        if (!b) return;
+        if (b.mesh) scene.remove(b.mesh);
+        if (b.shieldDomeMesh) scene.remove(b.shieldDomeMesh);
+        if (b.hb && b.hb.root) b.hb.root.remove();
+        if (b.badge) b.badge.remove();
+    });
+    buildings.length = 0;
+
+    // 2. Remove & clean up all friendly units
+    units.forEach(u => {
+        if (!u) return;
+        if (u.mesh) scene.remove(u.mesh);
+        if (u.healBeam) scene.remove(u.healBeam);
+        if (u.selCircle) scene.remove(u.selCircle);
+        if (u.hb && u.hb.root) u.hb.root.remove();
+    });
+    units.length = 0;
+
+    // 3. Remove & clean up all enemy units
+    enemies.forEach(e => {
+        if (!e) return;
+        if (e.mesh) scene.remove(e.mesh);
+        if (e.hb && e.hb.root) e.hb.root.remove();
+    });
+    enemies.length = 0;
+
+    // 4. Remove & clean up all active projectiles, particles, smoke, shockwaves & casings
+    projectiles.forEach(p => { if (p && p.mesh) scene.remove(p.mesh); });
+    projectiles.length = 0;
+    particles.forEach(pt => { if (pt && pt.mesh) scene.remove(pt.mesh); });
+    particles.length = 0;
+    smokeClouds.forEach(sm => { if (sm && sm.mesh) scene.remove(sm.mesh); });
+    smokeClouds.length = 0;
+    shockwaves.forEach(sw => { if (sw && sw.mesh) scene.remove(sw.mesh); });
+    shockwaves.length = 0;
+    shellCasings.forEach(sc => { if (sc && sc.mesh) scene.remove(sc.mesh); });
+    shellCasings.length = 0;
+    if (typeof corpses !== 'undefined') {
+        corpses.forEach(c => { if (c && c.mesh) scene.remove(c.mesh); });
+        corpses.length = 0;
+    }
+    if (typeof wreckageParts !== 'undefined') {
+        wreckageParts.forEach(w => { if (w && w.mesh) scene.remove(w.mesh); });
+        wreckageParts.length = 0;
+    }
+    if (typeof scavengerDebrisClusters !== 'undefined') {
+        scavengerDebrisClusters.forEach(sc => { if (sc && sc.group) scene.remove(sc.group); });
+        scavengerDebrisClusters.length = 0;
+    }
+
+    // 5. Reset match state & progress back to fresh start (Slow-start economy: 200 starting minerals)
+    state.req = 200;
+    state.gems = 0;
+    state.wave = 1;
+    state.kills = 0;
+    state.elapsedSec = 0;
+    state.rushGraceTimer = 45.0;
+    state.swarmWaveTimer = 28.0;
+    state.basePlaced = false;
+    state.heroPlaced = false;
+    state.missionWon = false;
+    state.isEndless = false;
+    state.enemyBaseDiscovered = false;
+    state.discoveredEnemyBasePos = null;
+    state.baseBuilding = null;
+    state.selectedBuilding = null;
+    state.selectedUnits = [];
+    state.unitCommandMode = null;
+    state.squadPosture = 'DEFENSIVE';
+    state.upgrades = {
+        terran: { weapons: 0, armor: 0 },
+        solaris: { weapons: 0, armor: 0 },
+        zerg: { weapons: 0, armor: 0 }
+    };
+    state.zergUpgradeTimer = 34.0;
+    state.solarisUpgradeTimer = 32.0;
+    state.mode = 'base';
+    syncSquadIntelButtonUI();
+
+    if (state.humanBadgeDom) {
+        state.humanBadgeDom.remove();
+        state.humanBadgeDom = null;
+    }
+    if (state.powerRing) {
+        scene.remove(state.powerRing);
+        state.powerRing = null;
+    }
+    if (typeof selRing !== 'undefined' && selRing) selRing.visible = false;
+    if (typeof ghostMesh !== 'undefined' && ghostMesh) ghostMesh.visible = true;
+    const victoryOverlay = document.getElementById('victory-overlay');
+    if (victoryOverlay) victoryOverlay.style.display = 'none';
+
+    // Reset Fog of War arrays completely
+    fowExplored.fill(0);
+    fowVisible.fill(0);
+    fowSmoothAlpha.fill(215);
+
+    // 6. Rebuild Drop-Zone Barriers & Base Placement Ghost on the new terrain
+    buildBasePlacementBarrierMeshes();
+    rebuildGhostModel('base');
+    selectBaseBarrierZone('alpha', true);
+
+    // 7. Rebuild Enemy Hive Cluster & AI Ally Solaris Enclave at new procedural sector coordinates
+    enemyBuildings.forEach(eb => {
+        if (eb.mesh) scene.remove(eb.mesh);
+        if (eb.badge) eb.badge.remove();
+        if (eb.hb && eb.hb.root) eb.hb.root.remove();
+    });
+    enemyBuildings.length = 0;
+    state.enemyBase = null;
+    creepRadius = 16.5;
+    creepTargetRadius = 21.0;
+    initEnemyHiveCluster();
+    if (Array.isArray(window.CUSTOM_LOBBY_PLAYERS) && window.CUSTOM_LOBBY_PLAYERS.length > 2) {
+        spawnLobbyExpansionBases(window.CUSTOM_LOBBY_PLAYERS);
+    }
+    if (typeof updateZergCreepColors === 'function') {
+        updateZergCreepColors(creepRadius, false, true);
+    }
+
+    // 8. Recenter camera on the new Player Start Sector
+    const startY = getTerrainHeight(PLAYER_START_POS.x, PLAYER_START_POS.z);
+    controls.target.set(PLAYER_START_POS.x, startY, PLAYER_START_POS.z);
+    if (IS_MOBILE) {
+        camera.position.set(PLAYER_START_POS.x + 6, 52, PLAYER_START_POS.z + 46);
+    } else {
+        camera.position.set(PLAYER_START_POS.x + 4, 38, PLAYER_START_POS.z + 34);
+    }
+    controls.update();
+
+    const rampDesc = window.HAS_BASE_PLATEAU_RAMP ? 'Elevated Ramp Sanctuary' : 'Open Valley Basin';
+    const ticker = document.getElementById('directive-ticker');
+    if (ticker) {
+        ticker.innerText = `NEW SECTOR GENERATED [SEED #${newSeed || window.ACTIVE_MAP_SEED} · ${rampDesc}]: Deploy Orbital Citadel HQ!`;
+        ticker.style.color = '#00e5ff';
+    }
+
+    updateFogOfWarVision();
+    renderTacticalMinimap();
+    renderSC2CommandCard();
+    updateHUD();
+};
+
+const hudVisibilityState = {
+    allHidden: false,
+    consoleHidden: false,
+    minimalMobile: IS_MOBILE,
+    showMinimap: true,
+    showPortrait: !IS_MOBILE,
+    showCenter: true,
+    showObjective: !IS_MOBILE,
+    soundEnabled: true
+};
+
+function syncHudVisibilityClasses() {
+    const container = document.getElementById('game-container');
+    if (!container) return;
+
+    container.classList.toggle('hud-all-hidden', !!hudVisibilityState.allHidden);
+    container.classList.toggle('hud-console-hidden', !!hudVisibilityState.consoleHidden);
+    container.classList.toggle('hud-minimal-mobile', !!hudVisibilityState.minimalMobile);
+    container.classList.toggle('hud-hide-minimap', !hudVisibilityState.showMinimap);
+    container.classList.toggle('hud-hide-portrait', !hudVisibilityState.showPortrait);
+    container.classList.toggle('hud-hide-center', !hudVisibilityState.showCenter);
+    container.classList.toggle('hud-hide-objective', !hudVisibilityState.showObjective);
+
+    const btnRestoreAll = document.getElementById('btn-restore-all-ui');
+    if (btnRestoreAll) {
+        btnRestoreAll.style.display = '';
+        btnRestoreAll.classList.toggle('pill-visible', !!hudVisibilityState.allHidden);
+    }
+    const btnRestoreConsole = document.getElementById('btn-restore-console');
+    if (btnRestoreConsole) {
+        btnRestoreConsole.style.display = '';
+        btnRestoreConsole.classList.toggle('pill-visible', !hudVisibilityState.allHidden && !!hudVisibilityState.consoleHidden);
+    }
+    const btnToggleConsole = document.getElementById('btn-toggle-console');
+    if (btnToggleConsole) {
+        btnToggleConsole.innerText = hudVisibilityState.consoleHidden ? '▲ PANEL' : '▼ PANEL';
+    }
+
+    // Sync Settings Modal Checkboxes
+    const chkMinimal = document.getElementById('chk-hud-minimal');
+    if (chkMinimal) chkMinimal.checked = !!hudVisibilityState.minimalMobile;
+    const chkConsole = document.getElementById('chk-hud-console');
+    if (chkConsole) chkConsole.checked = !hudVisibilityState.consoleHidden;
+    const chkMinimap = document.getElementById('chk-hud-minimap');
+    if (chkMinimap) chkMinimap.checked = !!hudVisibilityState.showMinimap;
+    const chkPortrait = document.getElementById('chk-hud-portrait');
+    if (chkPortrait) chkPortrait.checked = !!hudVisibilityState.showPortrait;
+    const chkCenter = document.getElementById('chk-hud-center');
+    if (chkCenter) chkCenter.checked = !!hudVisibilityState.showCenter;
+    const chkObj = document.getElementById('chk-hud-objective');
+    if (chkObj) chkObj.checked = !!hudVisibilityState.showObjective;
+    const chkSound = document.getElementById('chk-hud-sound');
+    if (chkSound && window.SFX) chkSound.checked = !window.SFX.muted;
+}
+
+window.toggleBottomConsole = function() {
+    hudVisibilityState.consoleHidden = !hudVisibilityState.consoleHidden;
+    if (window.SFX) window.SFX.playClick();
+    syncHudVisibilityClasses();
+};
+
+window.toggleAllGameUI = function() {
+    hudVisibilityState.allHidden = !hudVisibilityState.allHidden;
+    if (window.SFX) window.SFX.playClick();
+    syncHudVisibilityClasses();
+};
+
+window.toggleHudSettingsModal = function() {
+    const modal = document.getElementById('hud-settings-modal');
+    if (!modal) return;
+    const isHidden = modal.style.display === 'none' || !modal.style.display;
+    modal.style.display = isHidden ? 'flex' : 'none';
+    if (window.SFX) window.SFX.playClick();
+    syncHudVisibilityClasses();
+};
+
+window.updateHudSetting = function(key, checked) {
+    if (key === 'minimal') {
+        hudVisibilityState.minimalMobile = !!checked;
+    } else if (key === 'console') {
+        hudVisibilityState.consoleHidden = !checked;
+    } else if (key === 'minimap') {
+        hudVisibilityState.showMinimap = !!checked;
+        if (checked) hudVisibilityState.minimalMobile = false;
+    } else if (key === 'portrait') {
+        hudVisibilityState.showPortrait = !!checked;
+        if (checked) hudVisibilityState.minimalMobile = false;
+    } else if (key === 'center') {
+        hudVisibilityState.showCenter = !!checked;
+    } else if (key === 'objective') {
+        hudVisibilityState.showObjective = !!checked;
+        if (checked) hudVisibilityState.minimalMobile = false;
+    } else if (key === 'sound' && window.SFX) {
+        window.SFX.muted = !checked;
+    }
+    if (window.SFX) window.SFX.playClick();
+    syncHudVisibilityClasses();
+};
+
+state.aiAllyMode = 'defensive';
+state.aiAllyTimer = 11.0;
+
+function syncAiAllyButtons() {
+    const mode = (state.aiAllyMode || 'defensive').toUpperCase();
+    const btnTop = document.getElementById('btn-toggle-ai-ally');
+    if (btnTop) {
+        btnTop.innerText = `🤖 ALLY AI: ${mode}`;
+        btnTop.style.borderColor = mode === 'OFF' ? 'rgba(148,163,184,0.4)' : (mode === 'AGGRESSIVE' ? '#f59e0b' : '#00ff66');
+        btnTop.style.color = mode === 'OFF' ? '#94a3b8' : (mode === 'AGGRESSIVE' ? '#fde047' : '#86efac');
+    }
+    const btnModal = document.getElementById('btn-modal-ai-ally');
+    if (btnModal) {
+        btnModal.innerText = `🤖 AI ALLY COMMANDER: ${mode}`;
+    }
+}
+
+window.toggleAiAllyMode = function() {
+    const order = ['defensive', 'aggressive', 'off'];
+    const idx = order.indexOf(state.aiAllyMode || 'defensive');
+    state.aiAllyMode = order[(idx + 1) % order.length];
+    const prodBld = buildings.find(b =>
+        (b.type === 'barracks' || b.type === 'factory' || b.type === 'solaris_gate') &&
+        b.hp > 0 && (b.buildProgress === undefined || b.buildProgress >= 1.0)
+    );
+    if (state.aiAllyMode !== 'off' && state.basePlaced && prodBld && units.length < 36) {
+        const uToSpawn = prodBld.type === 'factory' ? 'tank' : (prodBld.type === 'solaris_gate' ? 'zealot' : 'firebat');
+        spawnAlliedUnit(uToSpawn, prodBld.pos);
+    }
+    if (window.SFX) window.SFX.playClick();
+    syncAiAllyButtons();
+};
+
+syncHudVisibilityClasses();
+syncAiAllyButtons();
+
+// ============================================================================
+// TOP-RIGHT 3D AXIS BALL CAMERA EYE PERSPECTIVE CONTROLLER
+// Interactive 3D Orientation Sphere Gizmo: Drag to orbit/tilt camera eye
+// perspective or click any 3D axis node (TOP, N, S, E, W, TAC) to orient view.
+// Strictly keeps camera upright (polar angle clamped to [0.14, 0.94] rad).
+// ============================================================================
+const AXIS_BALL_CONTROLLER = {
+    canvas: null,
+    ctx: null,
+    readoutEl: null,
+    isDragging: false,
+    dragMoved: false,
+    lastPointerX: 0,
+    lastPointerY: 0,
+    hoveredNodeId: null,
+    activePreset: 'tac',
+    transition: null,
+    projectedNodes: [],
+
+    init() {
+        const canvas = document.getElementById('axis-ball-canvas');
+        if (!canvas) return;
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.readoutEl = document.getElementById('axis-ball-readout');
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(78 * dpr);
+        canvas.height = Math.round(78 * dpr);
+
+        const getLocalCoords = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width,
+                y: ((e.clientY - rect.top) / Math.max(1, rect.height)) * canvas.height
+            };
+        };
+
+        canvas.addEventListener('pointerdown', (e) => {
+            e.stopPropagation();
+            this.isDragging = true;
+            this.dragMoved = false;
+            this.transition = null;
+            this.lastPointerX = e.clientX;
+            this.lastPointerY = e.clientY;
+            try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+
+        canvas.addEventListener('pointermove', (e) => {
+            e.stopPropagation();
+            const pt = getLocalCoords(e);
+            if (!this.isDragging) {
+                let bestId = null;
+                let bestDist = 11 * (canvas.width / 78);
+                for (let i = 0; i < this.projectedNodes.length; i++) {
+                    const n = this.projectedNodes[i];
+                    const d = Math.hypot(pt.x - n.sx, pt.y - n.sy);
+                    if (d <= bestDist) {
+                        bestDist = d;
+                        bestId = n.id;
+                    }
+                }
+                this.hoveredNodeId = bestId;
+                return;
+            }
+
+            const dx = e.clientX - this.lastPointerX;
+            const dy = e.clientY - this.lastPointerY;
+            if (Math.hypot(dx, dy) > 2.2) {
+                this.dragMoved = true;
+            }
+            this.lastPointerX = e.clientX;
+            this.lastPointerY = e.clientY;
+
+            if (Math.abs(dx) > 0.1 || Math.abs(dy) > 0.1) {
+                this.orbitCameraByDelta(-dx * 0.014, -dy * 0.011);
+                this.setActivePresetBadge(null);
+            }
+        });
+
+        const finishPointer = (e) => {
+            if (!this.isDragging) return;
+            this.isDragging = false;
+            try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+
+            if (!this.dragMoved) {
+                const pt = getLocalCoords(e);
+                let clickedNode = null;
+                let bestDist = 13 * (canvas.width / 78);
+                for (let i = 0; i < this.projectedNodes.length; i++) {
+                    const n = this.projectedNodes[i];
+                    const d = Math.hypot(pt.x - n.sx, pt.y - n.sy);
+                    if (d <= bestDist) {
+                        bestDist = d;
+                        clickedNode = n;
+                    }
+                }
+                if (clickedNode) {
+                    this.snapToPerspective(clickedNode.id);
+                }
+            }
+        };
+
+        canvas.addEventListener('pointerup', finishPointer);
+        canvas.addEventListener('pointercancel', finishPointer);
+        canvas.addEventListener('pointerleave', () => {
+            if (!this.isDragging) this.hoveredNodeId = null;
+        });
+    },
+
+    getCameraSpherical() {
+        const ox = camera.position.x - controls.target.x;
+        const oy = camera.position.y - controls.target.y;
+        const oz = camera.position.z - controls.target.z;
+        const radius = Math.max(18.0, Math.min(140.0, Math.hypot(ox, oy, oz) || 48.0));
+        const polar = THREE.MathUtils.clamp(Math.acos(THREE.MathUtils.clamp(oy / radius, -1, 1)), 0.14, 0.94);
+        const azimuth = Math.atan2(ox, oz);
+        return { radius, polar, azimuth };
+    },
+
+    applyCameraSpherical(radius, polar, azimuth) {
+        const safePolar = THREE.MathUtils.clamp(polar, 0.14, 0.94);
+        const safeRadius = THREE.MathUtils.clamp(radius, 18.0, 140.0);
+        const sinP = Math.sin(safePolar);
+        const cosP = Math.cos(safePolar);
+
+        camera.position.x = controls.target.x + sinP * Math.sin(azimuth) * safeRadius;
+        camera.position.z = controls.target.z + sinP * Math.cos(azimuth) * safeRadius;
+        camera.position.y = controls.target.y + cosP * safeRadius;
+        camera.lookAt(controls.target);
+    },
+
+    orbitCameraByDelta(dAzimuth, dPolar) {
+        const sph = this.getCameraSpherical();
+        this.applyCameraSpherical(
+            sph.radius,
+            THREE.MathUtils.clamp(sph.polar + dPolar, 0.14, 0.94),
+            sph.azimuth + dAzimuth
+        );
+    },
+
+    setActivePresetBadge(viewId) {
+        this.activePreset = viewId;
+        const btns = document.querySelectorAll('#sc2-axis-ball-widget .axis-preset-btn');
+        btns.forEach(btn => {
+            btn.classList.toggle('active', btn.getAttribute('data-view') === viewId);
+        });
+    },
+
+    snapToPerspective(viewId) {
+        if (window.SFX) window.SFX.playClick();
+        const sph = this.getCameraSpherical();
+        let targetAzimuth = sph.azimuth;
+        let targetPolar = 0.72; // Default ~41° from vertical (49° elevation above ground — upright tactical view)
+        let targetRadius = Math.max(38.0, Math.min(68.0, sph.radius));
+
+        const key = String(viewId || 'tac').toLowerCase();
+        if (key === 'top' || key === '+y') {
+            targetPolar = 0.15; // High-altitude overhead command perspective
+            targetRadius = Math.max(54.0, targetRadius);
+            this.setActivePresetBadge('top');
+        } else if (key === 'tac') {
+            targetAzimuth = 0.12;
+            targetPolar = 0.74;
+            targetRadius = 50.0;
+            this.setActivePresetBadge('tac');
+        } else if (key === 's' || key === '+z') {
+            targetAzimuth = 0.0;
+            targetPolar = 0.72;
+            this.setActivePresetBadge('s');
+        } else if (key === 'n' || key === '-z') {
+            targetAzimuth = Math.PI;
+            targetPolar = 0.72;
+            this.setActivePresetBadge('n');
+        } else if (key === 'e' || key === '+x') {
+            targetAzimuth = Math.PI * 0.5;
+            targetPolar = 0.72;
+            this.setActivePresetBadge('e');
+        } else if (key === 'w' || key === '-x') {
+            targetAzimuth = -Math.PI * 0.5;
+            targetPolar = 0.72;
+            this.setActivePresetBadge('w');
+        }
+
+        this.transition = {
+            startAzimuth: sph.azimuth,
+            targetAzimuth,
+            startPolar: sph.polar,
+            targetPolar,
+            startRadius: sph.radius,
+            targetRadius,
+            elapsed: 0,
+            duration: 0.32
+        };
+    },
+
+    update(dt) {
+        if (!this.canvas) this.init();
+        if (!this.canvas || !this.ctx) return;
+
+        if (this.transition) {
+            this.transition.elapsed += dt;
+            const t = Math.min(1.0, this.transition.elapsed / this.transition.duration);
+            const ease = 1.0 - Math.pow(1.0 - t, 3);
+            const dAz = shortestAngleDiff(this.transition.startAzimuth, this.transition.targetAzimuth);
+            const curAz = this.transition.startAzimuth + dAz * ease;
+            const curPol = THREE.MathUtils.lerp(this.transition.startPolar, this.transition.targetPolar, ease);
+            const curRad = THREE.MathUtils.lerp(this.transition.startRadius, this.transition.targetRadius, ease);
+            this.applyCameraSpherical(curRad, curPol, curAz);
+            if (t >= 1.0) {
+                this.transition = null;
+            }
+        }
+
+        this.renderGizmo();
+    },
+
+    renderGizmo() {
+        const ctx = this.ctx;
+        const w = this.canvas.width;
+        const h = this.canvas.height;
+        const cx = w * 0.5;
+        const cy = h * 0.5;
+        const ballR = w * 0.36;
+
+        ctx.clearRect(0, 0, w, h);
+
+        const sph = this.getCameraSpherical();
+        // Elevation angle above horizontal ground in degrees (90° = straight overhead, 36°..55° = tactical isometric)
+        const elevDeg = Math.round(90 - THREE.MathUtils.radToDeg(sph.polar));
+        if (this.readoutEl) {
+            this.readoutEl.innerText = `${elevDeg}° UP`;
+        }
+
+        // Camera view basis vectors (Right, Up, Forward) for projecting 3D gizmo axes
+        const sinAz = Math.sin(sph.azimuth);
+        const cosAz = Math.cos(sph.azimuth);
+        const sinPol = Math.sin(sph.polar);
+        const cosPol = Math.cos(sph.polar);
+
+        // Right vector in world XZ
+        const rx = cosAz, ry = 0, rz = -sinAz;
+        // Up vector in camera screen plane
+        const ux = -cosPol * sinAz, uy = sinPol, uz = -cosPol * cosAz;
+        // View direction from target to camera eye
+        const vx = sinPol * sinAz, vy = cosPol, vz = sinPol * cosAz;
+
+        const project3D = (wx, wy, wz) => {
+            const px = wx * rx + wy * ry + wz * rz;
+            const py = wx * ux + wy * uy + wz * uz;
+            const pz = wx * vx + wy * vy + wz * vz; // +pz = facing toward camera
+            return {
+                sx: cx + px * ballR,
+                sy: cy - py * ballR,
+                depth: pz
+            };
+        };
+
+        // 1. Outer 3D Sphere Rim & Equatorial Horizon Ring
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0, 229, 255, 0.25)';
+        ctx.lineWidth = Math.max(1, w * 0.015);
+        ctx.beginPath();
+        ctx.arc(cx, cy, ballR, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Draw projected XZ horizon ring on the 3D ball
+        ctx.strokeStyle = 'rgba(147, 184, 222, 0.24)';
+        ctx.beginPath();
+        for (let i = 0; i <= 28; i++) {
+            const ang = (i / 28) * Math.PI * 2;
+            const p = project3D(Math.cos(ang), 0, Math.sin(ang));
+            if (i === 0) ctx.moveTo(p.sx, p.sy);
+            else ctx.lineTo(p.sx, p.sy);
+        }
+        ctx.stroke();
+        ctx.restore();
+
+        // 2. Define 3D Axis Nodes (+X East, -X West, +Y Top, +Z South, -Z North)
+        const rawNodes = [
+            { id: 'e',   label: 'E',   wx:  1, wy:  0, wz:  0, color: '#ff4d6d', stem: true },
+            { id: 'w',   label: 'W',   wx: -1, wy:  0, wz:  0, color: '#9f1239', stem: false },
+            { id: 'top', label: 'Y',   wx:  0, wy:  1, wz:  0, color: '#00ff66', stem: true },
+            { id: 's',   label: 'S',   wx:  0, wy:  0, wz:  1, color: '#00e5ff', stem: true },
+            { id: 'n',   label: 'N',   wx:  0, wy:  0, wz: -1, color: '#0369a1', stem: false }
+        ];
+
+        const nodes = rawNodes.map(n => {
+            const p = project3D(n.wx, n.wy, n.wz);
+            return { ...n, sx: p.sx, sy: p.sy, depth: p.depth };
+        });
+
+        // Sort back-to-front by depth so front axis nodes cleanly occlude rear ones
+        nodes.sort((a, b) => a.depth - b.depth);
+        this.projectedNodes = nodes;
+
+        const scaleFactor = w / 78;
+        nodes.forEach(n => {
+            const isFront = n.depth >= -0.05;
+            const isHovered = this.hoveredNodeId === n.id;
+
+            // Axis stem from center to terminal cap
+            ctx.save();
+            ctx.globalAlpha = isFront ? 0.95 : 0.42;
+            ctx.strokeStyle = n.color;
+            ctx.lineWidth = (n.stem ? 2.2 : 1.3) * scaleFactor;
+            ctx.beginPath();
+            ctx.moveTo(cx, cy);
+            ctx.lineTo(n.sx, n.sy);
+            ctx.stroke();
+
+            // 3D Axis Cap Sphere
+            const nodeR = (isHovered ? 8.2 : (n.stem ? 6.8 : 5.4)) * scaleFactor;
+            ctx.beginPath();
+            ctx.arc(n.sx, n.sy, nodeR, 0, Math.PI * 2);
+            ctx.fillStyle = n.color;
+            ctx.fill();
+            ctx.lineWidth = (isHovered ? 1.8 : 1.0) * scaleFactor;
+            ctx.strokeStyle = isHovered ? '#ffffff' : '#040810';
+            ctx.stroke();
+
+            // Axis Label inside Cap
+            ctx.fillStyle = (n.id === 'top' || n.id === 's') ? '#030810' : '#ffffff';
+            ctx.font = `900 ${Math.round(6.8 * scaleFactor)}px "JetBrains Mono", monospace`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(n.label, n.sx, n.sy + 0.5 * scaleFactor);
+            ctx.restore();
+        });
+
+        // Center Eye Pivot Dot
+        ctx.save();
+        ctx.fillStyle = '#e2f1ff';
+        ctx.beginPath();
+        ctx.arc(cx, cy, 2.4 * scaleFactor, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+};
+
+window.AXIS_BALL_CONTROLLER = AXIS_BALL_CONTROLLER;
+window.setCameraAxisPerspective = function(viewId) {
+    if (!AXIS_BALL_CONTROLLER.canvas) AXIS_BALL_CONTROLLER.init();
+    AXIS_BALL_CONTROLLER.snapToPerspective(viewId);
+};
+
+// ============================================================================
+// LOCATION-AWARE SPATIAL AMBIENT AUDIO ENGINE
+// Synthesizes subtle procedural wildlife calls & environmental acoustics
+// modulated by camera elevation, river proximity, and active weather state.
+// ============================================================================
+window.AMBIENT_AUDIO_ENGINE = {
+    birdTimer: 5.5,
+    update(dt, cam, target) {
+        if (!window.SFX || window.SFX.muted || !window.SFX.ctx || window.titleScreenActive) return;
+        this.birdTimer -= dt;
+        if (this.birdTimer <= 0) {
+            this.birdTimer = 7.0 + Math.random() * 9.0;
+            const weatherKey = (window.WEATHER_SYSTEM && window.WEATHER_SYSTEM.currentKey) || 'clear';
+            // Only play canyon hawk / songbird call in clear weather when camera is near ground/forests
+            if (weatherKey === 'clear' && cam.position.y < 52 && window.SFX.ctx.state === 'running') {
+                try {
+                    const ctx = window.SFX.ctx;
+                    const now = ctx.currentTime;
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+                    osc.type = 'sine';
+                    const baseFreq = 1650 + Math.random() * 450;
+                    osc.frequency.setValueAtTime(baseFreq, now);
+                    osc.frequency.exponentialRampToValueAtTime(baseFreq * 1.22, now + 0.09);
+                    osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.88, now + 0.24);
+                    gain.gain.setValueAtTime(0.0001, now);
+                    gain.gain.linearRampToValueAtTime(0.018, now + 0.04);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.27);
+                } catch (_) {}
+            }
+        }
+    }
+};
+
+window.titleScreenActive = true;
+animate(performance.now());
+
