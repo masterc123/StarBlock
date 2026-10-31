@@ -1986,50 +1986,100 @@ function createEngineeredBuilding(type, includeEmblem = true) {
         root.userData.innerSolarRing = innerSolarRing;
     }
     else if (type === 'solaris_spire') {
-        // 3RD FACTION DEFENSE: SOLARIS KHAYDARIN PHOTON PRISM CANNON SPIRE
-        // Hexagonal Stepped Obsidian-Gold Pedestal + 6 Sweeping Ivory/Gold Focusing Blades + Levitating Multi-Ring Prism Emitter
-        const plinth = new THREE.Mesh(createSculptedLatheBarrelGeo(1.18, 1.46, 0.34, 8), MAT.solarisObsidian);
+        // PROTOSS KHAYDARIN AEGIS SPIRE (Dedicated Air + Ground Psionic Defensive Turret)
+        // Stepped Obsidian-Gold Pedestal + 6 Sweeping Ivory/Gold Focusing Blades + 4 Orbiting Levitating Defensive Pylons +
+        // Articulated Multi-Ring Psionic Targeting Turret Head + Charging Khaydarin Crystal Core & Muzzle Emitter
+        const plinth = new THREE.Mesh(createSculptedLatheBarrelGeo(1.22, 1.50, 0.34, 8), MAT.solarisObsidian);
         plinth.position.y = 0.17;
         plinth.castShadow = true;
-        const goldCollar = new THREE.Mesh(createSculptedLatheBarrelGeo(0.92, 1.18, 0.38, 8), MAT.solarisGold);
+        const goldCollar = new THREE.Mesh(createSculptedLatheBarrelGeo(0.96, 1.22, 0.38, 8), MAT.solarisGold);
         goldCollar.position.y = 0.46;
-        const ivoryStem = new THREE.Mesh(createSculptedLatheBarrelGeo(0.56, 0.84, 0.58, 8), MAT.solarisIvory);
+        const ivoryStem = new THREE.Mesh(createSculptedLatheBarrelGeo(0.58, 0.86, 0.58, 8), MAT.solarisIvory);
         ivoryStem.position.y = 0.88;
-        const crystalCoreColumn = new THREE.Mesh(createSculptedLatheBarrelGeo(0.32, 0.38, 1.15, 8), MAT.solarisCrystal);
-        crystalCoreColumn.position.y = 1.25;
+        const crystalCoreColumn = new THREE.Mesh(createSculptedLatheBarrelGeo(0.32, 0.38, 1.18, 8), MAT.solarisCrystal);
+        crystalCoreColumn.position.y = 1.26;
         mainStructure.add(plinth, goldCollar, ivoryStem, crystalCoreColumn);
         damageableParts.push(goldCollar, ivoryStem);
 
         // 6 Curved Ivory & Gold Focusing Pylon Claws cradling the levitating Prism Core
         for (let i = 0; i < 6; i++) {
             const a = (i / 6) * Math.PI * 2;
-            const fin = new THREE.Mesh(createCurvedScytheBladeGeo(1.78, 0.13, 0.30), i % 2 === 0 ? MAT.solarisGold : MAT.solarisIvory);
-            fin.position.set(Math.cos(a) * 0.84, 0.56, Math.sin(a) * 0.84);
+            const fin = new THREE.Mesh(createCurvedScytheBladeGeo(1.82, 0.14, 0.32), i % 2 === 0 ? MAT.solarisGold : MAT.solarisIvory);
+            fin.position.set(Math.cos(a) * 0.86, 0.58, Math.sin(a) * 0.86);
             fin.rotation.y = -a + Math.PI / 2;
             fin.rotation.x = -0.24;
             fin.castShadow = true;
-            const runeNode = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.11, 0), MAT.solarisPrismGlow);
-            runeNode.position.set(Math.cos(a) * 0.68, 1.48, Math.sin(a) * 0.68);
+            const runeNode = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.12, 0), MAT.solarisPrismGlow);
+            runeNode.position.set(Math.cos(a) * 0.70, 1.52, Math.sin(a) * 0.70);
             mainStructure.add(fin, runeNode);
             damageableParts.push(fin);
         }
 
-        // Levitating Prismatic Emitter Head with Dual Focusing Halo Rings
+        // 4 Orbiting Levitating Defensive Pylons around the upper spire
+        const floatingPylonRing = new THREE.Group();
+        floatingPylonRing.position.set(0, 1.72, 0);
+        for (let p = 0; p < 4; p++) {
+            const pa = (p / 4) * Math.PI * 2 + Math.PI / 4;
+            const pylonPod = new THREE.Group();
+            pylonPod.position.set(Math.cos(pa) * 1.04, 0, Math.sin(pa) * 1.04);
+            pylonPod.rotation.y = -pa;
+            const pBlade = new THREE.Mesh(createProtossArchBladeGeo(0.68, 0.14, 0.045, 0.22), p % 2 === 0 ? MAT.solarisGold : MAT.solarisIvory);
+            const pGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.13, 0), MAT.solarisCrystal);
+            pGem.scale.set(0.75, 1.55, 0.75);
+            pGem.position.set(0, 0.04, -0.08);
+            pylonPod.add(pBlade, pGem);
+            floatingPylonRing.add(pylonPod);
+        }
+        mainStructure.add(floatingPylonRing);
+
+        // Articulated Levitating Prismatic Emitter Head with 3 Focusing Rings & Forward Psionic Focusing Barrel
         const solarisCore = new THREE.Group();
-        solarisCore.position.set(0, 2.04, 0);
-        const prismCrystal = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.46, 1), MAT.solarisCrystal);
-        prismCrystal.scale.set(0.88, 1.38, 0.88);
-        const innerEmitterOrb = new THREE.Mesh(createSculptedArmorDomeGeo(0.26, 14, 14), MAT.solarisPrismGlow);
-        const haloRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.68, 0.05, 10, 26), MAT.solarisGold);
+        solarisCore.position.set(0, 2.12, 0);
+        const prismCrystal = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.48, 1), MAT.solarisCrystal);
+        prismCrystal.scale.set(0.88, 1.42, 0.88);
+        const innerEmitterOrb = new THREE.Mesh(createSculptedArmorDomeGeo(0.28, 14, 14), MAT.solarisPrismGlow);
+        const haloRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.72, 0.052, 10, 26), MAT.solarisGold);
         haloRing.rotation.x = Math.PI / 2;
-        const verticalHalo = new THREE.Mesh(createSculptedTorusCollarGeo(0.52, 0.038, 8, 22), MAT.solarisPrismGlow);
+        const verticalHalo = new THREE.Mesh(createSculptedTorusCollarGeo(0.56, 0.040, 8, 22), MAT.solarisPrismGlow);
         verticalHalo.rotation.y = Math.PI / 4;
-        solarisCore.add(prismCrystal, innerEmitterOrb, haloRing, verticalHalo);
+
+        // Forward Psionic Focusing Barrel & Muzzle Node (Rotates toward target when firing!)
+        const emitterHead = new THREE.Group();
+        const apertureRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.32, 0.036, 8, 20), MAT.solarisGold);
+        apertureRing.position.set(0, 0, 0.46);
+        const focusProngL = new THREE.Mesh(createProtossArchBladeGeo(0.54, 0.10, 0.035, 0.16), MAT.solarisIvory);
+        focusProngL.position.set(-0.24, 0, 0.36);
+        focusProngL.rotation.x = Math.PI / 2;
+        const focusProngR = focusProngL.clone();
+        focusProngR.position.x = 0.24;
+        const chargeOrb = new THREE.Mesh(createSculptedArmorDomeGeo(0.16, 12, 12), MAT.solarisPrismGlow);
+        chargeOrb.position.set(0, 0, 0.56);
+        const muzzleNode = new THREE.Object3D();
+        muzzleNode.position.set(0, 0, 0.68);
+        emitterHead.add(apertureRing, focusProngL, focusProngR, chargeOrb, muzzleNode);
+
+        // Upgrade Tier Crown Rings (revealed on MK-2 / MK-3 upgrades)
+        const upgradeTierGroup = new THREE.Group();
+        upgradeTierGroup.visible = false;
+        const mk2Crown = new THREE.Mesh(createSculptedTorusCollarGeo(0.92, 0.048, 8, 28), MAT.solarisGold);
+        mk2Crown.rotation.x = Math.PI / 2;
+        mk2Crown.position.y = -0.32;
+        const mk3Zenith = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.28, 0), MAT.solarisPrismGlow);
+        mk3Zenith.position.y = 0.78;
+        mk3Zenith.visible = false;
+        upgradeTierGroup.add(mk2Crown, mk3Zenith);
+        solarisCore.add(prismCrystal, innerEmitterOrb, haloRing, verticalHalo, emitterHead, upgradeTierGroup);
         mainStructure.add(solarisCore);
 
         root.userData.solarisCore = solarisCore;
         root.userData.outerSolarRing = haloRing;
         root.userData.innerSolarRing = verticalHalo;
+        root.userData.floatingPylonRing = floatingPylonRing;
+        root.userData.emitterHead = emitterHead;
+        root.userData.chargeOrb = chargeOrb;
+        root.userData.muzzleNode = muzzleNode;
+        root.userData.upgradeTierGroup = upgradeTierGroup;
+        root.userData.mk3Zenith = mk3Zenith;
     }
     else if (type === 'solaris_pylon') {
         // SOLARIS PROTOSS KHAYDARIN POWER PYLON (Psionic Energy Matrix Node — Powers Nearby Protoss Structures)
@@ -2995,10 +3045,32 @@ function updateBuildingMechanicsAndDamage(b, dt) {
         }
     }
     else if (ud.solarisCore) {
-        ud.solarisCore.rotation.y += dt * 1.65;
-        ud.solarisCore.position.y = (b.type === 'solaris_nexus' ? 2.48 : (b.type === 'solaris_spire' || b.type === 'solaris_cyber_lab' ? 1.92 : 2.05)) + Math.sin(t * 2.2) * 0.11;
-        if (ud.outerSolarRing) ud.outerSolarRing.rotation.z += dt * 2.4;
-        if (ud.innerSolarRing) ud.innerSolarRing.rotation.x -= dt * 3.1;
+        if (b.type === 'solaris_spire') {
+            ud.solarisCore.position.y = 2.12 + Math.sin(t * 2.4) * 0.09;
+            const chargeBoost = (b.attackAnim || 0) > 0 ? 3.2 : 1.0;
+            if (ud.outerSolarRing) ud.outerSolarRing.rotation.z += dt * 2.6 * chargeBoost;
+            if (ud.innerSolarRing) ud.innerSolarRing.rotation.x -= dt * 3.4 * chargeBoost;
+            if (ud.floatingPylonRing) {
+                ud.floatingPylonRing.rotation.y -= dt * 1.15 * chargeBoost;
+                ud.floatingPylonRing.position.y = 1.72 + Math.cos(t * 2.0) * 0.06;
+            }
+            if (ud.chargeOrb) {
+                const orbScale = 0.88 + Math.sin(t * 5.0) * 0.14 + (b.attackAnim || 0) * 0.65;
+                ud.chargeOrb.scale.setScalar(orbScale);
+            }
+            if (b.attackAnim > 0) b.attackAnim = Math.max(0, b.attackAnim - dt * 2.8);
+            if (ud.upgradeTierGroup) {
+                const lvl = b.upgradeLevel || 1;
+                ud.upgradeTierGroup.visible = lvl >= 2;
+                if (ud.mk3Zenith) ud.mk3Zenith.visible = lvl >= 3;
+                ud.upgradeTierGroup.rotation.y += dt * 1.8;
+            }
+        } else {
+            ud.solarisCore.rotation.y += dt * 1.65;
+            ud.solarisCore.position.y = (b.type === 'solaris_nexus' ? 2.48 : (b.type === 'solaris_cyber_lab' ? 1.92 : 2.05)) + Math.sin(t * 2.2) * 0.11;
+            if (ud.outerSolarRing) ud.outerSolarRing.rotation.z += dt * 2.4;
+            if (ud.innerSolarRing) ud.innerSolarRing.rotation.x -= dt * 3.1;
+        }
     }
 
     const ratio = b.hp / b.maxHp;
@@ -7141,8 +7213,237 @@ function createAnimatedUnitModel(role) {
         return group;
     }
 
-    // --- 3RD FACTION: THE SOLARIS CHRONO-SYNOD UNITS (ZEALOT / STALKER / ARCHON) — ENHANCED ALIEN ARCHITECTURE ---
-    if (role === 'zealot' || role === 'stalker' || role === 'archon') {
+    // --- 3RD FACTION: THE SOLARIS CHRONO-SYNOD UNITS (ZEALOT / STALKER / ARCHON / PHOENIX / VOID_RAY / CARRIER / INTERCEPTOR) ---
+    if (role === 'zealot' || role === 'stalker' || role === 'archon' || role === 'phoenix' || role === 'void_ray' || role === 'carrier' || role === 'interceptor') {
+        if (role === 'interceptor') {
+            // AUTONOMOUS CARRIER INTERCEPTOR: Sleek Golden-Cyan Micro-Strike Craft launched by Protoss Carriers
+            const bodyGroup = new THREE.Group();
+            group.add(bodyGroup);
+            const fuselage = new THREE.Mesh(createCompoundArmorChestGeo(0.26, 0.12, 0.46, 0.24, 0.22), MAT.solarisGold);
+            const corePod = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.11, 0), MAT.solarisPrismGlow);
+            corePod.scale.set(0.85, 0.85, 1.45);
+            corePod.position.set(0, 0.03, 0.04);
+            [-1, 1].forEach(side => {
+                const wing = new THREE.Mesh(createProtossArchBladeGeo(0.42, 0.09, 0.025, 0.18), MAT.solarisIvory);
+                wing.position.set(side * 0.22, 0, -0.02);
+                wing.rotation.set(0.15, side * 0.35, -side * 0.25);
+                const gunTip = new THREE.Mesh(createSculptedLatheBarrelGeo(0.018, 0.024, 0.24, 6), MAT.solarisCrystal);
+                gunTip.rotation.x = Math.PI / 2;
+                gunTip.position.set(side * 0.12, -0.02, 0.24);
+                bodyGroup.add(wing, gunTip);
+            });
+            bodyGroup.add(fuselage, corePod);
+            group.userData = { isSolaris: true, isAir: true, role: 'interceptor', bodyGroup, phase: Math.random() * 10, attackAnim: 0 };
+            return group;
+        }
+
+        if (role === 'phoenix') {
+            // PROTOSS PHOENIX INTERCEPTOR: High-Speed Swept-Wing Golden/Ivory Air Superiority Fighter with Twin Ion Cannons
+            const bodyGroup = new THREE.Group();
+            group.add(bodyGroup);
+
+            const hull = new THREE.Mesh(createCompoundArmorChestGeo(0.68, 0.26, 1.38, 0.26, 0.28), MAT.solarisGold);
+            hull.castShadow = true;
+            const ivorySpine = new THREE.Mesh(createCompoundArmorChestGeo(0.48, 0.18, 1.18, 0.22, 0.24), MAT.solarisIvory);
+            ivorySpine.position.set(0, 0.12, -0.04);
+            const canopy = new THREE.Mesh(createSculptedArmorDomeGeo(0.22, 12, 10), MAT.solarisCrystal);
+            canopy.scale.set(0.82, 0.62, 1.65);
+            canopy.position.set(0, 0.16, 0.18);
+            const gravityCore = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.22, 1), MAT.solarisPrismGlow);
+            gravityCore.position.set(0, 0.04, -0.10);
+            const coreHalo = new THREE.Mesh(createSculptedTorusCollarGeo(0.28, 0.028, 8, 20), MAT.solarisGold);
+            coreHalo.rotation.x = Math.PI / 2;
+            coreHalo.position.set(0, 0.04, -0.10);
+            bodyGroup.add(hull, ivorySpine, canopy, gravityCore, coreHalo);
+
+            const ionCannons = [];
+            const thrusterNozzles = [];
+            [-1, 1].forEach(side => {
+                // Swept-Forward Golden Crescent Primary Wings & Translucent Phase-Vanes
+                const mainWing = new THREE.Mesh(createProtossArchBladeGeo(1.42, 0.26, 0.055, 0.34), MAT.solarisGold);
+                mainWing.position.set(side * 0.78, 0.02, 0.06);
+                mainWing.rotation.set(0.12, -side * 0.48, -side * 0.18);
+                mainWing.castShadow = true;
+
+                const innerFeather = new THREE.Mesh(createProtossArchBladeGeo(1.08, 0.18, 0.04, 0.26), MAT.solarisIvory);
+                innerFeather.position.set(side * 0.64, 0.06, -0.22);
+                innerFeather.rotation.set(0.08, -side * 0.28, -side * 0.12);
+
+                const crystalVane = new THREE.Mesh(createProtossArchBladeGeo(0.95, 0.12, 0.03, 0.22), MAT.solarisCrystal);
+                crystalVane.position.set(side * 0.96, 0.02, 0.20);
+                crystalVane.rotation.set(0.12, -side * 0.52, -side * 0.18);
+
+                // Wing-Root Twin Ion Blasters
+                const cannonGroup = new THREE.Group();
+                cannonGroup.position.set(side * 0.36, -0.05, 0.52);
+                const shroud = new THREE.Mesh(createCompoundArmorChestGeo(0.14, 0.14, 0.48, 0.18, 0.18), MAT.solarisObsidian);
+                const barrel = new THREE.Mesh(createSculptedLatheBarrelGeo(0.042, 0.058, 0.68, 10), MAT.solarisGold);
+                barrel.rotation.x = Math.PI / 2;
+                barrel.position.z = 0.22;
+                const muzzleGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.065, 0), MAT.solarisPrismGlow);
+                muzzleGem.position.z = 0.58;
+                cannonGroup.add(shroud, barrel, muzzleGem);
+                ionCannons.push(cannonGroup);
+
+                // Rear Tail Fin & Ion Thruster Nozzle
+                const tailFin = new THREE.Mesh(createProtossArchBladeGeo(0.68, 0.14, 0.04, 0.22), MAT.solarisGold);
+                tailFin.position.set(side * 0.26, 0.18, -0.68);
+                tailFin.rotation.set(-0.42, side * 0.22, -side * 0.35);
+
+                const nozzle = new THREE.Object3D();
+                nozzle.position.set(side * 0.24, 0.02, -0.76);
+                bodyGroup.add(nozzle);
+                thrusterNozzles.push({ node: nozzle, dir: new THREE.Vector3(0, 0, -1), color: 'cyan', scale: 0.78 });
+
+                bodyGroup.add(mainWing, innerFeather, crystalVane, cannonGroup, tailFin);
+            });
+
+            group.userData = {
+                isSolaris: true, isAir: true, role: 'phoenix',
+                bodyGroup, gravityCore, coreHalo, ionCannons, thrusterNozzles,
+                phase: Math.random() * 10, attackAnim: 0
+            };
+            return group;
+        }
+
+        if (role === 'void_ray') {
+            // PROTOSS VOID RAY PRISMATIC CRUISER: Heavy Multi-Pronged Flux-Vane Beam Ship with Ramping Prismatic Core
+            const bodyGroup = new THREE.Group();
+            group.add(bodyGroup);
+
+            // Central Obsidian & Golden Spine Chassis
+            const spineHull = new THREE.Mesh(createCompoundArmorChestGeo(0.74, 0.42, 1.92, 0.24, 0.26), MAT.solarisObsidian);
+            spineHull.castShadow = true;
+            const dorsalMantle = new THREE.Mesh(createCompoundArmorChestGeo(0.84, 0.22, 1.56, 0.26, 0.22), MAT.solarisGold);
+            dorsalMantle.position.set(0, 0.20, -0.12);
+            const aftCrest = new THREE.Mesh(createSculptedOgiveSpireGeo(0.32, 0.86, 6), MAT.solarisIvory);
+            aftCrest.rotation.x = -Math.PI / 2;
+            aftCrest.position.set(0, 0.14, -1.05);
+            bodyGroup.add(spineHull, dorsalMantle, aftCrest);
+
+            // Central Suspended Khaydarin Prismatic Core & 3 Counter-Rotating Focusing Lens Rings
+            const prismCore = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.34, 1), MAT.solarisCrystal);
+            prismCore.scale.set(0.88, 0.88, 1.65);
+            prismCore.position.set(0, 0.02, 0.24);
+            bodyGroup.add(prismCore);
+
+            const focusRings = [];
+            [0.20, 0.56, 0.88].forEach((zPos, rIdx) => {
+                const ring = new THREE.Mesh(
+                    createSculptedTorusCollarGeo(0.44 - rIdx * 0.06, 0.036, 8, 22),
+                    rIdx % 2 === 0 ? MAT.solarisGold : MAT.solarisPrismGlow
+                );
+                ring.position.set(0, 0.02, zPos);
+                bodyGroup.add(ring);
+                focusRings.push(ring);
+            });
+
+            // Forward Prismatic Emitter Lens & Muzzle Node
+            const emitterLens = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.18, 1), MAT.solarisPrismGlow);
+            emitterLens.position.set(0, 0.02, 1.12);
+            const beamMuzzle = new THREE.Object3D();
+            beamMuzzle.position.set(0, 0.02, 1.24);
+            bodyGroup.add(emitterLens, beamMuzzle);
+
+            // 4 Articulated Radial Flux-Vane Prongs (Flare outward as Prismatic Alignment charges Stage 1 -> 2 -> 3!)
+            const fluxProngs = [];
+            for (let i = 0; i < 4; i++) {
+                const ang = (i / 4) * Math.PI * 2 + Math.PI / 4;
+                const prongPivot = new THREE.Group();
+                prongPivot.position.set(Math.cos(ang) * 0.36, Math.sin(ang) * 0.32, 0.18);
+                prongPivot.rotation.z = ang;
+
+                const armHull = new THREE.Mesh(createProtossArchBladeGeo(1.48, 0.20, 0.055, 0.28), i % 2 === 0 ? MAT.solarisGold : MAT.solarisIvory);
+                armHull.rotation.x = Math.PI / 2;
+                armHull.position.set(0.18, 0, 0.42);
+                armHull.castShadow = true;
+
+                const fluxCrystal = new THREE.Mesh(createExtrudedArmorHullGeo(0.06, 0.08, 1.12, 0.01, 0.02), MAT.solarisCrystal);
+                fluxCrystal.position.set(0.10, 0, 0.46);
+                prongPivot.add(armHull, fluxCrystal);
+                bodyGroup.add(prongPivot);
+                fluxProngs.push({ pivot: prongPivot, baseAng: ang, idx: i });
+            }
+
+            const thrusterNozzles = [];
+            [-0.28, 0.28].forEach(tx => {
+                const nozzle = new THREE.Object3D();
+                nozzle.position.set(tx, 0.04, -1.16);
+                bodyGroup.add(nozzle);
+                thrusterNozzles.push({ node: nozzle, dir: new THREE.Vector3(0, 0, -1), color: 'cyan', scale: 0.92 });
+            });
+
+            group.userData = {
+                isSolaris: true, isAir: true, role: 'void_ray',
+                bodyGroup, prismCore, focusRings, emitterLens, beamMuzzle, fluxProngs, thrusterNozzles,
+                beamStage: 1, phase: Math.random() * 10, attackAnim: 0
+            };
+            return group;
+        }
+
+        if (role === 'carrier') {
+            // PROTOSS FLEET CARRIER: Colossal Golden-Ivory Capital Dreadnought with Open Interceptor Launch Bays & Astrolabe Core
+            const bodyGroup = new THREE.Group();
+            group.add(bodyGroup);
+
+            // Massive Tiered Golden & Ivory Capital Hull
+            const lowerHull = new THREE.Mesh(createCompoundArmorChestGeo(1.12, 0.48, 2.55, 0.26, 0.28), MAT.solarisObsidian);
+            lowerHull.castShadow = true;
+            const upperCarapace = new THREE.Mesh(createCompoundArmorChestGeo(1.24, 0.34, 2.38, 0.28, 0.30), MAT.solarisGold);
+            upperCarapace.position.set(0, 0.26, 0.04);
+            upperCarapace.castShadow = true;
+            const ivoryCrown = new THREE.Mesh(createCompoundArmorChestGeo(0.86, 0.24, 1.92, 0.24, 0.24), MAT.solarisIvory);
+            ivoryCrown.position.set(0, 0.44, -0.08);
+
+            // Illuminated Ventral & Forward Interceptor Launch Hangar Bay
+            const hangarBayGlow = new THREE.Mesh(createExtrudedArmorHullGeo(0.76, 0.18, 1.85, 0.02, 0.04), MAT.solarisPrismGlow);
+            hangarBayGlow.position.set(0, -0.06, 0.18);
+            bodyGroup.add(lowerHull, upperCarapace, ivoryCrown, hangarBayGlow);
+
+            // 6 Sweeping Lateral Golden Rib Prow Blades framing the Carrier's silhouette
+            [-1, 1].forEach(side => {
+                for (let r = 0; r < 3; r++) {
+                    const zOff = 0.68 - r * 0.64;
+                    const ribArmor = new THREE.Mesh(
+                        createProtossArchBladeGeo(1.36 - r * 0.14, 0.22, 0.06, 0.28),
+                        r % 2 === 0 ? MAT.solarisGold : MAT.solarisIvory
+                    );
+                    ribArmor.position.set(side * (0.68 - r * 0.06), 0.10, zOff);
+                    ribArmor.rotation.set(0.15, side * 0.24, -side * 0.62);
+                    ribArmor.castShadow = true;
+                    const ribGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.11, 0), MAT.solarisCrystal);
+                    ribGem.position.set(side * (0.86 - r * 0.06), 0.16, zOff);
+                    bodyGroup.add(ribArmor, ribGem);
+                }
+            });
+
+            // Dorsal Fleet Command Citadel & Dual Spinning Khaydarin Astrolabe Rings
+            const fleetCore = new THREE.Group();
+            fleetCore.position.set(0, 0.68, -0.22);
+            const coreCrystal = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.32, 1), MAT.solarisCrystal);
+            coreCrystal.scale.set(0.9, 1.45, 0.9);
+            const ringOuter = new THREE.Mesh(createSculptedTorusCollarGeo(0.56, 0.042, 10, 26), MAT.solarisGold);
+            ringOuter.rotation.x = Math.PI / 2.4;
+            const ringInner = new THREE.Mesh(createSculptedTorusCollarGeo(0.42, 0.032, 8, 22), MAT.solarisPrismGlow);
+            ringInner.rotation.y = Math.PI / 3;
+            fleetCore.add(coreCrystal, ringOuter, ringInner);
+            bodyGroup.add(fleetCore);
+
+            const thrusterNozzles = [];
+            [-0.42, -0.16, 0.16, 0.42].forEach(tx => {
+                const nozzle = new THREE.Object3D();
+                nozzle.position.set(tx, 0.08, -1.34);
+                bodyGroup.add(nozzle);
+                thrusterNozzles.push({ node: nozzle, dir: new THREE.Vector3(0, 0, -1), color: 'cyan', scale: 0.95 });
+            });
+
+            group.userData = {
+                isSolaris: true, isAir: true, role: 'carrier',
+                bodyGroup, fleetCore, coreCrystal, ringOuter, ringInner, hangarBayGlow, thrusterNozzles,
+                phase: Math.random() * 10, attackAnim: 0
+            };
+            return group;
+        }
         if (role === 'stalker') {
             // SOLARIS PRISM STALKER: Sculpted Quad-Legged Golden-Obsidian Void Walker with Dorsal Khaydarin Spine, Levitating Oracle Head & Twin Particle Disruptors
             const bodyGroup = new THREE.Group();
@@ -9113,6 +9414,65 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
 
     if (ud.isSolaris) {
         ud.phase += effDt * (isMoving ? 13.0 : 3.4);
+        if (ud.role === 'phoenix' || ud.role === 'void_ray' || ud.role === 'carrier' || ud.role === 'interceptor') {
+            if (lodTier <= 1 && ud.thrusterNozzles && ud.thrusterNozzles.length > 0) {
+                ud.thrusterEmitTimer = (ud.thrusterEmitTimer || 0) - effDt;
+                if (ud.thrusterEmitTimer <= 0) {
+                    ud.thrusterEmitTimer = (isMoving ? 0.022 : 0.042) * thrusterIntervalMult;
+                    for (let ti = 0; ti < ud.thrusterNozzles.length; ti++) {
+                        const tn = ud.thrusterNozzles[ti];
+                        if (tn && tn.node) {
+                            emitThrusterExhaustParticles(tn.node, tn.dir, tn.color || 'cyan', tn.scale || 0.85, isMoving);
+                        }
+                    }
+                }
+            }
+            if (ud.role === 'phoenix') {
+                if (ud.gravityCore) ud.gravityCore.rotation.y += effDt * 3.5;
+                if (ud.coreHalo) ud.coreHalo.rotation.z -= effDt * 4.2;
+                if (ud.ionCannons) {
+                    for (let ci = 0; ci < ud.ionCannons.length; ci++) {
+                        ud.ionCannons[ci].position.z = 0.52 - ud.attackAnim * 0.16;
+                    }
+                }
+                if (ud.bodyGroup) {
+                    ud.bodyGroup.position.y = Math.sin(ud.phase * 0.65) * 0.08;
+                    ud.bodyGroup.rotation.z = Math.cos(ud.phase * 0.45) * 0.06;
+                }
+            } else if (ud.role === 'void_ray') {
+                const stage = Math.max(1, ud.beamStage || 1);
+                const spinMult = stage === 3 ? 3.2 : (stage === 2 ? 2.0 : 1.0);
+                if (ud.prismCore) {
+                    ud.prismCore.rotation.z += effDt * 2.8 * spinMult;
+                    const coreScale = 1.0 + (stage - 1) * 0.16 + Math.sin(ud.phase * 2.2) * 0.06;
+                    ud.prismCore.scale.set(0.88 * coreScale, 0.88 * coreScale, 1.65);
+                }
+                if (ud.focusRings) {
+                    for (let ri = 0; ri < ud.focusRings.length; ri++) {
+                        ud.focusRings[ri].rotation.z += effDt * (ri % 2 === 0 ? 3.4 : -4.2) * spinMult;
+                    }
+                }
+                if (ud.fluxProngs) {
+                    const targetFlare = (stage - 1) * 0.14 + (ud.attackAnim > 0.05 ? 0.08 : 0);
+                    for (let pi = 0; pi < ud.fluxProngs.length; pi++) {
+                        const fp = ud.fluxProngs[pi];
+                        fp.pivot.rotation.y = THREE.MathUtils.lerp(fp.pivot.rotation.y || 0, targetFlare, Math.min(1, effDt * 6));
+                    }
+                }
+                if (ud.bodyGroup) {
+                    ud.bodyGroup.position.y = Math.sin(ud.phase * 0.5) * 0.07;
+                }
+            } else if (ud.role === 'carrier') {
+                if (ud.coreCrystal) ud.coreCrystal.rotation.y += effDt * 2.2;
+                if (ud.ringOuter) ud.ringOuter.rotation.z += effDt * 2.8;
+                if (ud.ringInner) ud.ringInner.rotation.x -= effDt * 3.5;
+                if (ud.bodyGroup) {
+                    ud.bodyGroup.position.y = Math.sin(ud.phase * 0.4) * 0.06;
+                }
+            }
+            if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
+            return;
+        }
         if (ud.role === 'stalker') {
             if (ud.coreCrystal) ud.coreCrystal.rotation.y += effDt * 2.8;
             if (ud.stalkerLegs) {

@@ -1592,11 +1592,29 @@ body {
     }
     #command-grid {
         grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
-        gap: 3px !important;
+        grid-auto-rows: minmax(44px, 1fr) !important;
+        gap: 4px !important;
     }
     .cmd-cell {
-        min-height: 26px !important;
-        padding: 2px 3px !important;
+        min-height: 44px !important;
+        min-width: 44px !important;
+        padding: 3px 4px !important;
+        touch-action: manipulation;
+    }
+    .cmd-collapse-inline-btn,
+    .floating-hud-pill,
+    .sc2-endless-btn {
+        min-height: 36px !important;
+        touch-action: manipulation;
+    }
+    #sc2-console {
+        padding-bottom: max(4px, env(safe-area-inset-bottom)) !important;
+    }
+    #floating-ui-restore-bar {
+        bottom: max(12px, env(safe-area-inset-bottom)) !important;
+    }
+    #game-container.hud-console-hidden #minimap-wing {
+        bottom: max(10px, env(safe-area-inset-bottom)) !important;
     }
 }
 

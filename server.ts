@@ -713,18 +713,23 @@ wss.on('connection', (ws) => {
           const lobby = lobbies.get(meta.lobbyId);
           if (!lobby) return;
           lobby.status = 'In Progress';
+          (lobby as any).seq = 0;
           broadcastRoomMessage(meta.lobbyId, {
             type: 's:game_start',
             lobby,
-            seed: lobby.seed
+            seed: lobby.seed,
+            hostId: lobby.hostId,
+            serverTs: Date.now()
           });
           broadcastLobbies();
           break;
         }
 
         case 'c:game_order': {
-          // Synchronize in-game real-time RTS orders (move, attack, spawn, base) across room members with Anti-Cheat rate limiting
+          // Synchronize in-game real-time RTS orders (move, attack, spawn, base) across room members with Anti-Cheat rate limiting & deduplication
           if (!meta.lobbyId) return;
+          const lobby = lobbies.get(meta.lobbyId);
+          if (!lobby) return;
           const now = Date.now();
           meta.orderTimestamps = meta.orderTimestamps.filter(t => now - t < 2000);
           if (meta.orderTimestamps.length > 28) {
@@ -739,11 +744,66 @@ wss.on('connection', (ws) => {
             return;
           }
           meta.orderTimestamps.push(now);
+
+          const orderObj = msg.order && typeof msg.order === 'object' ? msg.order : {};
+          const orderId = orderObj.orderId || `${meta.playerId}_${now}_${Math.floor(Math.random() * 10000)}`;
+          if (!(lobby as any)._seenOrders) (lobby as any)._seenOrders = new Set<string>();
+          const seenSet: Set<string> = (lobby as any)._seenOrders;
+          if (seenSet.has(orderId)) return;
+          seenSet.add(orderId);
+          if (seenSet.size > 500) {
+            const oldest = seenSet.values().next().value;
+            if (oldest) seenSet.delete(oldest);
+          }
+
+          const nextSeq = ((lobby as any).seq || 0) + 1;
+          (lobby as any).seq = nextSeq;
+
           broadcastRoomMessage(meta.lobbyId, {
             type: 's:game_order',
             senderId: meta.playerId,
-            order: msg.order
+            seq: nextSeq,
+            serverTs: now,
+            order: { ...orderObj, orderId, seq: nextSeq }
           });
+          break;
+        }
+
+        case 'c:state_snapshot': {
+          if (!meta.lobbyId || !msg.snapshot) return;
+          const lobby = lobbies.get(meta.lobbyId);
+          if (!lobby) return;
+          const nextSeq = ((lobby as any).seq || 0) + 1;
+          (lobby as any).seq = nextSeq;
+          (lobby as any).lastSnapshot = msg.snapshot;
+          broadcastRoomMessage(meta.lobbyId, {
+            type: 's:state_snapshot',
+            senderId: meta.playerId,
+            seq: nextSeq,
+            serverTs: Date.now(),
+            snapshot: msg.snapshot
+          });
+          break;
+        }
+
+        case 'c:request_sync': {
+          if (!meta.lobbyId) return;
+          const lobby = lobbies.get(meta.lobbyId);
+          if (!lobby) return;
+          if ((lobby as any).lastSnapshot) {
+            ws.send(JSON.stringify({
+              type: 's:state_snapshot',
+              senderId: lobby.hostId,
+              seq: (lobby as any).seq || 0,
+              serverTs: Date.now(),
+              snapshot: (lobby as any).lastSnapshot
+            }));
+          } else {
+            broadcastRoomMessage(meta.lobbyId, {
+              type: 's:request_sync',
+              requesterId: meta.playerId
+            });
+          }
           break;
         }
       }

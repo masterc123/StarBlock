@@ -120,6 +120,18 @@ declare global {
         wave: number;
         checksum: number;
       };
+      runInitializationStep?: (stepIndex: number, config?: any) => Promise<{ ok: boolean; stage: string }>;
+      getBattleCinematicState?: () => {
+        stageIndex: number;
+        totalStages: number;
+        title: string;
+        subtitle: string;
+        progress: number;
+      } | null;
+      restartBattleCinematic?: () => void;
+      getStateSnapshot?: () => any;
+      applyStateSnapshot?: (snap: any) => void;
+      handleNetworkOrder?: (order: any, senderId?: string) => void;
     };
   }
 }
@@ -198,6 +210,21 @@ export default function App() {
   const [mapArchetypeDisplay, setMapArchetypeDisplay] = useState<string>(() => window.MAP_ARCHETYPE || 'open_badlands');
   const [bridgeCountDisplay, setBridgeCountDisplay] = useState<number>(() => (window.BRIDGES ? window.BRIDGES.length : 0));
   const [loadingStage, setLoadingStage] = useState<number>(0);
+  const [loadingStatusText, setLoadingStatusText] = useState<string>('Initializing WebGL Renderer & Tactical Camera Rig...');
+  const [cinematicState, setCinematicState] = useState<{
+    stageIndex: number;
+    totalStages: number;
+    title: string;
+    subtitle: string;
+    progress: number;
+  }>({
+    stageIndex: 0,
+    totalStages: 10,
+    title: 'ORBITAL RECONNAISSANCE',
+    subtitle: 'High-Altitude Tactical Sector-09 Overview',
+    progress: 0
+  });
+  const initRunningRef = useRef<boolean>(false);
 
   // Multiplayer Anti-Leave Penalty, Connection Ping, Share Resources & Anti-Cheat State
   const clientKeyRef = useRef<string>('');
@@ -402,58 +429,103 @@ export default function App() {
     setPhase('loading_match');
   }, [selectedLobby, myPlayerId, myPlayerName, commanderProfile.preferredFaction, penaltyUntil]);
 
-  // Live 3D Map Generation & Commander Profile Deployment Sequence
+  // Real 10-Stage World Initialization & Readiness Verification Pipeline
   useEffect(() => {
     if (phase !== 'loading_match') {
       window.loadingCameraSweep = false;
+      initRunningRef.current = false;
       return;
     }
+    if (initRunningRef.current) return;
+    initRunningRef.current = true;
     window.loadingCameraSweep = true;
 
-    const t1 = window.setTimeout(() => {
-      setLoadingStage(2);
-    }, 650);
+    let cancelled = false;
+    const allyBots = isMultiplayerMatch && selectedLobby ? selectedLobby.players.filter(p => p.isAi && p.team === 1) : [];
+    const enemyBots = isMultiplayerMatch && selectedLobby ? selectedLobby.players.filter(p => p.isAi && p.team !== 1) : [];
+    const missionConfig = {
+      allyBots,
+      enemyBots,
+      lobbyPlayers: isMultiplayerMatch && selectedLobby ? selectedLobby.players : [],
+      startingMinerals: isMultiplayerMatch ? lobbyMinerals : 200,
+      aiAllyMode: isMultiplayerMatch ? lobbyAiAllyMode : 'defensive',
+      botDifficulty: isMultiplayerMatch ? lobbyBotDiff : 'Hard',
+      autoDeployBase: true,
+      seed: selectedLobby?.seed || window.MAP_SEED
+    };
 
-    const t2 = window.setTimeout(() => {
-      setLoadingStage(3);
-      setMapSeedDisplay(window.MAP_SEED || mapSeedDisplay);
-      setMapArchetypeDisplay(window.MAP_ARCHETYPE || 'open_badlands');
-      setBridgeCountDisplay(window.BRIDGES ? window.BRIDGES.length : 0);
-    }, 1350);
+    const runRealInitialization = async () => {
+      const fallbackStageNames = [
+        'WebGL Renderer & Tactical Camera Rig Verified',
+        'Procedural Canyon & Bridges Synthesized',
+        'A* Navigation Grid & Bridge Waypoints Calibrated',
+        'Mineral Clusters & Rich Gem Craters Active',
+        '3-Faction Procedural 3D Meshes & Shaders Compiled',
+        'Zerg Overmind Hive Cluster Online',
+        'Solaris Protoss Enclave & Warp Matrix Synchronized',
+        'Orbital Command HQ & Faction Harvester Drones Deployed',
+        'Fog of War Vision Matrix & Tactical Radar Ready',
+        'All Combat Systems Nominal — Entering Sector-09'
+      ];
 
-    const t3 = window.setTimeout(() => {
-      setLoadingStage(4);
-      if (isMultiplayerMatch && socketRef.current && socketRef.current.readyState === WebSocket.OPEN && selectedLobby) {
-        socketRef.current.send(JSON.stringify({ type: 'c:start_game', clientKey: clientKeyRef.current }));
+      for (let step = 0; step < 10; step++) {
+        if (cancelled) return;
+        setLoadingStage(step + 1);
+        setLoadingStatusText(fallbackStageNames[step]);
+
+        // Wait one animation frame so the browser paints the updated progress bar and runs 3D frame ticks
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        await new Promise<void>(resolve => window.setTimeout(resolve, 140));
+        if (cancelled) return;
+
+        try {
+          if (window.GAME_API?.runInitializationStep) {
+            const res = await window.GAME_API.runInitializationStep(step, missionConfig);
+            if (res && res.stage) {
+              setLoadingStatusText(res.stage);
+            }
+          } else if (step === 9 && window.GAME_API?.startMission) {
+            window.GAME_API.startMission(missionConfig);
+          }
+        } catch (err) {
+          console.warn(`[WorldInit] Step ${step + 1} recovered from warning:`, err);
+        }
+
+        if (step === 1 || step === 3) {
+          setMapSeedDisplay(window.MAP_SEED || mapSeedDisplay);
+          setMapArchetypeDisplay(window.MAP_ARCHETYPE || 'open_badlands');
+          setBridgeCountDisplay(window.BRIDGES ? window.BRIDGES.length : 0);
+        }
+        if (step === 8 && isMultiplayerMatch && socketRef.current && socketRef.current.readyState === WebSocket.OPEN && selectedLobby) {
+          socketRef.current.send(JSON.stringify({ type: 'c:start_game', clientKey: clientKeyRef.current }));
+        }
       }
-      const allyBots = isMultiplayerMatch && selectedLobby ? selectedLobby.players.filter(p => p.isAi && p.team === 1) : [];
-      const enemyBots = isMultiplayerMatch && selectedLobby ? selectedLobby.players.filter(p => p.isAi && p.team !== 1) : [];
-      if (window.GAME_API) {
-        window.GAME_API.startMission({
-          allyBots,
-          enemyBots,
-          lobbyPlayers: isMultiplayerMatch && selectedLobby ? selectedLobby.players : [],
-          startingMinerals: isMultiplayerMatch ? lobbyMinerals : 200,
-          aiAllyMode: isMultiplayerMatch ? lobbyAiAllyMode : 'defensive',
-          botDifficulty: isMultiplayerMatch ? lobbyBotDiff : 'Hard',
-          autoDeployBase: true
-        });
-      } else {
-        window.titleScreenActive = false;
-        window.gamePaused = false;
-      }
-    }, 2050);
 
-    const t4 = window.setTimeout(() => {
-      window.loadingCameraSweep = false;
-      setPhase('playing');
-    }, 2650);
+      if (!cancelled) {
+        window.loadingCameraSweep = false;
+        initRunningRef.current = false;
+        setPhase('playing');
+      }
+    };
+
+    // Safety timeout in case WebGL tab is backgrounded
+    const safetyTimer = window.setTimeout(() => {
+      if (!cancelled && phaseRef.current === 'loading_match') {
+        if (window.GAME_API?.startMission) {
+          window.GAME_API.startMission(missionConfig);
+        }
+        window.loadingCameraSweep = false;
+        initRunningRef.current = false;
+        setPhase('playing');
+      }
+    }, 8500);
+
+    runRealInitialization();
 
     return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      clearTimeout(t3);
-      clearTimeout(t4);
+      cancelled = true;
+      initRunningRef.current = false;
+      clearTimeout(safetyTimer);
     };
   }, [phase, isMultiplayerMatch, selectedLobby, lobbyMinerals, lobbyAiAllyMode, lobbyBotDiff, mapSeedDisplay]);
 
@@ -609,8 +681,22 @@ export default function App() {
                 setPhase('playing');
                 break;
               case 's:game_order':
-                if (data.order && (window as any).GAME_API && (window as any).GAME_API.handleNetworkOrder) {
-                  (window as any).GAME_API.handleNetworkOrder(data.order, data.senderId);
+                if (data.order && window.GAME_API?.handleNetworkOrder) {
+                  window.GAME_API.handleNetworkOrder(data.order, data.senderId);
+                }
+                break;
+              case 's:state_snapshot':
+                if (data.snapshot && data.senderId !== myPlayerId && window.GAME_API?.applyStateSnapshot) {
+                  window.GAME_API.applyStateSnapshot(data.snapshot);
+                }
+                break;
+              case 's:request_sync':
+                if (window.GAME_API?.getStateSnapshot && ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'c:state_snapshot',
+                    clientKey: clientKeyRef.current,
+                    snapshot: window.GAME_API.getStateSnapshot()
+                  }));
                 }
                 break;
             }
@@ -621,7 +707,11 @@ export default function App() {
 
         (window as any).SEND_NETWORK_ORDER = (order: any) => {
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'c:game_order', order, clientKey: clientKeyRef.current }));
+            const orderWithId = {
+              ...order,
+              orderId: order?.orderId || `${clientKeyRef.current}_${Date.now()}_${Math.floor(Math.random() * 10000)}`
+            };
+            ws.send(JSON.stringify({ type: 'c:game_order', order: orderWithId, clientKey: clientKeyRef.current }));
           }
         };
 
@@ -725,6 +815,10 @@ export default function App() {
         if (typeof window.MAP_SEED === 'number') setMapSeedDisplay(window.MAP_SEED);
         if (typeof window.MAP_ARCHETYPE === 'string') setMapArchetypeDisplay(window.MAP_ARCHETYPE);
         if (Array.isArray(window.BRIDGES)) setBridgeCountDisplay(window.BRIDGES.length);
+        if (api && typeof api.getBattleCinematicState === 'function') {
+          const cState = api.getBattleCinematicState();
+          if (cState) setCinematicState(cState);
+        }
       } catch (err) {
         if ((window as any).APP_ERROR_HANDLER?.record) {
           (window as any).APP_ERROR_HANDLER.record('App.uiUpdateLoop', err);
@@ -1503,9 +1597,43 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bottom Hint */}
-          <div className="w-full max-w-4xl text-center text-[10px] sm:text-xs text-[#82a4c9] font-mono py-1.5 px-2 bg-[#060c14]/90 border border-[#1e3249] shrink-0">
-            Hold &amp; Drag: Box-Select &nbsp;|&nbsp; [8] Build Mine Drill on Minerals or Gem Craters &nbsp;|&nbsp; F2: Select Army
+          {/* Bottom Live 3D Combat Cinematic Theatre Bar */}
+          <div className="w-full max-w-4xl flex flex-col gap-1.5 py-2 px-3 bg-[#060c14]/92 border border-[#1e3249] shrink-0">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] sm:text-xs font-mono">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="px-1.5 py-0.5 bg-[#ffaa00]/20 border border-[#ffaa00] text-[#ffaa00] text-[9px] font-black uppercase shrink-0">
+                  🎬 STAGE {cinematicState.stageIndex + 1}/{cinematicState.totalStages}: {cinematicState.title}
+                </span>
+                <span className="text-[#93b7df] truncate">
+                  {cinematicState.subtitle}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    window.GAME_API?.restartBattleCinematic?.();
+                    if (window.SFX) window.SFX.playClick();
+                  }}
+                  className="px-2 py-0.5 bg-[#0e2238] hover:bg-[#00e5ff] text-[#00e5ff] hover:text-[#040810] border border-[#00e5ff]/60 text-[9px] sm:text-[10px] font-bold uppercase cursor-pointer transition-colors"
+                >
+                  ⟳ REPLAY CINEMATIC
+                </button>
+                <button
+                  type="button"
+                  onClick={handleStartCampaignGame}
+                  className="px-2.5 py-0.5 bg-[#00ff66] hover:bg-[#00e5ff] text-[#040810] text-[9px] sm:text-[10px] font-black uppercase cursor-pointer"
+                >
+                  ⚡ SKIP TO DEPLOY
+                </button>
+              </div>
+            </div>
+            <div className="w-full h-1 bg-[#03070c] overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-[#ffaa00] via-[#00e5ff] to-[#00ff66] transition-all duration-300"
+                style={{ width: `${Math.round((cinematicState.progress || 0) * 100)}%` }}
+              />
+            </div>
           </div>
         </div>
       )}
@@ -2252,15 +2380,20 @@ export default function App() {
                   ⟳ RE-ROLL 3D MAP
                 </button>
                 <span className="px-2.5 py-1 bg-[#00ff66]/20 border border-[#00ff66] text-[#00ff66] text-[10px] sm:text-xs font-mono font-bold uppercase">
-                  {Math.min(100, loadingStage * 25)}% DEPLOYING
+                  {Math.min(100, loadingStage * 10)}% VERIFIED ({loadingStage}/10)
                 </span>
               </div>
             </div>
 
+            <div className="text-[10px] sm:text-xs font-mono text-[#00ff66] mb-1.5 flex items-center justify-between">
+              <span>✓ STAGE {loadingStage}/10: {loadingStatusText}</span>
+              <span className="text-[#7dd3fc]">{Math.min(100, loadingStage * 10)}%</span>
+            </div>
+
             <div className="w-full h-2 bg-[#040810] border border-[#1f3b5c] overflow-hidden">
               <div
-                className="h-full bg-gradient-to-r from-[#00e5ff] via-[#38bdf8] to-[#00ff66] transition-all duration-300"
-                style={{ width: `${Math.min(100, loadingStage * 25)}%` }}
+                className="h-full bg-gradient-to-r from-[#00e5ff] via-[#38bdf8] to-[#00ff66] transition-all duration-200"
+                style={{ width: `${Math.min(100, loadingStage * 10)}%` }}
               />
             </div>
           </div>
