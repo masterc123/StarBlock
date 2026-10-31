@@ -12418,8 +12418,16 @@ function spawnMindControlDominationFX(targetPos, emitterPos) {
         }
 
         try {
+            if (window.SHADER_ENGINE && typeof window.SHADER_ENGINE.setPortraitRenderPass === 'function') {
+                window.SHADER_ENGINE.setPortraitRenderPass(true);
+            }
             portraitRenderer.render(portraitScene, portraitCamera);
-        } catch (e) {}
+        } catch (e) {
+        } finally {
+            if (window.SHADER_ENGINE && typeof window.SHADER_ENGINE.setPortraitRenderPass === 'function') {
+                window.SHADER_ENGINE.setPortraitRenderPass(false);
+            }
+        }
     }
 
     window.PORTRAIT_3D_VIEWER = {

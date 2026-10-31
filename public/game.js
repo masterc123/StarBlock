@@ -548,24 +548,60 @@ function updateFogOfWarVision() {
         }
     }
 
+    const fowBypass = !!(window.titleScreenActive || window.loadingCameraSweep || window.fowRevealAll);
+
     for (let i = 0; i < enemies.length; i++) {
         const e = enemies[i];
-        const vis = isWorldPosVisible(e.mesh.position.x, e.mesh.position.z);
+        const vis = fowBypass || isWorldPosVisible(e.mesh.position.x, e.mesh.position.z);
         e.mesh.visible = vis;
         if (!vis && e.hb && e.hb.root.style.display !== 'none') e.hb.root.style.display = 'none';
     }
 
     for (let i = 0; i < enemyBuildings.length; i++) {
         const eb = enemyBuildings[i];
-        const exp = isWorldPosExplored(eb.pos.x, eb.pos.z);
-        const vis = isWorldPosVisible(eb.pos.x, eb.pos.z);
-        eb.mesh.visible = true;
+        const exp = fowBypass || isWorldPosExplored(eb.pos.x, eb.pos.z);
+        const vis = fowBypass || isWorldPosVisible(eb.pos.x, eb.pos.z);
+        eb.mesh.visible = exp;
+        if (eb.expCreepMesh) {
+            eb.expCreepMesh.visible = exp && (typeof creepRadius === 'undefined' || creepRadius > 0.45);
+        }
         if (vis && state.basePlaced && !state.enemyBaseDiscovered) {
             notifyEnemyBaseDiscovered(eb.pos);
         }
-        if (!exp) {
-            if (eb.badge.style.display !== 'none') eb.badge.style.display = 'none';
-            if (eb.hb.root.style.display !== 'none') eb.hb.root.style.display = 'none';
+        if (!vis) {
+            if (eb.badge && eb.badge.style.display !== 'none') eb.badge.style.display = 'none';
+            if (eb.hb && eb.hb.root.style.display !== 'none') eb.hb.root.style.display = 'none';
+        }
+    }
+
+    if (typeof activeZergMainCreepMesh !== 'undefined' && activeZergMainCreepMesh) {
+        const r = typeof creepRadius !== 'undefined' ? creepRadius : 16.5;
+        const hiveExplored = fowBypass
+            || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z)
+            || isWorldPosExplored(ENEMY_BASE_POS.x + r * 0.55, ENEMY_BASE_POS.z)
+            || isWorldPosExplored(ENEMY_BASE_POS.x - r * 0.55, ENEMY_BASE_POS.z)
+            || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z + r * 0.55)
+            || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z - r * 0.55);
+        activeZergMainCreepMesh.visible = (r > 0.45) && hiveExplored;
+    }
+
+    if (typeof creepTumors !== 'undefined' && Array.isArray(creepTumors)) {
+        for (let t = 0; t < creepTumors.length; t++) {
+            const ct = creepTumors[t];
+            if (ct && ct.group) {
+                ct.group.visible = !ct.dead && (fowBypass || isWorldPosExplored(ct.x, ct.z));
+                if (ct.pustule) ct.pustule.visible = fowBypass || isWorldPosVisible(ct.x, ct.z);
+            }
+        }
+    }
+
+    if (typeof frontierBuildingInfestations !== 'undefined' && Array.isArray(frontierBuildingInfestations)) {
+        for (let f = 0; f < frontierBuildingInfestations.length; f++) {
+            const fi = frontierBuildingInfestations[f];
+            if (fi && fi.group) {
+                const onCreep = typeof isPointOnZergCreep === 'function' ? isPointOnZergCreep(fi.x, fi.z) : true;
+                fi.group.visible = onCreep && (fowBypass || isWorldPosExplored(fi.x, fi.z));
+            }
         }
     }
 
@@ -6931,9 +6967,23 @@ window.BATTLE_CINEMATIC = {
     initialized: false,
     group: null,
     time: 0,
+    elapsed: 0,
     cycleDuration: 28.0,
+    totalDuration: 28.0,
     currentStage: 1,
-    stageTitle: 'STAGE 1/10: HIGH-ALTITUDE AERIAL SECTOR RECON',
+    stageTitle: 'HIGH-ALTITUDE AERIAL RECON',
+    STAGES: [
+        { id: 1, start: 0.0,  end: 2.8,  title: 'HIGH-ALTITUDE AERIAL RECON', subtitle: 'Surveying contested sector & fortified defensive station' },
+        { id: 2, start: 2.8,  end: 5.6,  title: 'DEFENSIVE STATION OVERWATCH', subtitle: 'Fortified defensive station scanning approach corridor' },
+        { id: 3, start: 5.6,  end: 8.4,  title: 'INFANTRY SQUAD ADVANCING', subtitle: 'Combined-arms assault squad advancing in formation' },
+        { id: 4, start: 8.4,  end: 11.2, title: 'TANK MOVING INTO POSITION', subtitle: 'Heavy battle tank rolling onto firing line' },
+        { id: 5, start: 11.2, end: 14.0, title: 'TURRET LOCKING ONTO STATION', subtitle: 'Tank turret rotating to aim at defensive station' },
+        { id: 6, start: 14.0, end: 16.0, title: 'CANNON FIRING AP PROJECTILE', subtitle: '120mm main gun firing armor-piercing shell from barrel' },
+        { id: 7, start: 16.0, end: 18.8, title: 'PROJECTILE FLIGHT & IMPACT', subtitle: 'Tracking shell trajectory into defensive station hull' },
+        { id: 8, start: 18.8, end: 22.0, title: 'DEFENSIVE STATION RETURNING FIRE', subtitle: 'Station turret & spire unleashing counter-battery volley' },
+        { id: 9, start: 22.0, end: 25.0, title: 'SQUAD REACTION & FIREFIGHT', subtitle: 'Advancing units engaging fortified defensive line' },
+        { id: 10,start: 25.0, end: 28.0, title: 'WIDE BATTLEFIELD OVERVIEW', subtitle: 'Full-sector combined arms combat panorama' }
+    ],
     actors: {
         station: null,
         spire: null,
@@ -6945,6 +6995,10 @@ window.BATTLE_CINEMATIC = {
     shotFiredInCycle: false,
     stationFiredInCycle: false,
     impactTriggeredInCycle: false,
+
+    getCurrentStageIndex() {
+        return Math.max(0, Math.min(this.STAGES.length - 1, (this.currentStage || 1) - 1));
+    },
 
     init() {
         if (this.initialized) return;
@@ -6959,9 +7013,9 @@ window.BATTLE_CINEMATIC = {
         const baseH = surfFn(anchorX, anchorZ);
         this.anchor = new THREE.Vector3(anchorX, baseH, anchorZ);
 
-        // 1. Forward Defensive Station (Modular Ball Turret with Gatling, Rocket Pod & Plasma)
+        // 1. Fortified Defensive Station on the northern ridge (Target of the Tank's cannon shot & returns fire!)
         const stationMesh = createEngineeredBuilding('turret', false);
-        const stX = anchorX - 3.2, stZ = anchorZ + 2.2;
+        const stX = anchorX - 1.2, stZ = anchorZ - 9.5;
         stationMesh.position.set(stX, surfFn(stX, stZ), stZ);
         if (stationMesh.userData && stationMesh.userData.scaffoldGroup) {
             stationMesh.userData.scaffoldGroup.visible = false;
@@ -6982,9 +7036,9 @@ window.BATTLE_CINEMATIC = {
         this.group.add(stationMesh);
         this.actors.station = stationMesh;
 
-        // 2. Allied Khaydarin Aegis Spire alongside the Defensive Station
+        // 2. Supporting Aegis Spire flanking the Defensive Station
         const spireMesh = createEngineeredBuilding('solaris_spire', false);
-        const spX = anchorX + 4.4, spZ = anchorZ + 2.6;
+        const spX = anchorX + 3.8, spZ = anchorZ - 10.2;
         spireMesh.position.set(spX, surfFn(spX, spZ), spZ);
         if (spireMesh.userData && spireMesh.userData.scaffoldGroup) {
             spireMesh.userData.scaffoldGroup.visible = false;
@@ -6992,32 +7046,32 @@ window.BATTLE_CINEMATIC = {
         this.group.add(spireMesh);
         this.actors.spire = spireMesh;
 
-        // 3. Heavy Battle Tank positioning near the Defensive Station
+        // 3. Heavy Battle Tank advancing from the southern approach
         const tankMesh = createAnimatedUnitModel('tank');
-        const tkX = anchorX + 0.8, tkZ = anchorZ + 5.8;
+        const tkX = anchorX + 0.6, tkZ = anchorZ + 7.2;
         tankMesh.position.set(tkX, surfFn(tkX, tkZ), tkZ);
         tankMesh.rotation.y = Math.PI;
         this.group.add(tankMesh);
         this.actors.tank = tankMesh;
 
-        // 4. Friendly Infantry Squad (Shock Trooper, Marksmen, Firebat, Marauder)
+        // 4. Advancing Infantry Squad (Shock Trooper, Marksmen, Marauder, Firebat)
         const infRoles = ['grunt', 'ranger', 'ranger', 'marauder', 'firebat'];
         this.actors.infantry = infRoles.map((role, idx) => {
             const m = createAnimatedUnitModel(role);
-            const ix = anchorX - 4.0 + idx * 2.0;
-            const iz = anchorZ + 6.5 + (idx % 2) * 1.4;
+            const ix = anchorX - 4.4 + idx * 2.2;
+            const iz = anchorZ + 8.0 + (idx % 2) * 1.4;
             m.position.set(ix, surfFn(ix, iz), iz);
             m.rotation.y = Math.PI;
             this.group.add(m);
             return { mesh: m, role, baseX: ix, baseZ: iz };
         });
 
-        // 5. Hostile Zerg Strike Force charging from the northern river approach
+        // 5. Defending Guard Force around the Defensive Station
         const enemyRoles = ['crusher', 'spitter', 'skitterer', 'skitterer', 'behemoth'];
         this.actors.enemies = enemyRoles.map((role, idx) => {
             const m = createAnimatedUnitModel(role);
-            const ex = anchorX - 4.4 + idx * 2.2;
-            const ez = anchorZ - 11.5 - (idx % 2) * 2.0;
+            const ex = anchorX - 4.8 + idx * 2.4;
+            const ez = anchorZ - 12.2 - (idx % 2) * 1.8;
             m.position.set(ex, surfFn(ex, ez), ez);
             m.rotation.y = 0;
             this.group.add(m);
@@ -7033,8 +7087,18 @@ window.BATTLE_CINEMATIC = {
         this.actors.projectile = projMesh;
     },
 
+    cleanup() {
+        if (this.group) {
+            this.group.visible = false;
+        }
+        if (this.actors && this.actors.projectile) {
+            this.actors.projectile.visible = false;
+        }
+    },
+
     restart() {
         this.time = 0;
+        this.elapsed = 0;
         this.shotFiredInCycle = false;
         this.stationFiredInCycle = false;
         this.impactTriggeredInCycle = false;
@@ -7049,7 +7113,7 @@ window.BATTLE_CINEMATIC = {
     getState() {
         return {
             stage: this.currentStage,
-            totalStages: 10,
+            totalStages: this.STAGES.length,
             title: this.stageTitle,
             progress: Math.min(100, Math.round((this.time / this.cycleDuration) * 100))
         };
@@ -7061,6 +7125,7 @@ window.BATTLE_CINEMATIC = {
         this.group.visible = true;
 
         this.time = (this.time + dt) % this.cycleDuration;
+        this.elapsed = this.time;
         if (this.time < dt * 1.5) {
             this.shotFiredInCycle = false;
             this.stationFiredInCycle = false;
@@ -7073,125 +7138,127 @@ window.BATTLE_CINEMATIC = {
         const az = this.anchor.z;
         const ay = this.anchor.y;
 
-        const STAGE_DEFS = [
-            { id: 1, start: 0.0,  end: 2.8,  title: 'STAGE 1/10: HIGH-ANGLE AERIAL RECONNAISSANCE' },
-            { id: 2, start: 2.8,  end: 5.6,  title: 'STAGE 2/10: CAMERA SWEEP TO DEFENSIVE STATION' },
-            { id: 3, start: 5.6,  end: 8.4,  title: 'STAGE 3/10: FRIENDLY INFANTRY SQUAD ADVANCING' },
-            { id: 4, start: 8.4,  end: 11.2, title: 'STAGE 4/10: ARMORED TANK POSITIONING ON LINE' },
-            { id: 5, start: 11.2, end: 14.0, title: 'STAGE 5/10: TANK TURRET LOCKING ONTO TARGET' },
-            { id: 6, start: 14.0, end: 16.4, title: 'STAGE 6/10: 120MM CANNON FIRING AP PROJECTILE' },
-            { id: 7, start: 16.4, end: 19.0, title: 'STAGE 7/10: PROJECTILE FLIGHT & TARGET IMPACT' },
-            { id: 8, start: 19.0, end: 22.0, title: 'STAGE 8/10: DEFENSIVE STATION & SPIRE VOLLEY' },
-            { id: 9, start: 22.0, end: 25.0, title: 'STAGE 9/10: VOLUMETRIC BLASTS & BATTLEFIELD FX' },
-            { id: 10,start: 25.0, end: 28.0, title: 'STAGE 10/10: WIDE TACTICAL COMMAND OVERVIEW' }
-        ];
-        let activeDef = STAGE_DEFS[0];
-        for (let i = 0; i < STAGE_DEFS.length; i++) {
-            if (t >= STAGE_DEFS[i].start && t < STAGE_DEFS[i].end) {
-                activeDef = STAGE_DEFS[i];
+        let activeDef = this.STAGES[0];
+        for (let i = 0; i < this.STAGES.length; i++) {
+            if (t >= this.STAGES[i].start && t < this.STAGES[i].end) {
+                activeDef = this.STAGES[i];
                 break;
             }
         }
         this.currentStage = activeDef.id;
         this.stageTitle = activeDef.title;
 
-        // Animate Friendly Infantry Advancing (Stages 3..10)
-        const infAdv = THREE.MathUtils.clamp((t - 4.0) / 8.0, 0, 1);
+        const station = this.actors.station;
+        const spire = this.actors.spire;
+        const tankMesh = this.actors.tank;
+        const stationTargetPos = station ? station.position : new THREE.Vector3(ax - 1.2, ay, az - 9.5);
+
+        // Animate Friendly Infantry Advancing (Stages 3..10) & Reacting to Defensive Station Fire
+        const infAdv = THREE.MathUtils.clamp((t - 3.5) / 8.5, 0, 1);
         for (let i = 0; i < this.actors.infantry.length; i++) {
             const inf = this.actors.infantry[i];
-            const iz = inf.baseZ - infAdv * 5.2;
-            const ix = inf.baseX + Math.sin(t * 1.5 + i) * 0.18;
+            const dodgeEvade = (t >= 18.8 && t < 24.5) ? Math.sin(t * 5.0 + i * 1.7) * 0.45 : 0;
+            const iz = inf.baseZ - infAdv * 6.0;
+            const ix = inf.baseX + Math.sin(t * 1.5 + i) * 0.18 + dodgeEvade;
             inf.mesh.position.set(ix, surfFn(ix, iz), iz);
-            const enemyTarget = this.actors.enemies[i % this.actors.enemies.length].mesh.position;
-            updateUnitAnimation(inf.mesh, dt, infAdv > 0.01 && infAdv < 0.98, enemyTarget);
-            if (t > 8.0 && Math.random() < 0.06) {
+            const focusTarget = (i % 2 === 0) ? stationTargetPos : this.actors.enemies[i % this.actors.enemies.length].mesh.position;
+            updateUnitAnimation(inf.mesh, dt, (infAdv > 0.01 && infAdv < 0.98) || Math.abs(dodgeEvade) > 0.1, focusTarget);
+            if (t > 7.5 && Math.random() < 0.07) {
                 _muzzleScratch.set(ix, inf.mesh.position.y + 0.85, iz - 0.35);
                 triggerMuzzleFlash(_muzzleScratch);
             }
         }
 
-        // Animate Hostile Zerg Advancing & Recoiling
-        const zergAdv = THREE.MathUtils.clamp(t / 14.0, 0, 1);
+        // Animate Defending Perimeter Force
+        const zergAdv = THREE.MathUtils.clamp(t / 15.0, 0, 1);
         for (let i = 0; i < this.actors.enemies.length; i++) {
             const en = this.actors.enemies[i];
-            const ez = en.baseZ + zergAdv * 4.2;
+            const ez = en.baseZ + zergAdv * 3.8;
             const ex = en.baseX + Math.cos(t * 2.1 + i) * 0.22;
             en.mesh.position.set(ex, surfFn(ex, ez), ez);
-            updateUnitAnimation(en.mesh, dt, zergAdv < 0.98, this.actors.station.position);
+            updateUnitAnimation(en.mesh, dt, zergAdv < 0.98, tankMesh ? tankMesh.position : this.anchor);
         }
 
-        // Animate Tank Positioning (Stage 4) & Turret Rotation (Stage 5)
-        const tankMesh = this.actors.tank;
-        const primaryEnemyPos = this.actors.enemies[0].mesh.position;
+        // Animate Tank Moving into Position (Stage 4) & Turret Rotating to Lock onto Defensive Station (Stage 5)
+        let barrelMuzzlePos = new THREE.Vector3();
         if (tankMesh) {
-            const tankRoll = THREE.MathUtils.clamp((t - 7.5) / 3.5, 0, 1);
-            const tz = (az + 6.4) - tankRoll * 4.4;
-            const tx = ax + 0.8;
+            const tankRoll = THREE.MathUtils.clamp((t - 7.2) / 3.8, 0, 1);
+            const tz = (az + 7.2) - tankRoll * 5.4;
+            const tx = ax + 0.6;
             tankMesh.position.set(tx, surfFn(tx, tz), tz);
             tankMesh.rotation.y = Math.PI;
-            const aimActive = t >= 10.8;
-            updateUnitAnimation(tankMesh, dt, tankRoll > 0.01 && tankRoll < 0.99, aimActive ? primaryEnemyPos : null);
+            const aimActive = t >= 10.6;
+            updateUnitAnimation(tankMesh, dt, tankRoll > 0.01 && tankRoll < 0.99, aimActive ? stationTargetPos : null);
+
+            // Compute exact cannon barrel tip position along aim vector toward the defensive station
+            const dirToStation = new THREE.Vector3().subVectors(stationTargetPos, tankMesh.position);
+            dirToStation.y = 0;
+            if (dirToStation.lengthSq() > 0.001) dirToStation.normalize();
+            else dirToStation.set(0, 0, -1);
+            barrelMuzzlePos.set(
+                tankMesh.position.x + dirToStation.x * 1.45,
+                tankMesh.position.y + 0.92,
+                tankMesh.position.z + dirToStation.z * 1.45
+            );
         }
 
-        // Stage 6 & 7: Tank Firing Projectile & Projectile Traveling / Impacting
+        // Stage 6 & 7: Tank Firing Projectile from Cannon Barrel & Camera Tracking Projectile Flight -> Impact on Defensive Station
         const proj = this.actors.projectile;
-        if (t >= 14.2 && !this.shotFiredInCycle && tankMesh) {
+        const impactPos = new THREE.Vector3(stationTargetPos.x, stationTargetPos.y + 1.15, stationTargetPos.z + 0.35);
+        if (t >= 14.0 && !this.shotFiredInCycle && tankMesh) {
             this.shotFiredInCycle = true;
             tankMesh.userData.attackAnim = 1.0;
-            const muzzlePos = new THREE.Vector3(tankMesh.position.x, tankMesh.position.y + 0.85, tankMesh.position.z - 1.25);
             if (typeof triggerTankCannonMuzzleFlash === 'function') {
-                triggerTankCannonMuzzleFlash(tankMesh, muzzlePos, primaryEnemyPos);
+                triggerTankCannonMuzzleFlash(tankMesh, barrelMuzzlePos, impactPos);
             } else {
-                triggerMuzzleFlash(muzzlePos);
+                triggerMuzzleFlash(barrelMuzzlePos);
             }
         }
         if (proj) {
-            if (t >= 14.2 && t < 17.2 && tankMesh) {
-                const flightP = THREE.MathUtils.clamp((t - 14.2) / 2.6, 0, 1);
-                const startP = new THREE.Vector3(tankMesh.position.x, tankMesh.position.y + 0.85, tankMesh.position.z - 1.25);
-                const endP = new THREE.Vector3(primaryEnemyPos.x, primaryEnemyPos.y + 0.5, primaryEnemyPos.z);
-                proj.visible = flightP < 0.99;
-                proj.position.lerpVectors(startP, endP, flightP);
-                proj.position.y += Math.sin(flightP * Math.PI) * 1.35;
-                proj.lookAt(endP);
+            if (t >= 14.0 && t < 17.4 && tankMesh) {
+                const flightP = THREE.MathUtils.clamp((t - 14.0) / 2.7, 0, 1);
+                proj.visible = flightP < 0.98;
+                proj.position.lerpVectors(barrelMuzzlePos, impactPos, flightP);
+                proj.position.y += Math.sin(flightP * Math.PI) * 1.15;
+                proj.lookAt(impactPos);
                 if (typeof emitThrusterExhaustParticles === 'function') {
-                    _projTrailDirScratch.copy(startP).sub(endP).normalize();
-                    emitThrusterExhaustParticles(proj.position, _projTrailDirScratch, 0.85, false);
+                    _projTrailDirScratch.copy(barrelMuzzlePos).sub(impactPos).normalize();
+                    emitThrusterExhaustParticles(proj.position, _projTrailDirScratch, 0.92, false);
                 }
                 if (flightP >= 0.96 && !this.impactTriggeredInCycle) {
                     this.impactTriggeredInCycle = true;
                     proj.visible = false;
                     if (typeof detonateTankKineticShell === 'function') {
-                        detonateTankKineticShell(endP, true);
+                        detonateTankKineticShell(impactPos, true);
                     } else {
-                        detonateArtilleryBomb(endP, true);
+                        detonateArtilleryBomb(impactPos, true);
                     }
+                    triggerSparks(impactPos);
                 }
             } else {
                 proj.visible = false;
             }
         }
 
-        // Stage 8 & 9: Defensive Station & Khaydarin Aegis Spire Firing + Volumetric Explosions
-        const station = this.actors.station;
-        const spire = this.actors.spire;
-        if (station && station.userData && station.userData.head) {
-            const desiredYaw = Math.atan2(primaryEnemyPos.x - station.position.x, primaryEnemyPos.z - station.position.z);
-            station.userData.head.rotation.y = THREE.MathUtils.lerp(station.userData.head.rotation.y, desiredYaw, dt * 4.5);
-            if (t >= 18.8 && t < 24.5 && Math.random() < 0.22) {
-                _muzzleScratch.set(station.position.x, station.position.y + 1.55, station.position.z - 0.65);
+        // Stage 8 & 9: Defensive Station & Aegis Spire Returning Fire at the Advancing Tank & Infantry
+        if (station && station.userData && station.userData.head && tankMesh) {
+            const desiredYaw = Math.atan2(tankMesh.position.x - station.position.x, tankMesh.position.z - station.position.z);
+            station.userData.head.rotation.y = THREE.MathUtils.lerp(station.userData.head.rotation.y, desiredYaw, dt * 4.8);
+            if (t >= 18.6 && t < 24.6 && Math.random() < 0.25) {
+                _muzzleScratch.set(station.position.x, station.position.y + 1.55, station.position.z + 0.65);
                 triggerMuzzleFlash(_muzzleScratch);
                 if (!this.stationFiredInCycle) {
                     this.stationFiredInCycle = true;
-                    launchOrdProjectile(_muzzleScratch, { pos: primaryEnemyPos.clone(), hp: 100 }, 'rocket', 55);
+                    launchOrdProjectile(_muzzleScratch, { pos: tankMesh.position.clone(), hp: 100 }, 'rocket', 55);
                 }
             }
         }
-        if (spire) {
+        if (spire && tankMesh) {
             updateBuildingMechanicsAndDamage({ mesh: spire, hp: 900, maxHp: 900, buildProgress: 1.0, spireCharging: t >= 18.5 && t <= 24.5 }, dt);
-            if (t >= 19.2 && t < 24.2 && Math.random() < 0.14) {
+            if (t >= 19.0 && t < 24.4 && Math.random() < 0.16) {
                 _muzzleScratch.set(spire.position.x, spire.position.y + 2.45, spire.position.z);
-                launchOrdProjectile(_muzzleScratch, { pos: this.actors.enemies[1].mesh.position.clone(), hp: 100 }, 'solaris_spire', 48);
+                const infTarget = this.actors.infantry[2] ? this.actors.infantry[2].mesh.position.clone() : tankMesh.position.clone();
+                launchOrdProjectile(_muzzleScratch, { pos: infTarget, hp: 100 }, 'solaris_spire', 48);
             }
         }
 
@@ -7201,51 +7268,55 @@ window.BATTLE_CINEMATIC = {
 
         if (this.currentStage === 1) {
             const a = t * 0.18;
-            camGoalPos.set(ax + Math.sin(a) * 46, ay + 42, az + Math.cos(a) * 46);
+            camGoalPos.set(ax + Math.sin(a) * 44, ay + 40, az + Math.cos(a) * 44);
             lookGoalPos.set(ax, ay + 1.0, az - 2.0);
         } else if (this.currentStage === 2) {
             const p = (t - 2.8) / 2.8;
-            camGoalPos.set(THREE.MathUtils.lerp(ax + 26, station.position.x - 7.5, p), THREE.MathUtils.lerp(ay + 34, ay + 8.5, p), THREE.MathUtils.lerp(az + 32, station.position.z + 9.5, p));
-            lookGoalPos.set(station.position.x, station.position.y + 1.4, station.position.z);
+            camGoalPos.set(
+                THREE.MathUtils.lerp(ax + 24, stationTargetPos.x - 6.8, p),
+                THREE.MathUtils.lerp(ay + 32, stationTargetPos.y + 6.5, p),
+                THREE.MathUtils.lerp(az + 28, stationTargetPos.z + 8.5, p)
+            );
+            lookGoalPos.set(stationTargetPos.x, stationTargetPos.y + 1.4, stationTargetPos.z);
         } else if (this.currentStage === 3) {
             const leadInf = this.actors.infantry[2].mesh.position;
-            camGoalPos.set(leadInf.x + 6.5, leadInf.y + 5.8, leadInf.z + 7.2);
-            lookGoalPos.set(leadInf.x - 1.0, leadInf.y + 1.0, leadInf.z - 4.0);
+            camGoalPos.set(leadInf.x + 6.2, leadInf.y + 5.2, leadInf.z + 6.8);
+            lookGoalPos.set(leadInf.x - 0.8, leadInf.y + 1.0, leadInf.z - 5.0);
         } else if (this.currentStage === 4) {
-            camGoalPos.set(tankMesh.position.x - 5.8, tankMesh.position.y + 4.8, tankMesh.position.z + 6.8);
-            lookGoalPos.set(tankMesh.position.x, tankMesh.position.y + 1.1, tankMesh.position.z - 2.0);
+            camGoalPos.set(tankMesh.position.x - 5.4, tankMesh.position.y + 4.2, tankMesh.position.z + 6.4);
+            lookGoalPos.set(tankMesh.position.x, tankMesh.position.y + 1.1, tankMesh.position.z - 3.0);
         } else if (this.currentStage === 5) {
-            camGoalPos.set(tankMesh.position.x + 3.6, tankMesh.position.y + 3.2, tankMesh.position.z + 4.2);
-            lookGoalPos.set(primaryEnemyPos.x, primaryEnemyPos.y + 0.8, primaryEnemyPos.z);
+            camGoalPos.set(tankMesh.position.x + 3.2, tankMesh.position.y + 2.8, tankMesh.position.z + 3.8);
+            lookGoalPos.set(stationTargetPos.x, stationTargetPos.y + 1.2, stationTargetPos.z);
         } else if (this.currentStage === 6) {
-            camGoalPos.set(tankMesh.position.x + 2.8, tankMesh.position.y + 2.8, tankMesh.position.z + 3.4);
-            lookGoalPos.set(primaryEnemyPos.x, primaryEnemyPos.y + 0.8, primaryEnemyPos.z);
+            camGoalPos.set(tankMesh.position.x + 2.4, tankMesh.position.y + 2.3, tankMesh.position.z + 2.8);
+            lookGoalPos.set(stationTargetPos.x, stationTargetPos.y + 1.2, stationTargetPos.z);
         } else if (this.currentStage === 7) {
-            const focusPt = proj && proj.visible ? proj.position : primaryEnemyPos;
-            camGoalPos.set(focusPt.x + 6.2, focusPt.y + 4.5, focusPt.z + 6.5);
+            const focusPt = (proj && proj.visible) ? proj.position : impactPos;
+            camGoalPos.set(focusPt.x + 4.8, focusPt.y + 3.2, focusPt.z + 5.2);
             lookGoalPos.copy(focusPt);
         } else if (this.currentStage === 8) {
-            camGoalPos.set(station.position.x - 6.2, station.position.y + 5.2, station.position.z + 6.2);
-            lookGoalPos.set(primaryEnemyPos.x, primaryEnemyPos.y + 1.0, primaryEnemyPos.z);
+            camGoalPos.set(stationTargetPos.x - 5.8, stationTargetPos.y + 4.8, stationTargetPos.z - 4.8);
+            lookGoalPos.set(tankMesh.position.x, tankMesh.position.y + 1.0, tankMesh.position.z);
         } else if (this.currentStage === 9) {
-            if (Math.random() < 0.08) {
+            if (Math.random() < 0.09) {
                 const blastPt = new THREE.Vector3(
-                    primaryEnemyPos.x + (Math.random() - 0.5) * 5.0,
-                    primaryEnemyPos.y + 0.3,
-                    primaryEnemyPos.z + (Math.random() - 0.5) * 4.0
+                    tankMesh.position.x + (Math.random() - 0.5) * 6.0,
+                    tankMesh.position.y + 0.3,
+                    tankMesh.position.z - 2.0 + (Math.random() - 0.5) * 4.0
                 );
                 detonateArtilleryBomb(blastPt, false);
             }
-            camGoalPos.set(ax - 12.0, ay + 11.5, az + 8.5);
-            lookGoalPos.set(primaryEnemyPos.x, primaryEnemyPos.y + 0.8, primaryEnemyPos.z);
+            camGoalPos.set(ax - 11.5, ay + 10.5, az + 6.5);
+            lookGoalPos.set(ax, ay + 1.0, az - 4.0);
         } else {
             const p = (t - 25.0) / 3.0;
-            camGoalPos.set(ax + Math.sin(p * 0.5) * 28, THREE.MathUtils.lerp(ay + 18, ay + 38, p), az + 34);
+            camGoalPos.set(ax + Math.sin(p * 0.5) * 28, THREE.MathUtils.lerp(ay + 16, ay + 36, p), az + 32);
             lookGoalPos.set(ax, ay + 1.0, az - 3.0);
         }
 
-        camera.position.lerp(camGoalPos, Math.min(1.0, dt * 3.8));
-        controls.target.lerp(lookGoalPos, Math.min(1.0, dt * 4.2));
+        camera.position.lerp(camGoalPos, Math.min(1.0, dt * 4.0));
+        controls.target.lerp(lookGoalPos, Math.min(1.0, dt * 4.5));
         controls.update();
     }
 };
@@ -7262,7 +7333,17 @@ function animate(now) {
         window.PERF_MANAGER.update(rawDt, renderer, perfProf);
     }
 
-    if (window.titleScreenActive || window.loadingCameraSweep) {
+    const isCinematicOrLoading = !!(window.titleScreenActive || window.loadingCameraSweep);
+    const gameContainerEl = document.getElementById('game-container');
+    if (gameContainerEl) {
+        if (isCinematicOrLoading && !gameContainerEl.classList.contains('cinematic-overlay-active')) {
+            gameContainerEl.classList.add('cinematic-overlay-active');
+        } else if (!isCinematicOrLoading && gameContainerEl.classList.contains('cinematic-overlay-active')) {
+            gameContainerEl.classList.remove('cinematic-overlay-active');
+        }
+    }
+
+    if (isCinematicOrLoading) {
         fowMesh.visible = false;
         window.BATTLE_CINEMATIC.update(rawDt, now);
         if (MAT.updateShaders) MAT.updateShaders(now * 0.001);
@@ -7834,7 +7915,11 @@ function animate(now) {
         }
 
         const ebInViewport = window.isWorldPosInViewport(eb.pos.x, eb.pos.y, eb.pos.z, 7.5);
-        eb.mesh.visible = ebInViewport;
+        const ebExplored = !!(window.titleScreenActive || window.loadingCameraSweep || window.fowRevealAll) || isWorldPosExplored(eb.pos.x, eb.pos.z);
+        eb.mesh.visible = ebInViewport && ebExplored;
+        if (eb.expCreepMesh) {
+            eb.expCreepMesh.visible = ebExplored && (typeof creepRadius === 'undefined' || creepRadius > 0.45);
+        }
 
         const ud = eb.mesh.userData;
         ud.pulsePhase = (ud.pulsePhase || 0) + dt * 2.8;

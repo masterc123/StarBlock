@@ -15,7 +15,7 @@
     <script src="/vendor/OrbitControls.js"></script>
   </head>
   <body>
-    <div id="game-container">
+    <div id="game-container" class="cinematic-overlay-active">
       <div id="world-ui"></div>
 
       <!-- Tactical Red Glow Border Frame Overlay -->
@@ -52,11 +52,11 @@
 
       <!-- StarCraft II Terran Top Menu, Objective & Resource HUD -->
       <div id="sc2-top-hud">
-        <!-- Top-Left: SC2 Menu Strip + Primary Objective Ticker -->
+        <!-- Top-Left: Streamlined Essential Command Strip -->
         <div id="sc2-top-left">
           <div class="sc2-menu-strip">
             <span class="sc2-badge" id="mode-badge" style="cursor:pointer;" onclick="window.togglePlayerFaction && window.togglePlayerFaction()" title="Click to Switch Faction (Terran Dominion vs Solaris Protoss)">TERRAN DOMINION</span>
-            <button class="sc2-endless-btn" id="btn-main-menu-top" onclick="window.returnToMainMenu && window.returnToMainMenu()" title="Open StarCraft II Main Menu & Multiplayer Lobbies">
+            <button class="sc2-endless-btn" id="btn-main-menu-top" onclick="window.returnToMainMenu && window.returnToMainMenu()" title="Open Main Menu & Multiplayer Lobbies">
               MENU
             </button>
             <button class="sc2-endless-btn" id="btn-select-army" onclick="selectAllArmy()" title="Select All Friendly Combat Units [F2]">
@@ -65,33 +65,8 @@
             <button class="sc2-endless-btn" id="btn-toggle-console" onclick="window.toggleBottomConsole && window.toggleBottomConsole()" title="Show or Hide Bottom Command Console">
               ▼ PANEL
             </button>
-            <button class="sc2-endless-btn" id="btn-toggle-all-ui" onclick="window.toggleAllGameUI && window.toggleAllGameUI()" title="Hide All UI Overlays for Unobstructed View">
-              👁 HIDE UI
-            </button>
-            <button class="sc2-endless-btn" id="btn-hud-settings" onclick="window.toggleHudSettingsModal && window.toggleHudSettingsModal()" title="Open Tactical HUD & Audio Settings">
+            <button class="sc2-endless-btn" id="btn-hud-settings" onclick="window.toggleHudSettingsModal && window.toggleHudSettingsModal()" title="Open Tactical HUD, AI & Audio Settings">
               ⚙ SETTINGS
-            </button>
-            <button class="sc2-endless-btn desktop-only-hud-btn" id="btn-toggle-endless" onclick="switchToEndlessMode()" title="Switch to Endless Mutation Survival">
-              ENDLESS MODE
-            </button>
-            <button class="sc2-endless-btn desktop-only-hud-btn" id="btn-regen-map" onclick="window.regenerateDynamicSectorMap && window.regenerateDynamicSectorMap()" title="Dynamically Regenerate Procedural Map Layout & Seed">
-              ⟳ REGEN MAP
-            </button>
-            <button class="sc2-endless-btn" id="hud-music-btn" onclick="window.RAID_MUSIC && window.RAID_MUSIC.toggleMusic()" oncontextmenu="event.preventDefault(); window.RAID_MUSIC && window.RAID_MUSIC.nextTrack();" title="Click to Toggle Red Alert Industrial Military AI Music (Right-Click to Switch Track)">
-              🎸 IRON: ON
-            </button>
-            <button class="sc2-endless-btn" id="btn-solaris-stance" onclick="window.toggleSolarisDiplomacy && window.toggleSolarisDiplomacy()" title="3rd Faction: The Solaris Chrono-Synod (Click to toggle Allied Coalition vs 3-Way Free-For-All War)">
-              ❖ SYNOD: ALLIED
-            </button>
-            <button class="sc2-endless-btn" id="btn-toggle-ai-ally" onclick="window.toggleAiAllyMode && window.toggleAiAllyMode()" title="AI Ally Commander (Click to cycle Defensive / Aggressive / Off — Spawns autonomous Allied Terran &amp; Protoss reinforcements)">
-              🤖 ALLY AI: DEFENSIVE
-            </button>
-            <button class="sc2-endless-btn" id="btn-squad-intel" onclick="window.toggleSquadIntelligence && window.toggleSquadIntelligence()" title="Squad Intelligence (Auto-switches units between Defensive Phalanx Formation &amp; Aggressive Hunting based on Zerg cluster proximity)">
-              🧠 SQUAD AI: DEFENSIVE
-            </button>
-            <button class="sc2-endless-btn weather-pill-btn desktop-only-hud-btn" id="btn-weather-cycle" onclick="window.WEATHER_SYSTEM && window.WEATHER_SYSTEM.cycleNext()" title="Dynamic Sector Weather (Click to cycle Clear / Acid Rain / Heavy Fog)">
-              <span id="ui-weather-dot" class="weather-status-dot"></span>
-              <span id="ui-weather-label">CLEAR (FOW 100% · SPD 100%)</span>
             </button>
           </div>
           <div id="sc2-objective-pill">
@@ -391,22 +366,32 @@
           </div>
 
           <div class="settings-quick-actions">
-            <button class="settings-act-btn" onclick="window.regenerateDynamicSectorMap && window.regenerateDynamicSectorMap(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
+            <button class="settings-act-btn" id="btn-regen-map" onclick="window.regenerateDynamicSectorMap && window.regenerateDynamicSectorMap(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
               ⟳ REGENERATE MAP
             </button>
+            <button class="settings-act-btn" id="hud-music-btn" onclick="window.RAID_MUSIC && window.RAID_MUSIC.toggleMusic()">
+              🎸 IRON: ON
+            </button>
             <button class="settings-act-btn" id="modal-music-track-btn" onclick="window.RAID_MUSIC && window.RAID_MUSIC.nextTrack()">
-              🎸 TRACK: IRON MARCH
+              🎸 NEXT TRACK
             </button>
-            <button class="settings-act-btn" onclick="window.WEATHER_SYSTEM && window.WEATHER_SYSTEM.cycleNext()">
-              ☁ CYCLE WEATHER
+            <button class="settings-act-btn" id="btn-weather-cycle" onclick="window.WEATHER_SYSTEM && window.WEATHER_SYSTEM.cycleNext()">
+              <span id="ui-weather-dot" class="weather-status-dot" style="display:inline-block;margin-right:4px;"></span>
+              <span id="ui-weather-label">CLEAR WEATHER</span>
             </button>
-            <button class="settings-act-btn" id="btn-modal-ai-ally" onclick="window.toggleAiAllyMode && window.toggleAiAllyMode()">
-              🤖 AI ALLY COMMANDER: DEFENSIVE
+            <button class="settings-act-btn" id="btn-solaris-stance" onclick="window.toggleSolarisDiplomacy && window.toggleSolarisDiplomacy()">
+              ❖ SYNOD: ALLIED
             </button>
-            <button class="settings-act-btn" onclick="switchToEndlessMode(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
+            <button class="settings-act-btn" id="btn-toggle-ai-ally" onclick="window.toggleAiAllyMode && window.toggleAiAllyMode()">
+              🤖 ALLY AI: DEFENSIVE
+            </button>
+            <button class="settings-act-btn" id="btn-squad-intel" onclick="window.toggleSquadIntelligence && window.toggleSquadIntelligence()">
+              🧠 SQUAD AI: DEFENSIVE
+            </button>
+            <button class="settings-act-btn" id="btn-toggle-endless" onclick="switchToEndlessMode(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
               ❖ ENDLESS MODE
             </button>
-            <button class="settings-act-btn warn" onclick="window.toggleAllGameUI && window.toggleAllGameUI(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
+            <button class="settings-act-btn warn" id="btn-toggle-all-ui" onclick="window.toggleAllGameUI && window.toggleAllGameUI(); window.toggleHudSettingsModal && window.toggleHudSettingsModal();">
               👁 HIDE ALL UI
             </button>
           </div>

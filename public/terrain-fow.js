@@ -4374,21 +4374,44 @@ function deformTerrainCrater(cx, cz, radius = 2.4, depth = 0.28, forceImmediate 
     }
 }
 
-// Dynamically Flattens the Terrain Floor Map when a Building or Camp is Placed! (Optimized O(local vertices))
+// Dynamically Flattens the Terrain Floor Map when a Building or Camp is Placed! (Updates height cache, visible terrain mesh, vertex normals, and nearby structures)
 function flattenTerrainUnderBuilding(cx, cz, flatRadius = 3.2, blendRadius = 2.2) {
     if (!Number.isFinite(cx) || !Number.isFinite(cz)) return 0;
-    const rawCenterY = getTerrainHeight(cx, cz);
-    const targetY = THREE.MathUtils.clamp(rawCenterY, 0.06, 5.5);
-    FLATTENED_BUILDING_PADS.push({
-        x: cx,
-        z: cz,
-        targetY,
-        flatR: flatRadius,
-        blendR: blendRadius
-    });
+
+    // Sample 5-point footprint height so buildings placed on slopes sit naturally at the mean grade without floating or burying
+    const sampleR = Math.max(0.8, flatRadius * 0.55);
+    const hCenter = getTerrainHeight(cx, cz);
+    const hN = getTerrainHeight(cx, cz - sampleR);
+    const hS = getTerrainHeight(cx, cz + sampleR);
+    const hE = getTerrainHeight(cx + sampleR, cz);
+    const hW = getTerrainHeight(cx - sampleR, cz);
+    const weightedH = hCenter * 0.44 + (hN + hS + hE + hW) * 0.14;
+    const targetY = THREE.MathUtils.clamp(weightedH, 0.08, 6.2);
+
+    // Update existing pad if re-flattening same spot, otherwise append
+    let updatedExistingPad = false;
+    for (let p = 0; p < FLATTENED_BUILDING_PADS.length; p++) {
+        const pad = FLATTENED_BUILDING_PADS[p];
+        if (Math.hypot(pad.x - cx, pad.z - cz) < 1.2) {
+            pad.targetY = targetY;
+            pad.flatR = Math.max(pad.flatR, flatRadius);
+            pad.blendR = Math.max(pad.blendR, blendRadius);
+            updatedExistingPad = true;
+            break;
+        }
+    }
+    if (!updatedExistingPad) {
+        FLATTENED_BUILDING_PADS.push({
+            x: cx,
+            z: cz,
+            targetY,
+            flatR: flatRadius,
+            blendR: blendRadius
+        });
+    }
 
     const totalR = flatRadius + blendRadius;
-    updateLocalTerrainHeightCache(cx, cz, totalR);
+    updateLocalTerrainHeightCache(cx, cz, totalR + 1.5);
 
     const colorAttr = terrainGeo.attributes.color;
     const fPos = (typeof fowGeo !== 'undefined' && fowGeo && fowGeo.attributes) ? fowGeo.attributes.position : null;
@@ -4407,16 +4430,19 @@ function flattenTerrainUnderBuilding(cx, cz, flatRadius = 3.2, blendRadius = 2.2
             const vz = posAttr.getZ(i);
             const dist = Math.hypot(vx - cx, vz - cz);
             if (dist <= totalR) {
+                // Preserve river channel & bridge abutments
+                if (typeof isPointInValleyRiver === 'function' && isPointInValleyRiver(vx, vz, 0.8)) continue;
                 const newY = getTerrainHeight(vx, vz);
                 posAttr.setY(i, newY);
                 if (fPos) {
                     fPos.setY(i, getSurfaceHeightWithBridges(vx, vz));
                 }
-                if (dist <= flatRadius + 0.6) {
-                    const padBlend = Math.max(0, 1.0 - (dist / (flatRadius + 0.6))) * 0.28;
-                    baseColors[i * 3]     = baseColors[i * 3] * (1 - padBlend) + 0.34 * padBlend;
-                    baseColors[i * 3 + 1] = baseColors[i * 3 + 1] * (1 - padBlend) + 0.36 * padBlend;
-                    baseColors[i * 3 + 2] = baseColors[i * 3 + 2] * (1 - padBlend) + 0.32 * padBlend;
+                if (dist <= flatRadius + 1.1) {
+                    const padT = Math.max(0, Math.min(1, 1.0 - (dist / (flatRadius + 1.1))));
+                    const padBlend = padT * padT * (3.0 - 2.0 * padT) * 0.30;
+                    baseColors[i * 3]     = baseColors[i * 3] * (1 - padBlend) + 0.33 * padBlend;
+                    baseColors[i * 3 + 1] = baseColors[i * 3 + 1] * (1 - padBlend) + 0.35 * padBlend;
+                    baseColors[i * 3 + 2] = baseColors[i * 3 + 2] * (1 - padBlend) + 0.31 * padBlend;
                     if (colorAttr && (typeof isPointOnZergCreep !== 'function' || !isPointOnZergCreep(vx, vz))) {
                         colorAttr.setXYZ(i, baseColors[i * 3], baseColors[i * 3 + 1], baseColors[i * 3 + 2]);
                     }
@@ -4427,11 +4453,47 @@ function flattenTerrainUnderBuilding(cx, cz, flatRadius = 3.2, blendRadius = 2.2
     }
     if (modified) {
         posAttr.needsUpdate = true;
+        terrainGeo.computeVertexNormals();
+        if (terrainGeo.attributes.normal) terrainGeo.attributes.normal.needsUpdate = true;
         if (fPos) fPos.needsUpdate = true;
         if (colorAttr) colorAttr.needsUpdate = true;
+
+        // Re-sync any nearby structures & foundations so nothing floats or sinks when adjacent terrain flattens
+        const syncRadius = totalR + 2.5;
+        if (Array.isArray(window.REGISTERED_MAP_STRUCTURES)) {
+            for (let s = 0; s < window.REGISTERED_MAP_STRUCTURES.length; s++) {
+                const st = window.REGISTERED_MAP_STRUCTURES[s];
+                if (st && st.mesh && Math.hypot(st.x - cx, st.z - cz) <= syncRadius) {
+                    st.mesh.position.y = getTerrainHeight(st.x, st.z) + (st.yOffset || 0);
+                }
+            }
+        }
+        const buildingLists = [window.buildings, window.enemyBuildings, window.solarisBuildings];
+        for (let bl = 0; bl < buildingLists.length; bl++) {
+            const list = buildingLists[bl];
+            if (!Array.isArray(list)) continue;
+            for (let bi = 0; bi < list.length; bi++) {
+                const b = list[bi];
+                if (!b || !b.pos || !b.mesh) continue;
+                if (Math.hypot(b.pos.x - cx, b.pos.z - cz) <= syncRadius) {
+                    const by = (typeof getSurfaceHeightWithBridges === 'function')
+                        ? getSurfaceHeightWithBridges(b.pos.x, b.pos.z)
+                        : getTerrainHeight(b.pos.x, b.pos.z);
+                    b.pos.y = by;
+                    b.mesh.position.y = by;
+                }
+            }
+        }
+
         if (typeof syncZergCreepGroundMeshHeights === 'function' && activeZergMainCreepMesh) {
             if (Math.hypot(cx - ENEMY_BASE_POS.x, cz - ENEMY_BASE_POS.z) <= (creepRadius || 30.0) + totalR + 8.0) {
                 syncZergCreepGroundMeshHeights(activeZergMainCreepMesh, ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, creepRadius || 30.0);
+            }
+        }
+        for (let em = 0; em < activeZergExpansionCreepMeshes.length; em++) {
+            const expMesh = activeZergExpansionCreepMeshes[em];
+            if (expMesh && Math.hypot(cx - expMesh.position.x, cz - expMesh.position.z) <= 18.0 + totalR) {
+                syncZergCreepGroundMeshHeights(expMesh, expMesh.position.x, expMesh.position.z, 13.5);
             }
         }
     }
@@ -4510,6 +4572,7 @@ function isWorldPosExplored(x, z) {
     if (gx < 0 || gx >= FOW_RES || gy < 0 || gy >= FOW_RES) return false;
     return fowExplored[gy * FOW_RES + gx] === 1;
 }
+window.isPositionExploredByPlayer = isWorldPosExplored;
 
 let creepRadius = 16.5;
 let creepTargetRadius = 16.5;
@@ -4560,6 +4623,9 @@ function spawnCreepTumor(x, z) {
     const pustule = new THREE.Mesh(createOrganicBioCarapaceGeo(0.25, 0.22, 0.25, 4, 0.03), MAT.zergBioShader);
     pustule.position.y = 0.22;
     group.add(mound, pustule);
+    // Respect Fog of War immediately upon creation
+    const fBypass = !!(window.titleScreenActive || window.loadingCameraSweep || window.fowRevealAll);
+    group.visible = fBypass || isWorldPosExplored(tx, tz);
     addMapMesh(group);
     const distFromHive = Math.hypot(tx - ENEMY_BASE_POS.x, tz - ENEMY_BASE_POS.z);
     creepTumors.push({ group, mound, pustule, x: tx, z: tz, distFromHive, phase: seededRandom() * 10, scale: 1.0, dead: false });
@@ -4612,8 +4678,15 @@ function updateZergCreepColors(radius, isReceding = false, forceFullSync = false
     if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.setZergCreepUniforms === 'function') {
         SHADER_ENGINE.setZergCreepUniforms(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z, radius);
     }
+    const fowBypass = !!(window.titleScreenActive || window.loadingCameraSweep || window.fowRevealAll);
+    const mainHiveExplored = fowBypass || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z)
+        || isWorldPosExplored(ENEMY_BASE_POS.x + radius * 0.55, ENEMY_BASE_POS.z)
+        || isWorldPosExplored(ENEMY_BASE_POS.x - radius * 0.55, ENEMY_BASE_POS.z)
+        || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z + radius * 0.55)
+        || isWorldPosExplored(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z - radius * 0.55);
+
     if (activeZergMainCreepMesh) {
-        activeZergMainCreepMesh.visible = radius > 0.45;
+        activeZergMainCreepMesh.visible = (radius > 0.45) && mainHiveExplored;
         const baseR = (activeZergMainCreepMesh.userData && activeZergMainCreepMesh.userData.baseRadius) || 16.5;
         const scaleFrac = Math.max(0.02, radius / Math.max(1.0, baseR));
         activeZergMainCreepMesh.scale.set(scaleFrac, 1.0, scaleFrac);
@@ -4621,18 +4694,37 @@ function updateZergCreepColors(radius, isReceding = false, forceFullSync = false
     for (let em = 0; em < activeZergExpansionCreepMeshes.length; em++) {
         const expMesh = activeZergExpansionCreepMeshes[em];
         if (expMesh) {
+            const expExplored = fowBypass || isWorldPosExplored(expMesh.position.x, expMesh.position.z);
             if (expMesh.userData && expMesh.userData.ownerDestroyed) {
                 expMesh.userData.recedeRadius = Math.max(0, (expMesh.userData.recedeRadius ?? 13.5) - 0.35);
                 const rFrac = Math.max(0.01, expMesh.userData.recedeRadius / 13.5);
                 expMesh.scale.set(rFrac, 1.0, rFrac);
-                expMesh.visible = expMesh.userData.recedeRadius > 0.45;
+                expMesh.visible = (expMesh.userData.recedeRadius > 0.45) && expExplored;
             } else {
-                expMesh.visible = radius > 0.45;
+                expMesh.visible = (radius > 0.45) && expExplored;
                 if (radius > 0.45 && isReceding) {
                     const shrinkFrac = Math.min(1.0, Math.max(0.04, radius / 16.5));
                     expMesh.scale.set(shrinkFrac, 1.0, shrinkFrac);
                 }
             }
+        }
+    }
+
+    // Enforce Fog of War visibility on Creep Tumors and Frontier Building Infestations
+    for (let t = 0; t < creepTumors.length; t++) {
+        const ct = creepTumors[t];
+        if (ct && ct.group) {
+            ct.group.visible = !ct.dead && (fowBypass || isWorldPosExplored(ct.x, ct.z));
+            if (ct.pustule) {
+                ct.pustule.visible = fowBypass || isWorldPosVisible(ct.x, ct.z);
+            }
+        }
+    }
+    for (let f = 0; f < frontierBuildingInfestations.length; f++) {
+        const fi = frontierBuildingInfestations[f];
+        if (fi && fi.group) {
+            const onCreep = isPointOnZergCreep(fi.x, fi.z);
+            fi.group.visible = onCreep && (fowBypass || isWorldPosExplored(fi.x, fi.z));
         }
     }
 
@@ -4733,15 +4825,6 @@ function updateZergCreepColors(radius, isReceding = false, forceFullSync = false
         }
         if (grassMatrixDirty) {
             activeMeadowGrassMesh.instanceMatrix.needsUpdate = true;
-        }
-    }
-
-    // Ensure frontier buildings & goo clusters shrink and hide as Zerg creep recedes past them!
-    for (let f = 0; f < frontierBuildingInfestations.length; f++) {
-        const fi = frontierBuildingInfestations[f];
-        if (fi && fi.group) {
-            const onCreep = isPointOnZergCreep(fi.x, fi.z);
-            fi.group.visible = onCreep;
         }
     }
 }
@@ -8688,317 +8771,52 @@ function createDestroyedRunwayAirbase(rawX, rawZ, rotY = 0.35) {
 
 // Out-of-Bounds Bug-Fixed Perimeter + Terraria-Inspired Stratified Subterranean Cutaway Cross-Section & Outer Badlands Rim
 function createOutOfBoundsFloorSkirt() {
-    const halfMap = MAP_SIZE * 0.5; // 110.0m exact terrain boundary
-    const wallSteps = 88;           // 2.5m per step — matches terrain grid so there are ZERO gaps or sawtooth seams!
-
-    // Radial profile for the Terraria-Style Subterranean Cutaway Cross-Section & Outer Canyon Rim:
-    // dOff = distance outward from the ±110m map edge; yMode = 'rel' (relative to edgeH) or 'abs' (world Y)
-    // Strata:
-    //   0: Exact Map Edge Lip (stitched 100% flush to getTerrainHeight)
-    //   1: Overgrown Turf & Root Overhang Lip (-0.55m)
-    //   2: Topsoil & Loam Bench (-1.55m)
-    //   3: Banded Ochre Sandstone Cliff (-3.85m)
-    //   4: Terracotta Shale Ledge (-4.45m)
-    //   5: Deep Cavern Slate & Crystal Geode Wall (-8.20m)
-    //   6: Subterranean Cavern Ledge (-8.85m)
-    //   7: Abyssal Obsidian & Glowing Magma Fissure Trench Floor (-12.4m)
-    //   8: Outer Trench Magma Channel (-12.2m)
-    //   9: Outer Canyon Basalt Foot (-6.5m)
-    //  10: Outer Stratified Badlands Mesa Rim (+4.2m)
-    const profileRings = [
-        { dOff: -0.35, yOff: -0.08, mode: 'rel', r: 0.28, g: 0.39, b: 0.22 }, // 0: Flush inner lip under terrain edge
-        { dOff:  0.45, yOff: -0.45, mode: 'rel', r: 0.32, g: 0.44, b: 0.24 }, // 1: Turf & root crust overhang
-        { dOff:  1.35, yOff: -1.65, mode: 'rel', r: 0.44, g: 0.31, b: 0.20 }, // 2: Rich brown root-soil stratum
-        { dOff:  2.25, yOff: -1.95, mode: 'rel', r: 0.56, g: 0.36, b: 0.22 }, // 3: Upper sandstone bench
-        { dOff:  3.50, yOff: -4.25, mode: 'rel', r: 0.68, g: 0.41, b: 0.24 }, // 4: Banded ochre/terracotta sandstone wall
-        { dOff:  4.65, yOff: -4.65, mode: 'rel', r: 0.36, g: 0.31, b: 0.38 }, // 5: Metamorphic shale & ore shelf
-        { dOff:  6.10, yOff: -8.35, mode: 'rel', r: 0.20, g: 0.24, b: 0.33 }, // 6: Deep cavern dark slate & crystal geode wall
-        { dOff:  7.55, yOff: -8.80, mode: 'rel', r: 0.16, g: 0.19, b: 0.27 }, // 7: Subterranean cavern floor ledge
-        { dOff:  9.10, yOff: -12.4, mode: 'abs', r: 0.12, g: 0.09, b: 0.11 }, // 8: Abyssal obsidian bedrock wall
-        { dOff: 12.20, yOff: -12.4, mode: 'abs', r: 0.42, g: 0.13, b: 0.05 }, // 9: Glowing underworld magma fissure bed
-        { dOff: 15.50, yOff: -6.80, mode: 'abs', r: 0.24, g: 0.22, b: 0.26 }, // 10: Outer canyon cliff base
-        { dOff: 22.00, yOff:  2.80, mode: 'abs', r: 0.48, g: 0.34, b: 0.23 }  // 11: Outer terraced badlands mesa rim
-    ];
-
-    const numRings = profileRings.length;
-    const perimCount = wallSteps * 4; // 352 points around the 4 sides of the square map perimeter
-
-    // Helper: maps perimeter index (0 .. perimCount-1) to exact (x, z) on the [-halfMap, halfMap] square
-    const getPerimPoint = (idx) => {
-        const wIdx = ((idx % perimCount) + perimCount) % perimCount;
-        const side = Math.floor(wIdx / wallSteps);
-        const t = (wIdx % wallSteps) / wallSteps; // 0 .. 1 along current side
-        const span = (t - 0.5) * (halfMap * 2.0);
-        if (side === 0) return { x: span, z: -halfMap, nx: 0, nz: -1 }; // North edge
-        if (side === 1) return { x: halfMap, z: span, nx: 1, nz: 0 };   // East edge
-        if (side === 2) return { x: -span, z: halfMap, nx: 0, nz: 1 };  // South edge
-        return { x: -halfMap, z: -span, nx: -1, nz: 0 };                // West edge
-    };
-
-    const cutawayPositions = new Float32Array(perimCount * numRings * 3);
-    const cutawayColors = new Float32Array(perimCount * numRings * 3);
-    const cutawayIndices = [];
-
-    for (let i = 0; i < perimCount; i++) {
-        const pt = getPerimPoint(i);
-        const edgeH = getTerrainHeight(
-            THREE.MathUtils.clamp(pt.x, -halfMap + 0.2, halfMap - 0.2),
-            THREE.MathUtils.clamp(pt.z, -halfMap + 0.2, halfMap - 0.2)
-        );
-        // Scale outward direction at corners so square perimeter expands uniformly into outer square rings
-        const absMax = Math.max(Math.abs(pt.x), Math.abs(pt.z)) || halfMap;
-        const dirX = pt.x / absMax;
-        const dirZ = pt.z / absMax;
-
-        const geolNoise = Math.sin(pt.x * 0.09 + MAP_SEED) * Math.cos(pt.z * 0.09) * 0.45
-                        + Math.sin((pt.x + pt.z) * 0.22) * 0.22;
-
-        for (let r = 0; r < numRings; r++) {
-            const ring = profileRings[r];
-            const vIdx = (i * numRings + r) * 3;
-            const wx = pt.x + dirX * ring.dOff;
-            const wz = pt.z + dirZ * ring.dOff;
-
-            let wy;
-            if (r === 0) {
-                // Strictly lock ring 0 to the exact terrain edge height so zero gap can ever appear!
-                wy = edgeH - 0.04;
-            } else if (ring.mode === 'rel') {
-                wy = edgeH + ring.yOff + geolNoise * (r >= 3 ? 0.65 : 0.22);
-            } else {
-                const mesaWave = (r === numRings - 1)
-                    ? (Math.sin(wx * 0.045 + MAP_SEED) * Math.cos(wz * 0.045) * 3.2 + Math.abs(Math.sin(wx * 0.08 - wz * 0.07)) * 2.4)
-                    : (geolNoise * 0.5);
-                wy = ring.yOff + mesaWave;
-            }
-
-            cutawayPositions[vIdx]     = wx;
-            cutawayPositions[vIdx + 1] = wy;
-            cutawayPositions[vIdx + 2] = wz;
-
-            // Varied Terraria-style stratum shading (mineral veins, fossil flecks & glowing magma cracks)
-            let cr = ring.r;
-            let cg = ring.g;
-            let cb = ring.b;
-            const stratumVar = 0.90 + 0.18 * Math.sin(pt.x * 0.18 + r * 1.7) * Math.cos(pt.z * 0.18 - r * 1.3);
-            cr *= stratumVar;
-            cg *= stratumVar;
-            cb *= stratumVar;
-
-            // Subterranean Crystal & Ore Vein highlights in the Cavern Slate layer (rings 5..7)
-            if (r === 6 || r === 7) {
-                const veinPulse = Math.sin(pt.x * 0.35 + pt.z * 0.35 + MAP_SEED * 2.0);
-                if (veinPulse > 0.72) {
-                    // Glowing Khaydarin Cyan / Amethyst Geode seam in the rock wall
-                    const isAmethyst = ((i >> 2) % 2 === 0);
-                    cr = isAmethyst ? 0.68 : 0.12;
-                    cg = isAmethyst ? 0.22 : 0.78;
-                    cb = isAmethyst ? 0.88 : 0.95;
-                }
-            }
-            // Underworld Magma Fissure glow at ring 9
-            if (r === 9) {
-                const lavaPulse = 0.5 + 0.5 * Math.sin(pt.x * 0.24 - pt.z * 0.24 + MAP_SEED);
-                cr = 0.55 + lavaPulse * 0.42;
-                cg = 0.14 + lavaPulse * 0.24;
-                cb = 0.04;
-            }
-
-            cutawayColors[vIdx]     = THREE.MathUtils.clamp(cr, 0, 1);
-            cutawayColors[vIdx + 1] = THREE.MathUtils.clamp(cg, 0, 1);
-            cutawayColors[vIdx + 2] = THREE.MathUtils.clamp(cb, 0, 1);
-        }
-
-        const nextI = (i + 1) % perimCount;
-        for (let r = 0; r < numRings - 1; r++) {
-            const a = i * numRings + r;
-            const b = nextI * numRings + r;
-            const c = nextI * numRings + (r + 1);
-            const d = i * numRings + (r + 1);
-            cutawayIndices.push(a, b, d, b, c, d);
-        }
-    }
-
-    const cutawayGeo = new THREE.BufferGeometry();
-    cutawayGeo.setAttribute('position', new THREE.BufferAttribute(cutawayPositions, 3));
-    cutawayGeo.setAttribute('color', new THREE.BufferAttribute(cutawayColors, 3));
-    cutawayGeo.setIndex(cutawayIndices);
-    cutawayGeo.computeVertexNormals();
-
-    const cutawayMat = new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        roughness: 0.84,
-        metalness: 0.12,
-        flatShading: true,
-        side: THREE.DoubleSide
-    });
-    if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.applyBuildingShader === 'function') {
-        SHADER_ENGINE.applyBuildingShader(cutawayMat);
-    }
-    const cutawayMesh = new THREE.Mesh(cutawayGeo, cutawayMat);
-    cutawayMesh.receiveShadow = true;
-    addMapMesh(cutawayMesh);
-
-    // 2. Populate 3D Terraria-Style Subterranean Features embedded into the Cutaway Wall:
-    //    - Glowing Subterranean Khaydarin & Amethyst Crystal Geode Clusters
-    //    - Exposed Gold/Cobalt Ore Boulders & Fossilized Rib Arches
-    //    - Underworld Magma Lava Pools & Basalt Pillars in the Abyssal Trench
-    //    - Sculpted Outer Badlands Sandstone Mesas & Spires
-    const strataPropsGroup = new THREE.Group();
-    const crystalCyanMat = new THREE.MeshStandardMaterial({
-        color: 0x00f0ff,
-        emissive: 0x00a8cc,
-        emissiveIntensity: 0.95,
-        roughness: 0.12,
-        metalness: 0.70,
-        flatShading: true
-    });
-    const crystalVioletMat = new THREE.MeshStandardMaterial({
-        color: 0xe040fb,
-        emissive: 0x9c27b0,
-        emissiveIntensity: 0.95,
-        roughness: 0.12,
-        metalness: 0.70,
-        flatShading: true
-    });
-    const goldOreMat = new THREE.MeshStandardMaterial({
-        color: 0xfbbf24,
-        emissive: 0xb45309,
-        emissiveIntensity: 0.45,
-        roughness: 0.30,
-        metalness: 0.85,
-        flatShading: true
-    });
-    const magmaGlowMat = new THREE.MeshBasicMaterial({ color: 0xff5500 });
-    const sandstoneMesaMat = new THREE.MeshStandardMaterial({
-        color: 0x8c583a,
-        roughness: 0.90,
-        metalness: 0.06,
-        flatShading: true
-    });
-    const slateBoulderMat = new THREE.MeshStandardMaterial({
-        color: 0x262f3d,
-        roughness: 0.86,
-        metalness: 0.18,
-        flatShading: true
-    });
-
-    const shardGeo = createSculptedOgiveSpireGeo(0.42, 1.85, 6);
-    const oreNodeGeo = createOrganicBoulderGeo(0.68, 1);
-    const mesaRockGeo = createOrganicBoulderGeo(3.2, 1);
-    const magmaPoolGeo = createSculptedArmorDomeGeo(1.65, 10, 6);
-    magmaPoolGeo.scale(1.8, 0.12, 0.95);
-
-    for (let i = 0; i < perimCount; i += 3) {
-        const pt = getPerimPoint(i);
-        const edgeH = getTerrainHeight(
-            THREE.MathUtils.clamp(pt.x, -halfMap + 0.2, halfMap - 0.2),
-            THREE.MathUtils.clamp(pt.z, -halfMap + 0.2, halfMap - 0.2)
-        );
-        const absMax = Math.max(Math.abs(pt.x), Math.abs(pt.z)) || halfMap;
-        const dirX = pt.x / absMax;
-        const dirZ = pt.z / absMax;
-        const wallYaw = Math.atan2(pt.nx, pt.nz);
-
-        // A. Embedded Subterranean Crystal Geodes & Gold Ore Clusters in the Cavern Slate Stratum (dOff ~ 5.6m, y ~ edgeH - 6.8m)
-        if (i % 6 === 0) {
-            const isCyan = (i % 12 === 0);
-            const cMat = isCyan ? crystalCyanMat : crystalVioletMat;
-            const gx = pt.x + dirX * 5.4;
-            const gz = pt.z + dirZ * 5.4;
-            const gy = edgeH - 6.6 + Math.sin(i * 1.7) * 0.6;
-
-            const geodeCluster = new THREE.Group();
-            geodeCluster.position.set(gx, gy, gz);
-            geodeCluster.rotation.y = wallYaw;
-
-            for (let s = 0; s < 3; s++) {
-                const crystal = new THREE.Mesh(shardGeo, cMat);
-                crystal.scale.set(0.75 + s * 0.2, 0.85 + (s % 2) * 0.35, 0.75 + s * 0.2);
-                crystal.position.set((s - 1) * 0.55, (s % 2) * 0.25, 0.2);
-                crystal.rotation.x = 0.65 + s * 0.18;
-                crystal.rotation.z = (s - 1) * 0.38;
-                geodeCluster.add(crystal);
-            }
-            const hostRock = new THREE.Mesh(oreNodeGeo, slateBoulderMat);
-            hostRock.scale.set(1.5, 0.9, 0.9);
-            geodeCluster.add(hostRock);
-            strataPropsGroup.add(geodeCluster);
-        } else if (i % 9 === 0) {
-            // Subterranean Gold Ore Vein Cluster in the Sandstone/Shale Shelf (dOff ~ 4.1m, y ~ edgeH - 4.3m)
-            const ox = pt.x + dirX * 4.1;
-            const oz = pt.z + dirZ * 4.1;
-            const oy = edgeH - 4.3;
-            const oreBld = new THREE.Mesh(oreNodeGeo, slateBoulderMat);
-            oreBld.scale.set(1.4, 0.85, 1.1);
-            oreBld.position.set(ox, oy, oz);
-            strataPropsGroup.add(oreBld);
-
-            for (let g = 0; g < 2; g++) {
-                const nugget = new THREE.Mesh(oreNodeGeo, goldOreMat);
-                nugget.scale.set(0.55, 0.45, 0.55);
-                nugget.position.set(ox + (g - 0.5) * 0.55, oy + 0.22, oz + dirZ * 0.25);
-                strataPropsGroup.add(nugget);
-            }
-        }
-
-        // B. Glowing Underworld Magma Pools in the Abyssal Trench (dOff ~ 10.6m, y = -12.3m)
-        if (i % 9 === 0) {
-            const mx = pt.x + dirX * 10.6;
-            const mz = pt.z + dirZ * 10.6;
-            const magmaPool = new THREE.Mesh(magmaPoolGeo, magmaGlowMat);
-            magmaPool.position.set(mx, -12.28, mz);
-            magmaPool.rotation.y = wallYaw + Math.PI * 0.5;
-            strataPropsGroup.add(magmaPool);
-        }
-
-        // C. Sculpted Outer Badlands Terraced Mesas & Canyon Spires (dOff ~ 21m .. 34m)
-        if (i % 6 === 3) {
-            const bx = pt.x + dirX * (23.5 + (i % 5) * 2.2);
-            const bz = pt.z + dirZ * (23.5 + (i % 5) * 2.2);
-            const mesa = new THREE.Mesh(mesaRockGeo, (i % 12 === 3) ? sandstoneMesaMat : rockMat);
-            const hScale = 1.15 + (i % 4) * 0.45;
-            mesa.scale.set(1.85, hScale, 1.55);
-            mesa.position.set(bx, 1.8 + hScale * 1.1, bz);
-            mesa.rotation.y = i * 0.7;
-            strataPropsGroup.add(mesa);
-        }
-    }
-    addMapMesh(strataPropsGroup);
-
-    // 3. Outer Horizon Badlands Skirt (Starts cleanly outside ±130m so it NEVER intersects the playable map or subterranean trench!)
+    const halfMap = MAP_SIZE * 0.5; // 110.0m exact playable terrain boundary
     const skirtSize = 1100;
-    const skirtGeo = new THREE.PlaneGeometry(skirtSize, skirtSize, 76, 76);
+    const skirtGeo = new THREE.PlaneGeometry(skirtSize, skirtSize, 96, 96);
     skirtGeo.rotateX(-Math.PI / 2);
     const sPos = skirtGeo.attributes.position;
     const sColors = new Float32Array(sPos.count * 3);
-    const outerRimStart = halfMap + 21.0; // 131.0m
 
     for (let i = 0; i < sPos.count; i++) {
         const vx = sPos.getX(i);
         const vz = sPos.getZ(i);
         const maxCoord = Math.max(Math.abs(vx), Math.abs(vz));
-        let vy = -18.5;
 
-        if (maxCoord < outerRimStart - 4.0) {
-            // Keep strictly below the -12.4m subterranean magma trench so it never pokes through!
-            vy = -19.5;
+        // Sample nearest edge elevation so the outer badlands skirt meets the terrain border seamlessly with zero wall or cliff drop
+        const clampedX = THREE.MathUtils.clamp(vx, -halfMap + 0.25, halfMap - 0.25);
+        const clampedZ = THREE.MathUtils.clamp(vz, -halfMap + 0.25, halfMap - 0.25);
+        const edgeH = getTerrainHeight(clampedX, clampedZ);
+
+        let vy;
+        if (maxCoord < halfMap - 1.5) {
+            // Keep interior skirt vertices safely tucked underneath the playable terrain mesh
+            vy = edgeH - 4.5;
         } else {
-            const outDist = Math.max(0.0, maxCoord - outerRimStart);
-            const ridgeWave = Math.sin(vx * 0.032 + MAP_SEED) * Math.cos(vz * 0.032) * 5.2
-                            + Math.sin(vx * 0.014 - vz * 0.016) * 7.4;
-            const blendIn = Math.min(1.0, outDist / 18.0);
-            const outerBadlandsH = 2.6 + ridgeWave * 0.72;
-            vy = THREE.MathUtils.lerp(1.8, outerBadlandsH, blendIn);
+            const outDist = Math.max(0.0, maxCoord - (halfMap - 1.5));
+            const smoothBlend = THREE.MathUtils.smoothstep(outDist, 0.0, 42.0);
+            const rollingHills = Math.sin(vx * 0.024 + MAP_SEED) * Math.cos(vz * 0.024) * 3.8
+                               + Math.sin(vx * 0.011 - vz * 0.013) * 5.2;
+            const gentleFalloff = -Math.min(6.5, outDist * 0.018);
+            const naturalHorizonH = edgeH * (1.0 - smoothBlend * 0.65) + (rollingHills + gentleFalloff) * smoothBlend;
+            vy = THREE.MathUtils.lerp(edgeH - 0.05, naturalHorizonH, Math.min(1.0, outDist / 4.5));
         }
         sPos.setY(i, vy);
 
-        // Stratified Badlands Sandstone & Desert Ochre vertex palette
-        const band = 0.5 + 0.5 * Math.sin(vy * 0.85 + vx * 0.02);
-        const shade = 0.28 + 0.10 * Math.sin(vx * 0.04) * Math.cos(vz * 0.04);
-        sColors[i * 3]     = shade * (1.18 + band * 0.28);
-        sColors[i * 3 + 1] = shade * (0.92 + band * 0.14);
-        sColors[i * 3 + 2] = shade * (0.72 + band * 0.06);
+        // Natural meadow-to-badlands transition palette that blends into distance fog without artificial barriers
+        const outDistColor = Math.max(0.0, maxCoord - halfMap);
+        const desertMix = THREE.MathUtils.smoothstep(outDistColor, 0.0, 55.0);
+        const band = 0.5 + 0.5 * Math.sin(vy * 0.55 + vx * 0.018);
+        const shade = 0.28 + 0.08 * Math.sin(vx * 0.035) * Math.cos(vz * 0.035);
+
+        const edgeR = 0.26, edgeG = 0.35, edgeB = 0.22;
+        const badR = shade * (1.08 + band * 0.22);
+        const badG = shade * (0.88 + band * 0.14);
+        const badB = shade * (0.68 + band * 0.08);
+
+        sColors[i * 3]     = THREE.MathUtils.lerp(edgeR, badR, desertMix);
+        sColors[i * 3 + 1] = THREE.MathUtils.lerp(edgeG, badG, desertMix);
+        sColors[i * 3 + 2] = THREE.MathUtils.lerp(edgeB, badB, desertMix);
     }
     skirtGeo.setAttribute('color', new THREE.BufferAttribute(sColors, 3));
     skirtGeo.computeVertexNormals();
@@ -9006,67 +8824,56 @@ function createOutOfBoundsFloorSkirt() {
     const skirtMat = new THREE.MeshStandardMaterial({
         vertexColors: true,
         map: terrainDetailTex,
-        roughness: 0.88,
-        metalness: 0.05
+        roughness: 0.90,
+        metalness: 0.04
     });
-    if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.applyBuildingShader === 'function') {
-        SHADER_ENGINE.applyBuildingShader(skirtMat);
+    if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.applyTerrainShader === 'function') {
+        SHADER_ENGINE.applyTerrainShader(skirtMat, false);
     }
     const skirtMesh = new THREE.Mesh(skirtGeo, skirtMat);
     skirtMesh.receiveShadow = true;
     addMapMesh(skirtMesh);
 
-    // 4. Physical & Visual Out-of-Bounds Map Perimeter Barrier Ring at ±106.5m
-    const borderGroup = new THREE.Group();
+    // Scatter a few natural low rocks & desert boulders beyond the playable border (no fences, walls, or pylons)
+    const naturalOutcropGroup = new THREE.Group();
+    const outcropGeo = createOrganicBoulderGeo(2.4, 1);
     const borderLimit = 106.5;
-    const pylonMat = MAT.darkSteel || new THREE.MeshStandardMaterial({ color: 0x2c3540, roughness: 0.55, metalness: 0.65 });
-    const railMat = MAT.hazard || new THREE.MeshStandardMaterial({ color: 0xd97706, roughness: 0.5, metalness: 0.4 });
-    const pylonGeo = createSculptedLatheBarrelGeo(0.34, 0.52, 2.65, 8);
-    const capGeo = createSculptedArmorDomeGeo(0.22, 8, 8);
-    const beamGeo = createExtrudedArmorHullGeo(0.32, 0.36, 13.5, 0.03, 0.06);
-    const rockGeo = createOrganicBoulderGeo(2.2, 1);
 
-    const placeBorderPost = (bx, bz, yaw, idx) => {
-        const by = getTerrainHeight(bx, bz);
-        const post = new THREE.Mesh(pylonGeo, pylonMat);
-        post.position.set(bx, by + 1.25, bz);
-        borderGroup.add(post);
-
-        const beacon = new THREE.Mesh(capGeo, idx % 2 === 0 ? MAT.amberGlow : MAT.cyanGlow);
-        beacon.position.set(bx, by + 2.68, bz);
-        borderGroup.add(beacon);
-
-        const rail = new THREE.Mesh(beamGeo, idx % 3 === 0 ? railMat : pylonMat);
-        rail.position.set(bx, by + 1.05, bz);
-        rail.rotation.y = yaw;
-        borderGroup.add(rail);
-
-        if (idx % 2 === 1) {
-            const cliff = new THREE.Mesh(rockGeo, rockMat);
-            cliff.scale.set(1.6, 1.15, 1.3);
-            cliff.position.set(bx * 1.012, by + 0.55, bz * 1.012);
-            cliff.rotation.y = yaw + 0.4;
-            borderGroup.add(cliff);
-        }
-
-        obstacles.push({
-            x: bx,
-            z: bz,
-            r: 2.4,
-            footprintR: 3.4,
-            isBarrier: true,
-            type: 'map_boundary_barrier'
-        });
-    };
-
-    let bIdx = 0;
     for (let c = -96; c <= 96; c += 16) {
-        placeBorderPost(c, -borderLimit, Math.PI * 0.5, bIdx++);
-        placeBorderPost(c, borderLimit, Math.PI * 0.5, bIdx++);
-        placeBorderPost(-borderLimit, c, 0, bIdx++);
-        placeBorderPost(borderLimit, c, 0, bIdx++);
+        // Invisible gameplay boundary blockers at ±106.5m so units & buildings stay inside the playable map
+        const registerInvisibleBoundary = (bx, bz) => {
+            obstacles.push({
+                x: bx,
+                z: bz,
+                r: 2.4,
+                footprintR: 3.4,
+                isBarrier: true,
+                type: 'map_boundary_barrier'
+            });
+        };
+        registerInvisibleBoundary(c, -borderLimit);
+        registerInvisibleBoundary(c, borderLimit);
+        registerInvisibleBoundary(-borderLimit, c);
+        registerInvisibleBoundary(borderLimit, c);
+
+        // Occasional natural boulder clusters far outside the playable area (±124m..±145m)
+        if (Math.abs(c) % 32 === 0) {
+            const outDist = halfMap + 16.0 + (Math.abs(c) % 15);
+            const placeNaturalBoulder = (rx, rz, seedIdx) => {
+                const bMesh = new THREE.Mesh(outcropGeo, rockMat);
+                const s = 1.1 + (seedIdx % 3) * 0.45;
+                bMesh.scale.set(s * 1.3, s * 0.75, s);
+                bMesh.position.set(rx, getTerrainHeight(THREE.MathUtils.clamp(rx, -halfMap + 1, halfMap - 1), THREE.MathUtils.clamp(rz, -halfMap + 1, halfMap - 1)) - 0.4, rz);
+                bMesh.rotation.y = seedIdx * 1.1;
+                naturalOutcropGroup.add(bMesh);
+            };
+            placeNaturalBoulder(c, -outDist, c + 1);
+            placeNaturalBoulder(c, outDist, c + 2);
+            placeNaturalBoulder(-outDist, c, c + 3);
+            placeNaturalBoulder(outDist, c, c + 4);
+        }
     }
-    addMapMesh(borderGroup);
+    addMapMesh(naturalOutcropGroup);
 }
 
 // Mine Gems Crater Site: Redesigned with Chunky Multi-Faceted Bipyramidal Diamond-Cut Geode Crystals & Progressive Real-Time Depletion!

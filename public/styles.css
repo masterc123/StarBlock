@@ -1477,11 +1477,24 @@ body {
     color: #040810;
 }
 
+/* Hide gameplay HUD overlays while Main Menu Cinematic or Loading Screen is active */
+#game-container.cinematic-overlay-active #sc2-top-hud,
+#game-container.cinematic-overlay-active #sc2-console,
+#game-container.cinematic-overlay-active #minimap-wing,
+#game-container.cinematic-overlay-active #floating-ui-restore-bar,
+#game-container.cinematic-overlay-active #mobile-hint,
+#game-container.cinematic-overlay-active #world-ui,
+#game-container.cinematic-overlay-active #red-border-glow-frame,
+#game-container.cinematic-overlay-active #cursor-tag {
+    display: none !important;
+}
+
 /* Automatic clean mobile defaults so UI never overwhelms small viewports */
 @media (max-width: 768px) {
     .desktop-only-hud-btn,
     .res-item-secondary,
     #sc2-objective-pill,
+    #sc2-axis-ball-widget,
     #mobile-hint,
     #red-border-glow-frame {
         display: none !important;

@@ -1522,9 +1522,7 @@ const zergBioShaderMat = new THREE.ShaderMaterial({
             float v1 = abs(sin(vPos.x * 12.0 + uTime * 3.1) * cos(vPos.y * 12.0 - uTime * 2.4));
             float v2 = abs(sin(vPos.z * 9.5 - uTime * 2.8));
             float veinMask = smoothstep(0.46, 0.86, v1 * 0.75 + v2 * 0.25);
-            vec3 veinMix = mix(uPulseColor, uVeinColor, 0.5 + 0.5 * sin(uTime * 3.5 + vPos.y * 4.0));
-            vec3 col = mix(uBaseColor * sunDiff, veinMix * (0.55 + 0.45 * sunDiff), clamp(veinMask * 0.58 + rim * 0.35, 0.0, 0.85));
-            col *= clamp(0.38 + 0.62 * uSunLightFactor, 0.30, 1.05);
+            float fowIntensity = 0.0;
             if (uHasFow > 0.5 && uTitleScreen < 0.5) {
                 vec2 fowUv = vec2((vWorldPos.x / uMapSize) + 0.5, 0.5 - (vWorldPos.z / uMapSize));
                 if (fowUv.x >= 0.0 && fowUv.x <= 1.0 && fowUv.y >= 0.0 && fowUv.y <= 1.0) {
@@ -1534,13 +1532,22 @@ const zergBioShaderMat = new THREE.ShaderMaterial({
                              + texture2D(uFowMap, fowUv - vec2(tStep.x, 0.0)).a * 0.15
                              + texture2D(uFowMap, fowUv + vec2(0.0, tStep.y)).a * 0.15
                              + texture2D(uFowMap, fowUv - vec2(0.0, tStep.y)).a * 0.15;
-                    float fowIntensity = smoothstep(0.03, 0.96, fA);
-                    float luma = dot(col, vec3(0.299, 0.587, 0.114));
-                    vec3 exploredCol = mix(col, vec3(luma) * vec3(0.48, 0.58, 0.78), 0.72) * 0.34;
-                    vec3 unexploredCol = mix(exploredCol * 0.18, vec3(0.018, 0.030, 0.052), 0.82);
-                    vec3 targetFow = mix(exploredCol, unexploredCol, smoothstep(0.42, 0.88, fowIntensity));
-                    col = mix(col, targetFow, clamp(fowIntensity * 0.96, 0.0, 0.96));
+                    fowIntensity = smoothstep(0.03, 0.96, fA);
                 }
+            }
+            // Suppress bioluminescent veins & rim glow inside Fog of War so Zerg structures never self-illuminate in fog
+            float activeVis = 1.0 - smoothstep(0.08, 0.65, fowIntensity);
+            veinMask *= activeVis;
+            rim *= activeVis;
+            vec3 veinMix = mix(uPulseColor, uVeinColor, 0.5 + 0.5 * sin(uTime * 3.5 + vPos.y * 4.0));
+            vec3 col = mix(uBaseColor * sunDiff, veinMix * (0.55 + 0.45 * sunDiff), clamp(veinMask * 0.58 + rim * 0.35, 0.0, 0.85));
+            col *= clamp(0.38 + 0.62 * uSunLightFactor, 0.30, 1.05);
+            if (fowIntensity > 0.001) {
+                float luma = dot(col, vec3(0.299, 0.587, 0.114));
+                vec3 exploredCol = mix(col, vec3(luma) * vec3(0.42, 0.52, 0.70), 0.78) * 0.28;
+                vec3 unexploredCol = vec3(0.012, 0.020, 0.036);
+                vec3 targetFow = mix(exploredCol, unexploredCol, smoothstep(0.40, 0.84, fowIntensity));
+                col = mix(col, targetFow, clamp(fowIntensity * 0.98, 0.0, 0.98));
             }
             gl_FragColor = vec4(col, 1.0);
         }
@@ -2224,30 +2231,37 @@ const SHADER_ENGINE = {
             ).replace(
                 '#include <roughnessmap_fragment>',
                 `#include <roughnessmap_fragment>
+                float creepFowVis = 1.0;
+                if (uHasFow > 0.5 && uTitleScreen < 0.5) {
+                    vec2 rFowUv = vec2((vCustomWorldPos.x / uMapSize) + 0.5, 0.5 - (vCustomWorldPos.z / uMapSize));
+                    if (rFowUv.x >= 0.0 && rFowUv.x <= 1.0 && rFowUv.y >= 0.0 && rFowUv.y <= 1.0) {
+                        creepFowVis = 1.0 - smoothstep(0.10, 0.75, texture2D(uFowMap, rFowUv).a);
+                    }
+                }
                 if (uIsRoad > 0.5) {
-                    roughnessFactor = mix(0.92, 0.28, creepWetnessBoost * 0.75);
+                    roughnessFactor = mix(0.92, 0.28, creepWetnessBoost * creepFowVis * 0.75);
                 } else {
                     roughnessFactor = mix(roughnessFactor, 0.34, uWetness * 0.55);
                     if (creepWetnessBoost > 0.01) {
-                        roughnessFactor = mix(roughnessFactor, 0.18, creepWetnessBoost * 0.85);
+                        roughnessFactor = mix(0.92, 0.18, creepWetnessBoost * creepFowVis * 0.85);
                     }
                 }`
             ).replace(
                 '#include <emissivemap_fragment>',
                 `#include <emissivemap_fragment>
                 totalEmissiveRadiance *= clamp(0.45 + 0.55 * uSunLightFactor, 0.38, 1.0);
-                if (uHasFow > 0.5 && uTitleScreen < 0.5 && uIsBuilding < 0.5) {
+                if (uHasFow > 0.5 && uTitleScreen < 0.5) {
                     vec2 eFowUv = vec2((vCustomWorldPos.x / uMapSize) + 0.5, 0.5 - (vCustomWorldPos.z / uMapSize));
                     if (eFowUv.x >= 0.0 && eFowUv.x <= 1.0 && eFowUv.y >= 0.0 && eFowUv.y <= 1.0) {
                         float eFa = texture2D(uFowMap, eFowUv).a;
-                        totalEmissiveRadiance *= (1.0 - smoothstep(0.05, 0.85, eFa) * 0.88);
+                        totalEmissiveRadiance *= (1.0 - smoothstep(0.05, 0.75, eFa) * 0.96);
                     }
                 }`
             ).replace(
                 '#include <dithering_fragment>',
                 `#include <dithering_fragment>
-                // 6. Texture-Preserving Fog of War Intensity Shader (Never blackens unit/building materials in 3D Portrait Viewer or active combat!)
-                if (uHasFow > 0.5 && uTitleScreen < 0.5 && uIsBuilding < 0.5) {
+                // 6. Texture-Preserving Fog of War Intensity Shader (Applies to terrain, Zerg creep, and structures; bypassed in 3D Portrait Viewer via setPortraitRenderPass)
+                if (uHasFow > 0.5 && uTitleScreen < 0.5) {
                     vec2 fowUv = vec2((vCustomWorldPos.x / uMapSize) + 0.5, 0.5 - (vCustomWorldPos.z / uMapSize));
                     if (fowUv.x >= 0.0 && fowUv.x <= 1.0 && fowUv.y >= 0.0 && fowUv.y <= 1.0) {
                         vec2 tStep = vec2(1.25 / 160.0);
@@ -2259,23 +2273,36 @@ const SHADER_ENGINE = {
                         float fowIntensity = smoothstep(0.03, 0.97, fA);
                         float texLuma = dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114));
                         vec3 moonlitTex = mix(gl_FragColor.rgb, vec3(texLuma) * vec3(0.55, 0.68, 0.86), 0.65);
-                        vec3 exploredBlend = moonlitTex * 0.46;
-                        vec3 unexploredBlend = mix(moonlitTex * 0.24, vec3(0.04, 0.06, 0.10), 0.68);
-                        vec3 targetFowCol = mix(exploredBlend, unexploredBlend, smoothstep(0.40, 0.88, fowIntensity));
+                        vec3 exploredBlend = moonlitTex * (uIsBuilding > 0.5 ? 0.38 : 0.44);
+                        vec3 unexploredBlend = mix(moonlitTex * 0.10, vec3(0.018, 0.028, 0.048), 0.88);
+                        vec3 targetFowCol = mix(exploredBlend, unexploredBlend, smoothstep(0.40, 0.86, fowIntensity));
                         float visionEdge = 4.0 * fowIntensity * (1.0 - fowIntensity);
                         targetFowCol += vec3(0.025, 0.055, 0.10) * visionEdge * (0.4 + 0.6 * texLuma);
-                        gl_FragColor.rgb = mix(gl_FragColor.rgb, targetFowCol, clamp(fowIntensity * 0.88, 0.0, 0.88));
+                        gl_FragColor.rgb = mix(gl_FragColor.rgb, targetFowCol, clamp(fowIntensity * 0.94, 0.0, 0.94));
                     }
                 }`
             );
         };
         material.needsUpdate = true;
     },
+    _savedTitleFlag: 0.0,
+    setPortraitRenderPass(active) {
+        if (active) {
+            this._savedTitleFlag = _sharedTitleFlag.value;
+            _sharedTitleFlag.value = 1.0;
+            this.terrainUniforms.uTitleScreen.value = 1.0;
+        } else {
+            const restored = (window.titleScreenActive || window.loadingCameraSweep) ? 1.0 : (this._savedTitleFlag || 0.0);
+            _sharedTitleFlag.value = restored;
+            this.terrainUniforms.uTitleScreen.value = restored;
+        }
+    },
     update(timeSec, dt = 0.016) {
         plasmaShaderMat.uniforms.uTime.value = timeSec;
         zergBioShaderMat.uniforms.uTime.value = timeSec;
         waterShaderMat.uniforms.uTime.value = timeSec;
         const isTitle = (window.titleScreenActive || window.loadingCameraSweep) ? 1.0 : 0.0;
+        this._savedTitleFlag = isTitle;
         _sharedTitleFlag.value = isTitle;
         waterShaderMat.uniforms.uTitleScreen.value = isTitle;
         shieldHexShaderMat.uniforms.uTime.value = timeSec;

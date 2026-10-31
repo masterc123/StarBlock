@@ -210,7 +210,9 @@ export default function App() {
   const [mapArchetypeDisplay, setMapArchetypeDisplay] = useState<string>(() => window.MAP_ARCHETYPE || 'open_badlands');
   const [bridgeCountDisplay, setBridgeCountDisplay] = useState<number>(() => (window.BRIDGES ? window.BRIDGES.length : 0));
   const [loadingStage, setLoadingStage] = useState<number>(0);
-  const [loadingStatusText, setLoadingStatusText] = useState<string>('Initializing WebGL Renderer & Tactical Camera Rig...');
+  const [loadingStatusText, setLoadingStatusText] = useState<string>('Preparing terrain, factions and battlefield systems.');
+  const [loadingError, setLoadingError] = useState<string | null>(null);
+  const [loadingRetryCount, setLoadingRetryCount] = useState<number>(0);
   const [cinematicState, setCinematicState] = useState<{
     stageIndex: number;
     totalStages: number;
@@ -429,7 +431,7 @@ export default function App() {
     setPhase('loading_match');
   }, [selectedLobby, myPlayerId, myPlayerName, commanderProfile.preferredFaction, penaltyUntil]);
 
-  // Real 10-Stage World Initialization & Readiness Verification Pipeline
+  // Real 10-Stage World Initialization & Readiness Verification Pipeline (Driven by actual engine completion, no fake timers)
   useEffect(() => {
     if (phase !== 'loading_match') {
       window.loadingCameraSweep = false;
@@ -439,6 +441,7 @@ export default function App() {
     if (initRunningRef.current) return;
     initRunningRef.current = true;
     window.loadingCameraSweep = true;
+    setLoadingError(null);
 
     let cancelled = false;
     const allyBots = isMultiplayerMatch && selectedLobby ? selectedLobby.players.filter(p => p.isAi && p.team === 1) : [];
@@ -455,79 +458,58 @@ export default function App() {
     };
 
     const runRealInitialization = async () => {
-      const fallbackStageNames = [
-        'WebGL Renderer & Tactical Camera Rig Verified',
-        'Procedural Canyon & Bridges Synthesized',
-        'A* Navigation Grid & Bridge Waypoints Calibrated',
-        'Mineral Clusters & Rich Gem Craters Active',
-        '3-Faction Procedural 3D Meshes & Shaders Compiled',
-        'Zerg Overmind Hive Cluster Online',
-        'Solaris Protoss Enclave & Warp Matrix Synchronized',
-        'Orbital Command HQ & Faction Harvester Drones Deployed',
-        'Fog of War Vision Matrix & Tactical Radar Ready',
-        'All Combat Systems Nominal — Entering Sector-09'
-      ];
+      try {
+        setLoadingStage(0);
+        setLoadingStatusText('Preparing terrain, factions and battlefield systems.');
 
-      for (let step = 0; step < 10; step++) {
-        if (cancelled) return;
-        setLoadingStage(step + 1);
-        setLoadingStatusText(fallbackStageNames[step]);
+        for (let step = 0; step < 10; step++) {
+          if (cancelled) return;
 
-        // Wait one animation frame so the browser paints the updated progress bar and runs 3D frame ticks
-        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
-        await new Promise<void>(resolve => window.setTimeout(resolve, 140));
-        if (cancelled) return;
+          // Yield one animation frame so WebGL and the progress bar render smoothly between real subsystem tasks
+          await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+          if (cancelled) return;
 
-        try {
           if (window.GAME_API?.runInitializationStep) {
             const res = await window.GAME_API.runInitializationStep(step, missionConfig);
-            if (res && res.stage) {
-              setLoadingStatusText(res.stage);
+            if (res && res.ok === false) {
+              throw new Error(res.stage || `Initialization step ${step + 1} failed verification.`);
             }
           } else if (step === 9 && window.GAME_API?.startMission) {
             window.GAME_API.startMission(missionConfig);
           }
-        } catch (err) {
-          console.warn(`[WorldInit] Step ${step + 1} recovered from warning:`, err);
+
+          setLoadingStage(step + 1);
+
+          if (step === 1 || step === 3) {
+            setMapSeedDisplay(window.MAP_SEED || mapSeedDisplay);
+            setMapArchetypeDisplay(window.MAP_ARCHETYPE || 'open_badlands');
+            setBridgeCountDisplay(window.BRIDGES ? window.BRIDGES.length : 0);
+          }
+          if (step === 8 && isMultiplayerMatch && socketRef.current && socketRef.current.readyState === WebSocket.OPEN && selectedLobby) {
+            socketRef.current.send(JSON.stringify({ type: 'c:start_game', clientKey: clientKeyRef.current }));
+          }
         }
 
-        if (step === 1 || step === 3) {
-          setMapSeedDisplay(window.MAP_SEED || mapSeedDisplay);
-          setMapArchetypeDisplay(window.MAP_ARCHETYPE || 'open_badlands');
-          setBridgeCountDisplay(window.BRIDGES ? window.BRIDGES.length : 0);
+        if (!cancelled) {
+          window.loadingCameraSweep = false;
+          initRunningRef.current = false;
+          setPhase('playing');
         }
-        if (step === 8 && isMultiplayerMatch && socketRef.current && socketRef.current.readyState === WebSocket.OPEN && selectedLobby) {
-          socketRef.current.send(JSON.stringify({ type: 'c:start_game', clientKey: clientKeyRef.current }));
+      } catch (err: any) {
+        if (!cancelled) {
+          initRunningRef.current = false;
+          setLoadingError(err?.message || 'Failed to initialize battlefield systems.');
         }
-      }
-
-      if (!cancelled) {
-        window.loadingCameraSweep = false;
-        initRunningRef.current = false;
-        setPhase('playing');
       }
     };
-
-    // Safety timeout in case WebGL tab is backgrounded
-    const safetyTimer = window.setTimeout(() => {
-      if (!cancelled && phaseRef.current === 'loading_match') {
-        if (window.GAME_API?.startMission) {
-          window.GAME_API.startMission(missionConfig);
-        }
-        window.loadingCameraSweep = false;
-        initRunningRef.current = false;
-        setPhase('playing');
-      }
-    }, 8500);
 
     runRealInitialization();
 
     return () => {
       cancelled = true;
       initRunningRef.current = false;
-      clearTimeout(safetyTimer);
     };
-  }, [phase, isMultiplayerMatch, selectedLobby, lobbyMinerals, lobbyAiAllyMode, lobbyBotDiff, mapSeedDisplay]);
+  }, [phase, isMultiplayerMatch, selectedLobby, lobbyMinerals, lobbyAiAllyMode, lobbyBotDiff, mapSeedDisplay, loadingRetryCount]);
 
   // Establish Real WebSocket connection to backend server (/ws) + Ping & Anti-Cheat Heartbeat Loops
   useEffect(() => {
@@ -1500,56 +1482,48 @@ export default function App() {
       )}
 
       {/* =========================================================================
-          STARCRAFT II DOMINION MAIN MENU (CAMPAIGN / MULTIPLAYER / PROFILE)
+          COMPACT MAIN MENU OVERLAY OVER LIVE 3D BATTLEFIELD CINEMATIC
           ========================================================================= */}
       {phase === 'menu' && (
-        <div className="fixed inset-0 flex flex-col items-center justify-between py-3 sm:py-6 px-3 sm:px-4 pointer-events-auto overflow-y-auto bg-[radial-gradient(ellipse_at_center,rgba(6,14,24,0.45)_0%,rgba(3,7,12,0.92)_100%)] backdrop-blur-[2px]">
-          {/* Top Status Strip + Commander Profile Dossier Pill */}
-          <div className="w-full max-w-4xl flex flex-wrap items-center justify-between gap-2 px-3 sm:px-4 py-2 bg-[#060c14]/90 border border-[#223852] text-[10px] sm:text-[11px] font-mono shrink-0">
-            <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full shrink-0 bg-[#00ff66] animate-pulse"></span>
-              <span className="text-[#00e5ff] font-bold tracking-wider sm:tracking-widest uppercase truncate">
-                {commanderProfile.callsign} &middot; {commanderProfile.rank}
-              </span>
-            </div>
-            <div className="flex items-center gap-3 text-[#89a8cb]">
-              <button
-                onClick={() => setShowProfileModal(true)}
-                className="px-2 py-0.5 bg-[#0e2238] hover:bg-[#00e5ff] text-[#00e5ff] hover:text-[#040810] border border-[#00e5ff]/60 font-bold uppercase cursor-pointer transition-colors"
-              >
-                ★ COMMANDER PROFILE
-              </button>
-              <span className="text-[#00ff66]">SEED #{mapSeedDisplay}</span>
-            </div>
+        <div className="fixed inset-0 pointer-events-none flex flex-col justify-between p-4 sm:p-7">
+          {/* Top-Right Minimal Skip Button */}
+          <div className="flex justify-end pointer-events-auto">
+            <button
+              type="button"
+              onClick={handleStartCampaignGame}
+              className="px-3 py-1 bg-[#060d17]/75 hover:bg-[#00e5ff] text-[#93b4d4] hover:text-[#040810] border border-[#2b4463] hover:border-[#00e5ff] text-[10px] font-mono font-bold tracking-widest uppercase transition-colors cursor-pointer backdrop-blur-sm"
+            >
+              SKIP &raquo;
+            </button>
           </div>
 
-          {/* Center Main Menu Card */}
-          <div className="flex flex-col items-center max-w-xl w-full text-center my-auto p-4 sm:p-8 bg-[#060d17]/90 border-2 border-[#2b4463] shadow-[0_0_50px_rgba(0,229,255,0.18)] shrink-0">
-            {/* Terran Dominion Wing Emblem */}
-            <svg viewBox="0 0 120 120" className="w-14 h-14 sm:w-20 sm:h-20 mb-2 sm:mb-3 shrink-0" fill="none">
-              <circle cx="60" cy="60" r="54" stroke="#00e5ff" strokeWidth="2.5" strokeDasharray="10 5" />
-              <polygon points="60,10 106,34 92,86 60,108 28,86 14,34" fill="rgba(0, 229, 255, 0.14)" stroke="#00e5ff" strokeWidth="2.5" />
-              <polygon points="60,22 72,50 98,56 72,68 60,98 48,68 22,56 48,50" fill="#ffaa00" />
-              <circle cx="60" cy="58" r="7" fill="#040609" stroke="#00e5ff" strokeWidth="2" />
-            </svg>
+          {/* Lower-Left Compact Command Overlay (Leaves >85% of viewport open to 3D Battle Cinematic) */}
+          <div className="w-[84vw] max-w-[280px] sm:max-w-[310px] p-4 sm:p-5 bg-[#050b14]/82 border border-[#223852] shadow-[0_8px_32px_rgba(0,0,0,0.75)] backdrop-blur-md pointer-events-auto">
+            <div className="flex items-center gap-3 mb-4">
+              <svg viewBox="0 0 120 120" className="w-10 h-10 shrink-0" fill="none">
+                <circle cx="60" cy="60" r="54" stroke="#00e5ff" strokeWidth="2.5" strokeDasharray="10 5" />
+                <polygon points="60,10 106,34 92,86 60,108 28,86 14,34" fill="rgba(0, 229, 255, 0.14)" stroke="#00e5ff" strokeWidth="2.5" />
+                <polygon points="60,22 72,50 98,56 72,68 60,98 48,68 22,56 48,50" fill="#ffaa00" />
+                <circle cx="60" cy="58" r="7" fill="#040609" stroke="#00e5ff" strokeWidth="2" />
+              </svg>
+              <div className="min-w-0">
+                <h1 className="text-lg sm:text-xl font-black tracking-wider text-white leading-tight truncate">
+                  OUTPOST : SECTOR-09
+                </h1>
+                <p className="text-[9px] text-[#00e5ff] tracking-[0.18em] font-mono uppercase">
+                  Tactical RTS Command
+                </p>
+              </div>
+            </div>
 
-            <h1 className="text-2xl sm:text-5xl font-black tracking-widest text-white mb-1 drop-shadow-[0_4px_24px_rgba(0,229,255,0.45)]">
-              OUTPOST : SECTOR-09
-            </h1>
-            <p className="text-[10px] sm:text-xs text-[#00e5ff] tracking-[0.2em] sm:tracking-[0.3em] font-mono mb-4 sm:mb-6 uppercase">
-              Tactical Real-Time Base Building &amp; Combined Arms Command
-            </p>
-
-            {/* Menu Buttons */}
-            <div className="flex flex-col gap-2.5 sm:gap-3 w-full max-w-sm">
+            <div className="flex flex-col gap-2">
               <button
+                data-testid="launch-campaign-btn"
                 onClick={handleStartCampaignGame}
-                className="w-full py-3 sm:py-3.5 px-4 sm:px-6 bg-[#00e5ff] text-[#040810] font-black text-xs sm:text-sm tracking-widest uppercase hover:bg-[#38bdf8] border-2 border-[#bbf7ff] transition-all cursor-pointer shadow-[0_0_20px_rgba(0,229,255,0.5)] flex items-center justify-between"
+                className="w-full py-2.5 px-3.5 bg-[#00e5ff] text-[#040810] font-black text-xs tracking-widest uppercase hover:bg-[#38bdf8] border border-[#bbf7ff] transition-all cursor-pointer shadow-[0_0_16px_rgba(0,229,255,0.35)] flex items-center justify-between"
               >
-                <span>CAMPAIGN // SINGLE PLAYER</span>
-                <span className="text-[10px] sm:text-xs font-mono font-normal">
-                  DEPLOY [SOLO]
-                </span>
+                <span>CAMPAIGN</span>
+                <span className="text-[10px] font-mono font-bold">SINGLE PLAYER</span>
               </button>
 
               <button
@@ -1560,26 +1534,10 @@ export default function App() {
                     socketRef.current.send(JSON.stringify({ type: 'c:get_lobbies', clientKey: clientKeyRef.current }));
                   }
                 }}
-                className="w-full py-2.5 sm:py-3 px-4 sm:px-6 bg-[#0d1c2e] hover:bg-[#132840] text-[#00e5ff] font-extrabold text-xs sm:text-sm tracking-widest uppercase border-2 border-[#2b4c73] hover:border-[#00e5ff] transition-all cursor-pointer flex items-center justify-between shadow-lg"
+                className="w-full py-2.5 px-3.5 bg-[#0d1c2e]/90 hover:bg-[#132840] text-[#00e5ff] font-extrabold text-xs tracking-widest uppercase border border-[#2b4c73] hover:border-[#00e5ff] transition-all cursor-pointer flex items-center justify-between"
               >
-                <span>MULTIPLAYER BATTLE.NET</span>
-                <span className="text-[10px] sm:text-xs font-mono text-[#00ff66]">LIVE ROOMS ({lobbies.length})</span>
-              </button>
-
-              <button
-                onClick={() => setShowProfileModal(true)}
-                className="w-full py-2.5 px-4 sm:px-6 bg-[#101d30] hover:bg-[#162944] text-[#ffaa00] font-bold text-xs tracking-wider uppercase border border-[#4a3b18] hover:border-[#ffaa00] transition-all cursor-pointer flex items-center justify-between"
-              >
-                <span>★ COMMANDER PROFILE DOSSIER</span>
-                <span className="font-mono text-[10px] text-[#facc15]">{commanderProfile.callsign} ({commanderProfile.wins}W)</span>
-              </button>
-
-              <button
-                onClick={() => handleRegenerateMap()}
-                className="w-full py-2.5 px-4 sm:px-6 bg-[#0a1929] hover:bg-[#112a45] text-[#6ee7b7] font-bold text-xs tracking-wider uppercase border border-[#1f4d42] hover:border-[#00ff66] transition-all cursor-pointer flex items-center justify-between"
-              >
-                <span>⟳ REGENERATE PROCEDURAL MAP</span>
-                <span className="font-mono text-[10px] text-[#00e5ff]">SEED #{mapSeedDisplay} ({bridgeCountDisplay} BRIDGES)</span>
+                <span>MULTIPLAYER</span>
+                <span className="text-[10px] font-mono text-[#00ff66]">LOBBIES</span>
               </button>
 
               <button
@@ -1588,51 +1546,15 @@ export default function App() {
                     window.SFX.muted = !window.SFX.muted;
                     window.SFX.playClick();
                   }
+                  if (typeof (window as any).toggleHudSettingsModal === 'function') {
+                    (window as any).toggleHudSettingsModal();
+                  }
                 }}
-                className="w-full py-2 sm:py-2.5 px-4 sm:px-6 bg-[#091320] hover:bg-[#0e1d30] text-[#93b4d4] font-bold text-xs tracking-wider uppercase border border-[#233852] transition-all cursor-pointer flex items-center justify-between"
+                className="w-full py-2 px-3.5 bg-[#091320]/90 hover:bg-[#0e1d30] text-[#93b4d4] font-bold text-[11px] tracking-wider uppercase border border-[#233852] transition-all cursor-pointer flex items-center justify-between"
               >
-                <span>AUDIO / SOUND EFFECTS</span>
-                <span className="font-mono text-[10px]">{window.SFX?.muted ? 'MUTED' : 'ENABLED'}</span>
+                <span>SETTINGS / AUDIO</span>
+                <span className="font-mono text-[10px] text-[#00e5ff]">{window.SFX?.muted ? 'MUTED' : 'ACTIVE'}</span>
               </button>
-            </div>
-          </div>
-
-          {/* Bottom Live 3D Combat Cinematic Theatre Bar */}
-          <div className="w-full max-w-4xl flex flex-col gap-1.5 py-2 px-3 bg-[#060c14]/92 border border-[#1e3249] shrink-0">
-            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] sm:text-xs font-mono">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="px-1.5 py-0.5 bg-[#ffaa00]/20 border border-[#ffaa00] text-[#ffaa00] text-[9px] font-black uppercase shrink-0">
-                  🎬 STAGE {cinematicState.stageIndex + 1}/{cinematicState.totalStages}: {cinematicState.title}
-                </span>
-                <span className="text-[#93b7df] truncate">
-                  {cinematicState.subtitle}
-                </span>
-              </div>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => {
-                    window.GAME_API?.restartBattleCinematic?.();
-                    if (window.SFX) window.SFX.playClick();
-                  }}
-                  className="px-2 py-0.5 bg-[#0e2238] hover:bg-[#00e5ff] text-[#00e5ff] hover:text-[#040810] border border-[#00e5ff]/60 text-[9px] sm:text-[10px] font-bold uppercase cursor-pointer transition-colors"
-                >
-                  ⟳ REPLAY CINEMATIC
-                </button>
-                <button
-                  type="button"
-                  onClick={handleStartCampaignGame}
-                  className="px-2.5 py-0.5 bg-[#00ff66] hover:bg-[#00e5ff] text-[#040810] text-[9px] sm:text-[10px] font-black uppercase cursor-pointer"
-                >
-                  ⚡ SKIP TO DEPLOY
-                </button>
-              </div>
-            </div>
-            <div className="w-full h-1 bg-[#03070c] overflow-hidden">
-              <div
-                className="h-full bg-gradient-to-r from-[#ffaa00] via-[#00e5ff] to-[#00ff66] transition-all duration-300"
-                style={{ width: `${Math.round((cinematicState.progress || 0) * 100)}%` }}
-              />
             </div>
           </div>
         </div>
@@ -2352,177 +2274,48 @@ export default function App() {
       )}
 
       {/* =========================================================================
-          LIVE 3D MAP LAYOUT GENERATING VIEWPORT + COMMANDER PROFILES (NO INFO CHECKLIST)
+          CLEAN CINEMATIC LOADING SCREEN (REAL PROGRESS ONLY)
           ========================================================================= */}
       {phase === 'loading_match' && (
-        <div className="fixed inset-0 flex flex-col justify-between p-2.5 sm:p-5 pointer-events-auto z-50 bg-transparent">
-          {/* Top Bar: 3D Procedural Map Layout Telemetry + Progress */}
-          <div className="w-full max-w-6xl mx-auto p-3 sm:p-4 bg-[#050c17]/88 border-2 border-[#00e5ff] shadow-[0_0_35px_rgba(0,229,255,0.3)] backdrop-blur-sm">
-            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-              <div className="flex items-center gap-3">
-                <div className="px-2 py-1 bg-[#00e5ff]/20 border border-[#00e5ff] text-[#00e5ff] text-[10px] sm:text-xs font-mono font-black uppercase animate-pulse">
-                  3D SECTOR LAYOUT GENERATING LIVE
-                </div>
-                <div>
-                  <h2 className="text-sm sm:text-lg font-black tracking-widest text-white uppercase">
-                    SECTOR-09 // SEED #{mapSeedDisplay} &middot; {mapArchetypeDisplay.replace(/_/g, ' ').toUpperCase()}
-                  </h2>
-                  <p className="text-[10px] sm:text-xs font-mono text-[#7dd3fc]">
-                    {bridgeCountDisplay} BRIDGES &middot; {(window.BASE_TERRAIN_ZONES || []).length} FACTION BASES &amp; STEPPED RAMPS &middot; {(window.GEM_CRATERS || []).length} MINE GEM CRATERS &middot; CARVED TRENCHES &amp; AIRBASE
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => handleRegenerateMap(selectedLobby?.players)}
-                  className="px-2.5 py-1 bg-[#0d2238] hover:bg-[#00e5ff] text-[#00e5ff] hover:text-[#040810] border border-[#00e5ff] text-[10px] font-mono font-bold uppercase cursor-pointer"
-                >
-                  ⟳ RE-ROLL 3D MAP
-                </button>
-                <span className="px-2.5 py-1 bg-[#00ff66]/20 border border-[#00ff66] text-[#00ff66] text-[10px] sm:text-xs font-mono font-bold uppercase">
-                  {Math.min(100, loadingStage * 10)}% VERIFIED ({loadingStage}/10)
-                </span>
-              </div>
+        <div className="fixed inset-0 flex flex-col items-center justify-end pb-8 sm:pb-12 px-4 pointer-events-auto z-50 bg-transparent">
+          <div className="w-full max-w-md p-4 sm:p-5 bg-[#050b14]/88 border border-[#1f3b5c] shadow-[0_8px_32px_rgba(0,0,0,0.8)] backdrop-blur-md text-center">
+            <div className="flex items-center justify-center gap-2.5 mb-2">
+              <svg viewBox="0 0 120 120" className="w-6 h-6 shrink-0" fill="none">
+                <circle cx="60" cy="60" r="54" stroke="#00e5ff" strokeWidth="3" />
+                <polygon points="60,22 72,50 98,56 72,68 60,98 48,68 22,56 48,50" fill="#ffaa00" />
+              </svg>
+              <span className="text-xs sm:text-sm font-black tracking-widest text-white uppercase">
+                GENERATING BATTLEFIELD...
+              </span>
             </div>
 
-            <div className="text-[10px] sm:text-xs font-mono text-[#00ff66] mb-1.5 flex items-center justify-between">
-              <span>✓ STAGE {loadingStage}/10: {loadingStatusText}</span>
-              <span className="text-[#7dd3fc]">{Math.min(100, loadingStage * 10)}%</span>
-            </div>
+            <p className="text-[11px] font-mono text-[#8fb2d6] mb-3">
+              {loadingError ? loadingError : 'Preparing terrain, factions and battlefield systems.'}
+            </p>
 
-            <div className="w-full h-2 bg-[#040810] border border-[#1f3b5c] overflow-hidden">
+            <div className="w-full h-2 bg-[#03070e] border border-[#1f3b5c] overflow-hidden mb-2">
               <div
-                className="h-full bg-gradient-to-r from-[#00e5ff] via-[#38bdf8] to-[#00ff66] transition-all duration-200"
+                className="h-full bg-gradient-to-r from-[#00e5ff] to-[#00ff66] transition-all duration-150"
                 style={{ width: `${Math.min(100, loadingStage * 10)}%` }}
               />
             </div>
-          </div>
 
-          {/* Center Open Viewport: Live 3D Camera Orbit + 3D Isometric Sector Layout Holo-Map */}
-          <div className="w-full max-w-6xl mx-auto flex-1 flex items-center justify-between pointer-events-none my-2">
-            <div className="hidden lg:flex flex-col gap-1.5 p-3 bg-[#050c17]/82 border border-[#00e5ff]/60 w-64 pointer-events-auto backdrop-blur-sm">
-              <div className="text-[10px] font-mono font-bold text-[#00e5ff] uppercase border-b border-[#1c3554] pb-1">
-                3D TOPOGRAPHY &amp; RAMP LAYOUT
+            {loadingError ? (
+              <div className="flex items-center justify-center gap-3 mt-2">
+                <button
+                  type="button"
+                  onClick={() => setLoadingRetryCount(c => c + 1)}
+                  className="px-4 py-1.5 bg-[#00e5ff] text-[#040810] text-xs font-mono font-black uppercase cursor-pointer"
+                >
+                  RETRY
+                </button>
               </div>
-              {(window.BASE_TERRAIN_ZONES || []).slice(0, 6).map((z: any, i: number) => (
-                <div key={i} className="flex items-center justify-between text-[10px] font-mono py-0.5 border-b border-[#122438]">
-                  <span className="text-white truncate">{z.label || `Base #${i + 1}`}</span>
-                  <span className="text-[#00ff66] uppercase">{String(z.rampType || 'dual_stepped').replace(/_/g, ' ')}</span>
-                </div>
-              ))}
-              <div className="text-[9px] font-mono text-[#ffaa00] pt-1">
-                ◆ {(window.GEM_CRATERS || []).length} Gem Craters (Drill for Troops/Builds)
+            ) : (
+              <div className="flex items-center justify-between text-[10px] font-mono text-[#6488ad]">
+                <span>TIP: Build Mine Drills on Gem Craters for high-yield resources.</span>
+                <span className="text-[#00e5ff] font-bold">{Math.min(100, loadingStage * 10)}%</span>
               </div>
-            </div>
-
-            {/* Right 3D Isometric Holo-Projection Mini-Layout */}
-            <div className="ml-auto p-2.5 bg-[#050c17]/85 border border-[#00e5ff]/70 pointer-events-auto backdrop-blur-sm">
-              <div className="text-[9px] font-mono font-bold text-[#00e5ff] uppercase mb-1.5 text-center">
-                3D ISOMETRIC SECTOR HOLO-MAP
-              </div>
-              <div
-                className="w-36 h-36 sm:w-44 sm:h-44 bg-[#030812] border border-[#1d3f66] relative overflow-hidden"
-                style={{ transform: 'perspective(320px) rotateX(28deg) rotateZ(-8deg)' }}
-              >
-                <div className="absolute inset-0 bg-[linear-gradient(rgba(0,229,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(0,229,255,0.1)_1px,transparent_1px)] bg-[size:18px_18px]" />
-                {(window.BASE_TERRAIN_ZONES || []).map((z: any, i: number) => {
-                  const leftPct = Math.max(8, Math.min(92, ((z.x + 260) / 520) * 100));
-                  const topPct = Math.max(8, Math.min(92, ((z.z + 260) / 520) * 100));
-                  const color = z.faction === 'zerg' ? '#d946ef' : (z.faction === 'protoss' ? '#38bdf8' : '#00ff66');
-                  return (
-                    <div
-                      key={`bz_${i}`}
-                      className="absolute -translate-x-1/2 -translate-y-1/2 flex flex-col items-center"
-                      style={{ left: `${leftPct}%`, top: `${topPct}%` }}
-                    >
-                      <span
-                        className="w-3 h-3 rounded-full border border-white animate-ping absolute"
-                        style={{ backgroundColor: color }}
-                      />
-                      <span
-                        className="w-2.5 h-2.5 rounded-full border border-white relative z-10"
-                        style={{ backgroundColor: color }}
-                      />
-                    </div>
-                  );
-                })}
-                {(window.GEM_CRATERS || []).map((g: any, i: number) => {
-                  const leftPct = Math.max(8, Math.min(92, ((g.x + 260) / 520) * 100));
-                  const topPct = Math.max(8, Math.min(92, ((g.z + 260) / 520) * 100));
-                  return (
-                    <div
-                      key={`gc_${i}`}
-                      className="absolute w-2 h-2 rotate-45 bg-[#ffaa00] border border-white -translate-x-1/2 -translate-y-1/2"
-                      style={{ left: `${leftPct}%`, top: `${topPct}%` }}
-                      title="Gem Crater"
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          {/* Bottom Bar: Commander Profile Dossier Cards (Replaces Info Loading Checklist) */}
-          <div className="w-full max-w-6xl mx-auto p-3 sm:p-4 bg-[#050c17]/90 border-2 border-[#213c5c] shadow-2xl backdrop-blur-sm">
-            <div className="flex items-center justify-between border-b border-[#1b324d] pb-1.5 mb-2.5">
-              <span className="text-[10px] sm:text-xs font-mono font-bold text-[#ffaa00] uppercase tracking-wider">
-                ★ DEPLOYED COMMANDER PROFILES &amp; ASSIGNED SECTOR BASES
-              </span>
-              <span className="text-[10px] font-mono text-[#00e5ff]">
-                LIVE 3D TERRAIN CAMERA ACTIVE
-              </span>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 max-h-44 overflow-y-auto">
-              {/* Primary Human Commander Profile Card */}
-              <div className="flex items-center gap-2.5 p-2.5 bg-[#08182b] border border-[#00e5ff] shadow-[0_0_12px_rgba(0,229,255,0.2)]">
-                {renderCommanderEmblem(commanderProfile.emblem, '#00e5ff')}
-                <div className="min-w-0 flex-1 font-mono">
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-black text-white truncate">{commanderProfile.callsign}</span>
-                    <span className="px-1 bg-[#00e5ff] text-[#040810] text-[9px] font-bold">YOU</span>
-                  </div>
-                  <div className="text-[10px] text-[#00e5ff] truncate">{commanderProfile.rank}</div>
-                  <div className="text-[9px] text-[#8faecf] truncate">{commanderProfile.preferredFaction} &middot; {commanderProfile.wins}W-{commanderProfile.matches - commanderProfile.wins}L</div>
-                  <div className="text-[9px] text-[#00ff66] uppercase mt-0.5">BASE: DUAL STEPPED RAMP + 3 OPENINGS</div>
-                </div>
-              </div>
-
-              {/* Lobby AI & Multiplayer Commander Profile Cards (Multiplayer Only) */}
-              {isMultiplayerMatch && (selectedLobby?.players || [])
-                .filter(p => p.id !== myPlayerId && p.name !== myPlayerName)
-                .map((p, idx) => {
-                  const isZerg = String(p.faction).toLowerCase().includes('zerg');
-                  const isProtoss = String(p.faction).toLowerCase().includes('protoss');
-                  const borderColor = isZerg ? 'border-[#d946ef]/70 bg-[#1c091e]/90' : (isProtoss ? 'border-[#38bdf8]/70 bg-[#081c29]/90' : 'border-[#00ff66]/70 bg-[#082019]/90');
-                  const accentText = isZerg ? 'text-[#d946ef]' : (isProtoss ? 'text-[#38bdf8]' : 'text-[#00ff66]');
-                  const emblemType = isZerg ? 'zerg_brood' : (isProtoss ? 'solaris_crest' : 'dominion_eagle');
-                  const zoneInfo = (window.BASE_TERRAIN_ZONES || [])[idx + 2] || (window.BASE_TERRAIN_ZONES || [])[idx + 1];
-                  const rampLabel = zoneInfo?.rampType ? String(zoneInfo.rampType).replace(/_/g, ' ') : (idx % 2 === 0 ? 'MULTI OPENING RAMP' : 'UNDER RAMP CITADEL');
-                  return (
-                    <div key={p.id} className={`flex items-center gap-2.5 p-2.5 border ${borderColor}`}>
-                      {renderCommanderEmblem(emblemType, isZerg ? '#d946ef' : '#38bdf8')}
-                      <div className="min-w-0 flex-1 font-mono">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-xs font-bold text-white truncate">{p.name}</span>
-                          <span className="text-[9px] px-1 bg-white/10 text-white uppercase">
-                            {p.team === 1 ? 'ALLY' : (p.team === 2 ? 'ENEMY' : 'FFA')}
-                          </span>
-                        </div>
-                        <div className={`text-[10px] ${accentText} truncate`}>
-                          {p.isAi ? `${p.aiDifficulty || 'Hard'} AI Commander` : 'Field Commander'} &middot; {p.faction}
-                        </div>
-                        <div className="text-[9px] text-[#9ab4d2] truncate">
-                          Division: {isZerg ? 'Hive Brood Cluster' : (isProtoss ? 'Solaris Armada' : 'Dominion Taskforce')}
-                        </div>
-                        <div className="text-[9px] text-[#ffaa00] uppercase mt-0.5 truncate">
-                          BASE: {rampLabel}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-            </div>
+            )}
           </div>
         </div>
       )}
