@@ -443,21 +443,307 @@ scene.fog = new THREE.FogExp2(0x182838, 0.00042);
 const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1400);
 camera.position.set(22, 38, 56);
 
-const renderer = new THREE.WebGLRenderer({ antialias: !IS_MOBILE, powerPreference: 'high-performance' });
+const renderer = new THREE.WebGLRenderer({
+    antialias: !IS_MOBILE,
+    powerPreference: 'high-performance',
+    stencil: false
+});
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(IS_MOBILE ? 1.0 : Math.min(window.devicePixelRatio || 1, 1.5));
+const _initialMaxDpr = IS_MOBILE ? 1.15 : 1.5;
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, _initialMaxDpr));
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = IS_MOBILE ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.08;
 if (renderer.capabilities && renderer.capabilities.getMaxAnisotropy) {
-    const maxAniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+    const maxAniso = Math.min(IS_MOBILE ? 2 : 8, renderer.capabilities.getMaxAnisotropy());
     terrainDetailTex.anisotropy = maxAniso;
     terrainNormalTex.anisotropy = maxAniso;
     metalTex.anisotropy = maxAniso;
     metalNormalTex.anisotropy = maxAniso;
 }
 container.appendChild(renderer.domElement);
+
+// ============================================================================
+// ADAPTIVE PERFORMANCE QUALITY MANAGER & IN-GAME PERFORMANCE PROFILER
+// ============================================================================
+const PERF_QUALITY_PROFILES = {
+    high: {
+        name: 'High',
+        tierIndex: 0,
+        maxPixelRatio: IS_MOBILE ? 1.25 : 1.5,
+        shadowEnabled: true,
+        shadowMapSize: 1024,
+        shadowUpdateStride: 1,
+        maxParticles: 175,
+        maxSmokeClouds: 56,
+        maxShellCasings: 45,
+        maxCorpses: 32,
+        particleSpawnRateMult: 1.0,
+        thrusterIntervalScale: 1.0,
+        animCloseDistSq: 28 * 28,
+        animNormalDistSq: 56 * 56,
+        animFarDistSq: 92 * 92,
+        fowUpdateInterval: 0.18,
+        domProjectionStride: 1,
+        aiCloseStride: 1,
+        aiMidStride: 2,
+        aiFarStride: 4
+    },
+    balanced: {
+        name: 'Balanced',
+        tierIndex: 1,
+        maxPixelRatio: IS_MOBILE ? 1.15 : 1.35,
+        shadowEnabled: true,
+        shadowMapSize: 1024,
+        shadowUpdateStride: 2,
+        maxParticles: 125,
+        maxSmokeClouds: 40,
+        maxShellCasings: 28,
+        maxCorpses: 24,
+        particleSpawnRateMult: 0.75,
+        thrusterIntervalScale: 1.35,
+        animCloseDistSq: 24 * 24,
+        animNormalDistSq: 46 * 46,
+        animFarDistSq: 78 * 78,
+        fowUpdateInterval: 0.22,
+        domProjectionStride: 2,
+        aiCloseStride: 2,
+        aiMidStride: 3,
+        aiFarStride: 5
+    },
+    mobile: {
+        name: 'Mobile',
+        tierIndex: 2,
+        maxPixelRatio: 1.0,
+        shadowEnabled: true,
+        shadowMapSize: 512,
+        shadowUpdateStride: 3,
+        maxParticles: 80,
+        maxSmokeClouds: 24,
+        maxShellCasings: 16,
+        maxCorpses: 16,
+        particleSpawnRateMult: 0.50,
+        thrusterIntervalScale: 1.85,
+        animCloseDistSq: 18 * 18,
+        animNormalDistSq: 36 * 36,
+        animFarDistSq: 64 * 64,
+        fowUpdateInterval: 0.26,
+        domProjectionStride: 2,
+        aiCloseStride: 2,
+        aiMidStride: 4,
+        aiFarStride: 6
+    },
+    low: {
+        name: 'Low-end',
+        tierIndex: 3,
+        maxPixelRatio: 0.85,
+        shadowEnabled: false,
+        shadowMapSize: 512,
+        shadowUpdateStride: 4,
+        maxParticles: 48,
+        maxSmokeClouds: 14,
+        maxShellCasings: 8,
+        maxCorpses: 10,
+        particleSpawnRateMult: 0.30,
+        thrusterIntervalScale: 2.6,
+        animCloseDistSq: 14 * 14,
+        animNormalDistSq: 28 * 28,
+        animFarDistSq: 50 * 50,
+        fowUpdateInterval: 0.32,
+        domProjectionStride: 3,
+        aiCloseStride: 3,
+        aiMidStride: 5,
+        aiFarStride: 8
+    }
+};
+
+const _PERF_TIER_KEYS = ['high', 'balanced', 'mobile', 'low'];
+
+const PERF_MANAGER = {
+    profiles: PERF_QUALITY_PROFILES,
+    currentKey: IS_MOBILE ? 'mobile' : 'high',
+    current: IS_MOBILE ? PERF_QUALITY_PROFILES.mobile : PERF_QUALITY_PROFILES.high,
+    autoAdapt: true,
+    rollingFrameMs: 16.6,
+    rollingFps: 60.0,
+    cooldownSec: 0,
+    highLoadTimer: 0,
+    lowLoadTimer: 0,
+    frameCounter: 0,
+
+    applyProfile(key) {
+        if (!this.profiles[key]) return;
+        this.currentKey = key;
+        this.current = this.profiles[key];
+        const targetDpr = Math.min(window.devicePixelRatio || 1, this.current.maxPixelRatio);
+        if (Math.abs(renderer.getPixelRatio() - targetDpr) > 0.04) {
+            renderer.setPixelRatio(targetDpr);
+            renderer.setSize(window.innerWidth, window.innerHeight, false);
+        }
+        if (typeof dirLight !== 'undefined' && dirLight) {
+            if (dirLight.castShadow !== this.current.shadowEnabled) {
+                dirLight.castShadow = this.current.shadowEnabled;
+                renderer.shadowMap.needsUpdate = true;
+            }
+        }
+    },
+
+    update(rawFrameMs, dt, activeActorCount = 0) {
+        this.frameCounter = (this.frameCounter + 1) | 0;
+        const clampedMs = Math.max(4.0, Math.min(120.0, rawFrameMs));
+        this.rollingFrameMs = this.rollingFrameMs * 0.92 + clampedMs * 0.08;
+        this.rollingFps = 1000.0 / Math.max(1.0, this.rollingFrameMs);
+
+        // Adaptive shadow map update throttling on lower tiers so static terrain/structure shadows don't re-render every single frame
+        const stride = this.current.shadowUpdateStride || 1;
+        if (!this.current.shadowEnabled) {
+            renderer.shadowMap.autoUpdate = false;
+        } else if (stride <= 1) {
+            renderer.shadowMap.autoUpdate = true;
+        } else {
+            renderer.shadowMap.autoUpdate = false;
+            if ((this.frameCounter % stride) === 0) {
+                renderer.shadowMap.needsUpdate = true;
+            }
+        }
+
+        if (!this.autoAdapt) return;
+        if (this.cooldownSec > 0) {
+            this.cooldownSec = Math.max(0, this.cooldownSec - dt);
+            return;
+        }
+
+        // Hysteresis thresholds:
+        // Downgrade if rolling frame time > 23.5ms (< 42.5 FPS) for 1.6s (or > 29ms for 0.8s)
+        // Upgrade if rolling frame time < 14.2ms (> 70 FPS) for 4.5s and unit count allows
+        const idx = this.current.tierIndex;
+        if (this.rollingFrameMs > 23.5 || (activeActorCount > 180 && idx < 2 && this.rollingFrameMs > 19.5)) {
+            this.highLoadTimer += dt * (this.rollingFrameMs > 29.0 ? 2.0 : 1.0);
+            this.lowLoadTimer = 0;
+            if (this.highLoadTimer >= 1.6 && idx < _PERF_TIER_KEYS.length - 1) {
+                this.applyProfile(_PERF_TIER_KEYS[idx + 1]);
+                this.cooldownSec = 3.5;
+                this.highLoadTimer = 0;
+            }
+        } else if (this.rollingFrameMs < 14.2 && activeActorCount < 140) {
+            const minAllowedTier = IS_MOBILE ? 1 : 0;
+            this.lowLoadTimer += dt;
+            this.highLoadTimer = 0;
+            if (this.lowLoadTimer >= 4.5 && idx > minAllowedTier) {
+                this.applyProfile(_PERF_TIER_KEYS[idx - 1]);
+                this.cooldownSec = 4.5;
+                this.lowLoadTimer = 0;
+            }
+        } else {
+            this.highLoadTimer = Math.max(0, this.highLoadTimer - dt * 0.5);
+            this.lowLoadTimer = Math.max(0, this.lowLoadTimer - dt * 0.5);
+        }
+    }
+};
+window.PERF_MANAGER = PERF_MANAGER;
+
+const PERF_PROFILER = {
+    enabled: true,
+    overlayVisible: false,
+    overlayEl: null,
+    lastOverlayUpdateMs: 0,
+    sections: {
+        mainSimulation: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        alliedAI: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        enemyAI: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        targetAcquisition: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        groundNavigation: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        collisionResolution: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        airSeparation: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        unitAnimation: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        particleSimulation: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        fogOfWar: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        domHealthBars: { cur: 0, avg: 0, max: 0, _t0: 0 },
+        threeRender: { cur: 0, avg: 0, max: 0, _t0: 0 }
+    },
+    counts: {
+        alliedUnits: 0,
+        enemies: 0,
+        buildings: 0,
+        enemyBuildings: 0,
+        projectiles: 0,
+        particles: 0,
+        pooledParticles: 0,
+        smokeClouds: 0,
+        corpses: 0,
+        drawCalls: 0,
+        triangles: 0,
+        geometries: 0,
+        textures: 0
+    },
+    beginFrame() {
+        if (!this.enabled) return;
+        const s = this.sections;
+        s.targetAcquisition.cur = 0;
+        s.groundNavigation.cur = 0;
+        s.unitAnimation.cur = 0;
+        s.domHealthBars.cur = 0;
+    },
+    begin(name) {
+        if (!this.enabled) return;
+        const sec = this.sections[name];
+        if (sec) sec._t0 = performance.now();
+    },
+    end(name) {
+        if (!this.enabled) return;
+        const sec = this.sections[name];
+        if (!sec || sec._t0 <= 0) return;
+        const dtMs = performance.now() - sec._t0;
+        sec._t0 = 0;
+        sec.cur = dtMs;
+        sec.avg = sec.avg * 0.90 + dtMs * 0.10;
+        if (dtMs > sec.max) sec.max = dtMs;
+    },
+    addSample(name, dtMs) {
+        if (!this.enabled) return;
+        const sec = this.sections[name];
+        if (!sec) return;
+        sec.cur += dtMs;
+    },
+    endFrame() {
+        if (!this.enabled) return;
+        const s = this.sections;
+        ['targetAcquisition', 'groundNavigation', 'unitAnimation', 'domHealthBars'].forEach(k => {
+            const sec = s[k];
+            sec.avg = sec.avg * 0.90 + sec.cur * 0.10;
+            if (sec.cur > sec.max) sec.max = sec.cur;
+        });
+        if (renderer && renderer.info) {
+            this.counts.drawCalls = renderer.info.render ? renderer.info.render.calls : 0;
+            this.counts.triangles = renderer.info.render ? renderer.info.render.triangles : 0;
+            this.counts.geometries = renderer.info.memory ? renderer.info.memory.geometries : 0;
+            this.counts.textures = renderer.info.memory ? renderer.info.memory.textures : 0;
+        }
+    },
+    resetPeaks() {
+        for (const k in this.sections) {
+            this.sections[k].max = 0;
+        }
+    },
+    getSummary() {
+        const out = {
+            qualityTier: PERF_MANAGER.current.name,
+            fps: +PERF_MANAGER.rollingFps.toFixed(1),
+            frameMs: +PERF_MANAGER.rollingFrameMs.toFixed(2),
+            timingsMs: {},
+            counts: { ...this.counts }
+        };
+        for (const k in this.sections) {
+            out.timingsMs[k] = {
+                avg: +this.sections[k].avg.toFixed(3),
+                max: +this.sections[k].max.toFixed(3)
+            };
+        }
+        return out;
+    }
+};
+window.PERF_PROFILER = PERF_PROFILER;
 
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.target.set(18, 0, 22);
@@ -1027,8 +1313,11 @@ scene.add(hemiLight);
 const dirLight = new THREE.DirectionalLight(0xfff2de, 1.22);
 dirLight.position.set(58, 96, 48);
 dirLight.castShadow = true;
-dirLight.shadow.mapSize.width = 1024;
-dirLight.shadow.mapSize.height = 1024;
+const _initialShadowMapRes = (window.PERF_MANAGER && window.PERF_MANAGER.current)
+    ? window.PERF_MANAGER.current.shadowMapSize
+    : (IS_MOBILE ? 512 : 1024);
+dirLight.shadow.mapSize.width = _initialShadowMapRes;
+dirLight.shadow.mapSize.height = _initialShadowMapRes;
 const d = 88;
 dirLight.shadow.camera.left = -d; dirLight.shadow.camera.right = d;
 dirLight.shadow.camera.top = d; dirLight.shadow.camera.bottom = -d;
@@ -1273,6 +1562,7 @@ const waterShaderMat = new THREE.ShaderMaterial({
         uTitleScreen: _sharedTitleFlag
     },
     vertexShader: `
+        attribute vec3 color;
         uniform float uTime;
         uniform float uRainIntensity;
         uniform vec2 uFlowDir;
@@ -1282,10 +1572,15 @@ const waterShaderMat = new THREE.ShaderMaterial({
         varying vec2 vUv;
         varying vec3 vWorldPos;
         varying vec3 vViewDir;
+        varying vec3 vVertColor;
         varying float vWaveHeight;
         void main() {
             vUv = uv;
+            vVertColor = (dot(color, color) > 0.001) ? color : vec3(0.12, 0.36, 0.46);
             vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+            float edgeFactor = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)) * 2.0;
+            float shoreWaveMask = smoothstep(0.0, 0.26, edgeFactor);
+
             float flowPhase = dot(worldPosition.xz, uFlowDir) * 1.65 - uTime * 3.2;
             float h = sin(flowPhase) * cos(worldPosition.z * 1.4 - uTime * 2.1) * 0.055;
             h += sin(worldPosition.x * 3.2 - worldPosition.z * 2.8 + uTime * 4.1) * 0.028;
@@ -1302,6 +1597,8 @@ const waterShaderMat = new THREE.ShaderMaterial({
                 }
             }
 
+            // Attenuate vertical wave displacement at the shoreline so water edges stay welded to the riverbank
+            h *= shoreWaveMask;
             worldPosition.y += h;
             vWorldPos = worldPosition.xyz;
             vViewDir = normalize(cameraPosition - worldPosition.xyz);
@@ -1323,6 +1620,7 @@ const waterShaderMat = new THREE.ShaderMaterial({
         varying vec2 vUv;
         varying vec3 vWorldPos;
         varying vec3 vViewDir;
+        varying vec3 vVertColor;
         varying float vWaveHeight;
         void main() {
             float edgeFactor = min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y)) * 2.0;
@@ -1331,6 +1629,9 @@ const waterShaderMat = new THREE.ShaderMaterial({
             vec3 shallowCol = mix(vec3(0.08, 0.44, 0.54), vec3(0.24, 0.62, 0.32), uRainIntensity * 0.55);
             vec3 col = mix(deepCol, shallowCol, smoothstep(0.15, 0.92, radialDist));
 
+            // Blend with vertex-painted littoral/shoreline color so the water edge harmonizes with the riverbank soil
+            col = mix(col, vVertColor, smoothstep(0.45, 0.96, radialDist) * 0.65);
+
             // Dual scrolling directional river & pond caustic network
             vec2 flowUv1 = vWorldPos.xz * 0.42 - uFlowDir * (uTime * 0.65);
             vec2 flowUv2 = vWorldPos.xz * 0.68 + vec2(-uFlowDir.y, uFlowDir.x) * (uTime * 0.42);
@@ -1338,7 +1639,7 @@ const waterShaderMat = new THREE.ShaderMaterial({
             float c2 = sin(flowUv2.x * 9.5 - flowUv2.y * 7.5 + uTime * 3.1);
             float caustics = smoothstep(0.34, 0.86, abs(c1 * 0.65 + c2 * 0.45));
             vec3 causticTint = mix(vec3(0.20, 0.72, 0.88), vec3(0.52, 0.95, 0.28), uRainIntensity * 0.65);
-            col += causticTint * caustics * 0.30;
+            col += causticTint * caustics * 0.28 * (1.0 - smoothstep(0.75, 1.0, radialDist));
 
             // Acid raindrop micro-rings on water surface when raining
             if (uRainIntensity > 0.02) {
@@ -1377,11 +1678,13 @@ const waterShaderMat = new THREE.ShaderMaterial({
 
             float fresnel = pow(1.0 - max(0.0, dot(waterNormal, normalize(vViewDir))), 3.0);
             vec3 skyReflCol = mix(vec3(0.42, 0.68, 0.88), vec3(0.28, 0.46, 0.36), uRainIntensity * 0.6);
-            col = mix(col, skyReflCol, fresnel * 0.48);
-            col += vec3(1.0, 0.95, 0.82) * specGlint * 0.85;
+            col = mix(col, skyReflCol, fresnel * 0.48 * (1.0 - smoothstep(0.75, 1.0, radialDist)));
+            col += vec3(1.0, 0.95, 0.82) * specGlint * 0.85 * (1.0 - smoothstep(0.72, 1.0, radialDist));
 
-            float shoreFoam = smoothstep(0.82, 0.98, radialDist + 0.032 * sin(uTime * 3.0 + vWorldPos.x * 2.2));
-            col = mix(col, vec3(0.82, 0.94, 0.98), shoreFoam * 0.42);
+            // Soft animated shoreline foam band that blends into vertex-painted wet riverbank color at the outer edge
+            float waveMod = 0.025 * sin(uTime * 2.6 + vWorldPos.x * 1.9 - vWorldPos.z * 1.7);
+            float foamBand = smoothstep(0.74, 0.88, radialDist + waveMod) * (1.0 - smoothstep(0.90, 0.99, radialDist));
+            col = mix(col, mix(vec3(0.76, 0.90, 0.94), vVertColor * 1.25, 0.35), foamBand * 0.38);
 
             // Apply Fog of War Intensity Attenuation to Water so Rivers & Ponds match Terrain Shroud!
             if (uHasFow > 0.5 && uTitleScreen < 0.5) {
@@ -1403,7 +1706,9 @@ const waterShaderMat = new THREE.ShaderMaterial({
                 }
             }
 
-            gl_FragColor = vec4(col, 0.92);
+            // Soft shoreline alpha feathering prevents any sharp edge seam between the water plane and canyon floor
+            float shoreAlpha = smoothstep(0.0, 0.14, edgeFactor);
+            gl_FragColor = vec4(col, 0.92 * shoreAlpha);
         }
     `
 });
@@ -1791,10 +2096,10 @@ const SHADER_ENGINE = {
                 vec3 sunDirV = normalize(vec3(58.0, 96.0, 48.0));
                 float nDotL = max(0.0, dot(safeWNormal, sunDirV));
                 float hemiMix = safeWNormal.y * 0.5 + 0.5;
-                vec3 hemiCol = mix(vec3(0.54, 0.60, 0.68), vec3(0.92, 0.96, 1.0), hemiMix);
-                float aoHeight = uIsBuilding > 0.5 ? clamp(0.76 + customWp.y * 0.08, 0.76, 1.0) : 1.0;
-                float sunScale = clamp(uSunLightFactor, 0.35, 1.15);
-                vVertexLighting = clamp((hemiCol * (0.58 * sunScale) + vec3(0.42, 0.40, 0.38) * nDotL * sunScale) * aoHeight, vec3(0.32), vec3(1.0));`
+                vec3 hemiCol = mix(vec3(0.66, 0.72, 0.80), vec3(0.96, 0.98, 1.0), hemiMix);
+                float aoHeight = uIsBuilding > 0.5 ? clamp(0.86 + customWp.y * 0.08, 0.86, 1.0) : 1.0;
+                float sunScale = clamp(uSunLightFactor, 0.55, 1.15);
+                vVertexLighting = clamp((hemiCol * (0.68 * sunScale) + vec3(0.42, 0.40, 0.38) * nDotL * sunScale) * aoHeight, vec3(0.68), vec3(1.05));`
             );
 
             shader.fragmentShader = `
@@ -1830,12 +2135,12 @@ const SHADER_ENGINE = {
                     }
                 }
 
-                // 0. Apply Per-Vertex AO, Directional Sun & Day/Night Shading so structures react to night & shadow!
-                diffuseColor.rgb *= mix(vec3(1.0), vVertexLighting, uIsBuilding > 0.5 ? 0.58 : 0.32);
+                // 0. Apply Per-Vertex AO, Directional Sun & Day/Night Shading without over-darkening metallic Terran armor!
+                diffuseColor.rgb *= mix(vec3(1.0), vVertexLighting, uIsBuilding > 0.5 ? 0.18 : 0.26);
 
                 // 1. Subtle wind-swept cloud shadow & botanical meadow shimmer
-                float cloudWave = 0.92 + 0.06 * sin(vCustomWorldPos.x * 0.055 + uTime * 0.42) * cos(vCustomWorldPos.z * 0.055 - uTime * 0.31);
-                diffuseColor.rgb *= cloudWave;
+                float cloudWave = 0.95 + 0.05 * sin(vCustomWorldPos.x * 0.055 + uTime * 0.42) * cos(vCustomWorldPos.z * 0.055 - uTime * 0.31);
+                diffuseColor.rgb *= mix(1.0, cloudWave, 1.0 - uIsBuilding * 0.75);
 
                 // 2. Procedural tri-planar sedimentary rock strata + crevice ambient occlusion on steep canyon cliffs
                 float terrainOnly = clamp(1.0 - uIsRoad - uIsBuilding - uIsGrass, 0.0, 1.0);
@@ -1855,8 +2160,8 @@ const SHADER_ENGINE = {
 
                 // 3. Dynamic Acid Rain Wetness Sheen
                 if (uWetness > 0.01) {
-                    diffuseColor.rgb *= (1.0 - uWetness * 0.16);
-                    diffuseColor.rgb += vec3(0.01, 0.04, 0.01) * uAcidRain * uWetness * (1.0 - uIsRoad * 0.65 - uIsBuilding * 0.5);
+                    diffuseColor.rgb *= (1.0 - uWetness * (0.14 * (1.0 - uIsBuilding * 0.65)));
+                    diffuseColor.rgb += vec3(0.01, 0.04, 0.01) * uAcidRain * uWetness * (1.0 - uIsRoad * 0.65 - uIsBuilding * 0.75);
                 }
 
                 // 4. Micro-aggregate asphalt grain on roads
@@ -1869,9 +2174,9 @@ const SHADER_ENGINE = {
                     diffuseColor.rgb *= (0.95 + 0.05 * windGust);
                 }
 
-                // 5. Static, Non-Animated Wave-Like Goo Zerg Creep Zone Overlay (Compact Radius, 100% Hole-Free Floor + Semi-Textured Structure Creep!)
+                // 5. Static, Non-Animated Wave-Like Goo Zerg Creep Zone Overlay (Applied ONLY to terrain/roads, never tinting unit/building armor!)
                 float creepWetnessBoost = 0.0;
-                if (uCreepRadius > 0.5 && uIsGrass < 0.5 && vCustomWorldPos.y > -12.0) {
+                if (uCreepRadius > 0.5 && uIsGrass < 0.5 && uIsBuilding < 0.5 && vCustomWorldPos.y > -12.0) {
                     vec2 toPos = vCustomWorldPos.xz - uCreepCenter;
                     float dHive = length(toPos);
                     float ang = atan(toPos.y, toPos.x);
@@ -1884,7 +2189,6 @@ const SHADER_ENGINE = {
 
                     if (effDist < uCreepRadius + 2.0) {
                         vec2 baseCreepCoords = vCustomWorldPos.xz + vec2(vCustomWorldPos.y * 0.25, -vCustomWorldPos.y * 0.22);
-                        // Static domain-warped goo wave coordinates (strictly non-animated — zero uTime dependency!)
                         vec2 gooWarp = vec2(
                             sin(baseCreepCoords.y * 0.42 + cos(baseCreepCoords.x * 0.35)),
                             cos(baseCreepCoords.x * 0.42 - sin(baseCreepCoords.y * 0.35))
@@ -1895,7 +2199,6 @@ const SHADER_ENGINE = {
                         vec3 texSample2 = texture2D(uCreepTex, warpedCoords * 0.085 + vec2(0.37, 0.61)).rgb;
                         vec3 creepTexCol = mix(texSample1, texSample2, 0.52);
 
-                        // Static concentric + sinuous viscous goo wave ridges radiating from the Zerg Hive
                         float concentricWave = sin(dHive * 1.35 + sin(ang * 5.0 + dHive * 0.35) * 1.45 + gooWarp.x * 0.85);
                         float crossGooWave = cos(warpedCoords.x * 0.72 - sin(warpedCoords.y * 0.68) * 1.35);
                         float gooCrest = smoothstep(-0.55, 0.85, concentricWave * 0.58 + crossGooWave * 0.42);
@@ -1909,24 +2212,13 @@ const SHADER_ENGINE = {
                         vec3 organicCreep  = mix(baseBiomass, creepTexCol * vec3(1.18, 0.72, 1.32), 0.56)
                                            + vec3(0.28, 0.08, 0.38) * gooSpecularHighlight;
 
-                        if (uIsBuilding < 0.5) {
-                            // 100% solid interior floor coverage (zero holes) + static wave-like goo outer rim
-                            float solidInterior = smoothstep(uCreepRadius + 1.5, uCreepRadius - 1.4, effDist);
-                            float frontierRim = smoothstep(2.0, 0.0, abs(uCreepRadius - effDist - 0.30));
-                            organicCreep += vec3(0.42, 0.12, 0.54) * frontierRim * 0.34;
+                        float solidInterior = smoothstep(uCreepRadius + 1.5, uCreepRadius - 1.4, effDist);
+                        float frontierRim = smoothstep(2.0, 0.0, abs(uCreepRadius - effDist - 0.30));
+                        organicCreep += vec3(0.42, 0.12, 0.54) * frontierRim * 0.34;
 
-                            float creepOpacity = clamp(solidInterior, 0.0, 1.0);
-                            diffuseColor.rgb = mix(diffuseColor.rgb, organicCreep, creepOpacity);
-                            creepWetnessBoost = solidInterior * (0.78 + gooCrest * 0.20);
-                        } else if (vCustomWorldPos.y < 3.6) {
-                            // Semi-textured wave-goo creep bio-membrane wrapping around the base of terrain structures, rocks & cliffs
-                            float structRadial = smoothstep(uCreepRadius + 2.0, uCreepRadius - 1.8, effDist);
-                            float heightWrap = smoothstep(3.4, 0.15, max(0.0, vCustomWorldPos.y));
-                            float bioWaveWrap = 0.62 + 0.38 * gooCrest;
-                            float structCreepAlpha = clamp(structRadial * heightWrap * bioWaveWrap * 0.70, 0.0, 0.74);
-                            diffuseColor.rgb = mix(diffuseColor.rgb, organicCreep * 0.92, structCreepAlpha);
-                            creepWetnessBoost = structCreepAlpha * 0.78;
-                        }
+                        float creepOpacity = clamp(solidInterior, 0.0, 1.0);
+                        diffuseColor.rgb = mix(diffuseColor.rgb, organicCreep, creepOpacity);
+                        creepWetnessBoost = solidInterior * (0.78 + gooCrest * 0.20);
                     }
                 }`
             ).replace(
@@ -1943,20 +2235,19 @@ const SHADER_ENGINE = {
             ).replace(
                 '#include <emissivemap_fragment>',
                 `#include <emissivemap_fragment>
-                // Prevent structures from always glowing brightly at night or inside unexplored Fog of War!
-                totalEmissiveRadiance *= clamp(0.32 + 0.68 * uSunLightFactor, 0.28, 1.0);
-                if (uHasFow > 0.5 && uTitleScreen < 0.5) {
+                totalEmissiveRadiance *= clamp(0.45 + 0.55 * uSunLightFactor, 0.38, 1.0);
+                if (uHasFow > 0.5 && uTitleScreen < 0.5 && uIsBuilding < 0.5) {
                     vec2 eFowUv = vec2((vCustomWorldPos.x / uMapSize) + 0.5, 0.5 - (vCustomWorldPos.z / uMapSize));
                     if (eFowUv.x >= 0.0 && eFowUv.x <= 1.0 && eFowUv.y >= 0.0 && eFowUv.y <= 1.0) {
                         float eFa = texture2D(uFowMap, eFowUv).a;
-                        totalEmissiveRadiance *= (1.0 - smoothstep(0.05, 0.85, eFa) * 0.96);
+                        totalEmissiveRadiance *= (1.0 - smoothstep(0.05, 0.85, eFa) * 0.88);
                     }
                 }`
             ).replace(
                 '#include <dithering_fragment>',
                 `#include <dithering_fragment>
-                // 6. Texture-Preserving 9-Tap Fog of War Intensity Shader (Darkens terrain, roads, structures & Zerg infestations in FoW!)
-                if (uHasFow > 0.5 && uTitleScreen < 0.5) {
+                // 6. Texture-Preserving Fog of War Intensity Shader (Never blackens unit/building materials in 3D Portrait Viewer or active combat!)
+                if (uHasFow > 0.5 && uTitleScreen < 0.5 && uIsBuilding < 0.5) {
                     vec2 fowUv = vec2((vCustomWorldPos.x / uMapSize) + 0.5, 0.5 - (vCustomWorldPos.z / uMapSize));
                     if (fowUv.x >= 0.0 && fowUv.x <= 1.0 && fowUv.y >= 0.0 && fowUv.y <= 1.0) {
                         vec2 tStep = vec2(1.25 / 160.0);
@@ -1966,16 +2257,14 @@ const SHADER_ENGINE = {
                                  + texture2D(uFowMap, fowUv + vec2(0.0, tStep.y)).a * 0.15
                                  + texture2D(uFowMap, fowUv - vec2(0.0, tStep.y)).a * 0.15;
                         float fowIntensity = smoothstep(0.03, 0.97, fA);
-                        // Preserve underlying terrain/building texture detail via cool moonlight desaturation + organic contrast
                         float texLuma = dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114));
-                        vec3 moonlitTex = mix(gl_FragColor.rgb, vec3(texLuma) * vec3(0.48, 0.62, 0.82), 0.74);
-                        vec3 exploredBlend = moonlitTex * 0.36;
-                        vec3 unexploredBlend = mix(moonlitTex * 0.12, vec3(0.018, 0.030, 0.052), 0.78);
+                        vec3 moonlitTex = mix(gl_FragColor.rgb, vec3(texLuma) * vec3(0.55, 0.68, 0.86), 0.65);
+                        vec3 exploredBlend = moonlitTex * 0.46;
+                        vec3 unexploredBlend = mix(moonlitTex * 0.24, vec3(0.04, 0.06, 0.10), 0.68);
                         vec3 targetFowCol = mix(exploredBlend, unexploredBlend, smoothstep(0.40, 0.88, fowIntensity));
-                        // Subtle cyan-blue vision rim glow right at the FoW edge
                         float visionEdge = 4.0 * fowIntensity * (1.0 - fowIntensity);
                         targetFowCol += vec3(0.025, 0.055, 0.10) * visionEdge * (0.4 + 0.6 * texLuma);
-                        gl_FragColor.rgb = mix(gl_FragColor.rgb, targetFowCol, clamp(fowIntensity * 0.95, 0.0, 0.95));
+                        gl_FragColor.rgb = mix(gl_FragColor.rgb, targetFowCol, clamp(fowIntensity * 0.88, 0.0, 0.88));
                     }
                 }`
             );
@@ -1986,7 +2275,7 @@ const SHADER_ENGINE = {
         plasmaShaderMat.uniforms.uTime.value = timeSec;
         zergBioShaderMat.uniforms.uTime.value = timeSec;
         waterShaderMat.uniforms.uTime.value = timeSec;
-        const isTitle = window.titleScreenActive ? 1.0 : 0.0;
+        const isTitle = (window.titleScreenActive || window.loadingCameraSweep) ? 1.0 : 0.0;
         _sharedTitleFlag.value = isTitle;
         waterShaderMat.uniforms.uTitleScreen.value = isTitle;
         shieldHexShaderMat.uniforms.uTime.value = timeSec;
@@ -1995,7 +2284,7 @@ const SHADER_ENGINE = {
         this.terrainUniforms.uTime.value = timeSec;
         this.terrainUniforms.uTitleScreen.value = isTitle;
         if (typeof dirLight !== 'undefined' && dirLight) {
-            _sharedSunLightFactor.value = THREE.MathUtils.clamp(dirLight.intensity / 1.15, 0.28, 1.15);
+            _sharedSunLightFactor.value = THREE.MathUtils.clamp(dirLight.intensity / 1.15, 0.45, 1.15);
         }
 
         if (window.WEATHER_SYSTEM) {

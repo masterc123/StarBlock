@@ -341,6 +341,397 @@ function createBatWingMembraneGeo(span = 1.25, chord = 0.78) {
     return geo;
 }
 
+// ============================================================================
+// EXTENDED PROCEDURAL 3D MODELING TOOLKIT & ANATOMICAL HUMANOID GEOMETRY BUILDERS
+// ============================================================================
+const _ANATOMICAL_GEO_CACHE = new Map();
+function getCachedAnatomicalGeo(key, factoryFn) {
+    let geo = _ANATOMICAL_GEO_CACHE.get(key);
+    if (!geo) {
+        geo = factoryFn();
+        geo.userData = geo.userData || {};
+        geo.userData.isSharedAsset = true;
+        _ANATOMICAL_GEO_CACHE.set(key, geo);
+    }
+    return geo;
+}
+
+function createSegmentedChitinLimbGeo(length = 0.46, rStart = 0.078, rMid = 0.095, rEnd = 0.024, curveArch = 0.04, segs = 10) {
+    const key = `chitinLimb_${length.toFixed(3)}_${rStart.toFixed(3)}_${rMid.toFixed(3)}_${rEnd.toFixed(3)}_${curveArch.toFixed(3)}_${segs}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const radialSegs = 9;
+        const positions = [];
+        const uvs = [];
+        const indices = [];
+
+        for (let i = 0; i <= segs; i++) {
+            const t = i / segs;
+            const baseR = t < 0.42
+                ? THREE.MathUtils.lerp(rEnd, rMid, Math.sin((t / 0.42) * Math.PI * 0.5))
+                : THREE.MathUtils.lerp(rMid, rStart, Math.pow((t - 0.42) / 0.58, 1.15));
+            const plateRipple = 1.0 + Math.sin(t * Math.PI * 5.0) * 0.08 * (1.0 - t * 0.4);
+            // Centered along Y axis (-length/2 .. +length/2) so limb rotations align with Cylinder/Lathe limbs
+            const yCenter = (t - 0.5) * length;
+            const zArch = Math.sin(t * Math.PI) * curveArch;
+
+            for (let j = 0; j <= radialSegs; j++) {
+                const u = j / radialSegs;
+                const ang = u * Math.PI * 2;
+                const cosA = Math.cos(ang);
+                const sinA = Math.sin(ang);
+                const dorsalRidge = sinA > 0 ? Math.pow(sinA, 3) * 0.24 : -0.08 * Math.abs(sinA);
+                const rx = baseR * plateRipple * 0.86;
+                const rz = baseR * plateRipple * (1.08 + dorsalRidge);
+                positions.push(cosA * rx, yCenter, zArch + sinA * rz);
+                uvs.push(u, t);
+            }
+        }
+
+        for (let i = 0; i < segs; i++) {
+            for (let j = 0; j < radialSegs; j++) {
+                const a = i * (radialSegs + 1) + j;
+                const b = a + 1;
+                const c = (i + 1) * (radialSegs + 1) + j + 1;
+                const d = (i + 1) * (radialSegs + 1) + j;
+                indices.push(a, b, d, b, c, d);
+            }
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+function createSculptedMuscleMassGeo(rx = 0.36, ry = 0.30, rz = 0.52, striationCount = 8, asymmetry = 0.04) {
+    const key = `muscleMass_${rx.toFixed(3)}_${ry.toFixed(3)}_${rz.toFixed(3)}_${striationCount}_${asymmetry.toFixed(3)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const wSegs = 16;
+        const hSegs = 12;
+        const positions = [];
+        const uvs = [];
+        const indices = [];
+
+        for (let iy = 0; iy <= hSegs; iy++) {
+            const v = iy / hSegs;
+            const theta = v * Math.PI;
+            const sinT = Math.sin(theta);
+            const cosT = Math.cos(theta);
+            for (let ix = 0; ix <= wSegs; ix++) {
+                const u = ix / wSegs;
+                const phi = u * Math.PI * 2;
+                let x = -Math.cos(phi) * sinT;
+                let y = cosT;
+                let z = Math.sin(phi) * sinT;
+
+                const muscleBands = Math.sin((z * 0.85 + y * 0.35) * Math.PI * striationCount) * 0.065;
+                const tendonChannel = Math.cos(phi * 3.0 + z * 2.2) * 0.045 * sinT;
+                const asymShift = Math.sin(z * Math.PI * 1.5) * asymmetry;
+                const forwardChestBulk = 1.0 + Math.max(0, z) * 0.16 - Math.max(0, -z) * 0.14;
+
+                x = (x * rx * forwardChestBulk * (1.0 + muscleBands + tendonChannel)) + asymShift;
+                y = y * ry * (1.0 + muscleBands * 0.7) + Math.max(0, y) * 0.05;
+                z = z * rz;
+                positions.push(x, y, z);
+                uvs.push(u, 1 - v);
+            }
+        }
+
+        for (let iy = 0; iy < hSegs; iy++) {
+            for (let ix = 0; ix < wSegs; ix++) {
+                const a = iy * (wSegs + 1) + (ix + 1);
+                const b = iy * (wSegs + 1) + ix;
+                const c = (iy + 1) * (wSegs + 1) + ix;
+                const d = (iy + 1) * (wSegs + 1) + (ix + 1);
+                if (iy !== 0) indices.push(a, b, d);
+                if (iy !== hSegs - 1) indices.push(b, c, d);
+            }
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+function createCompoundArmorChestGeo(width = 0.36, height = 0.36, depth = 0.24, glacisSlope = 0.16, shoulderFlare = 0.18) {
+    const key = `compoundChest_${width.toFixed(3)}_${height.toFixed(3)}_${depth.toFixed(3)}_${glacisSlope.toFixed(2)}_${shoulderFlare.toFixed(2)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const geo = createExtrudedArmorHullGeo(width, height, depth, Math.min(width, height) * 0.08, Math.min(width, depth) * 0.22);
+        const pos = geo.attributes.position;
+        const halfH = height * 0.5;
+        for (let i = 0; i < pos.count; i++) {
+            let vx = pos.getX(i);
+            let vy = pos.getY(i);
+            let vz = pos.getZ(i);
+            const hNorm = THREE.MathUtils.clamp((vy + halfH) / Math.max(0.01, height), 0, 1);
+            // Taper waist (hNorm=0) and flare upper chest (hNorm=0.78), then narrow at neck (hNorm=1)
+            const chestCurve = hNorm < 0.82
+                ? THREE.MathUtils.lerp(0.72, 1.0 + shoulderFlare * 0.45, Math.sin((hNorm / 0.82) * Math.PI * 0.5))
+                : THREE.MathUtils.lerp(1.0 + shoulderFlare * 0.45, 0.76, (hNorm - 0.82) / 0.18);
+            vx *= chestCurve;
+            if (vz > 0) {
+                vz += Math.sin(hNorm * Math.PI) * glacisSlope * depth * 0.65;
+            } else {
+                vz *= 0.86 + hNorm * 0.14;
+            }
+            // Keep centered at y = 0 so callers setting .position.y do not double-offset
+            pos.setXYZ(i, vx, vy, vz);
+        }
+        pos.needsUpdate = true;
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+function createProtossArchBladeGeo(length = 0.65, width = 0.12, thickness = 0.04, curvature = 0.18) {
+    const key = `protossBlade_${length.toFixed(3)}_${width.toFixed(3)}_${thickness.toFixed(3)}_${curvature.toFixed(3)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const segs = 14;
+        const radial = 6;
+        const positions = [];
+        const uvs = [];
+        const indices = [];
+
+        for (let i = 0; i <= segs; i++) {
+            const t = i / segs;
+            const env = Math.sin(Math.pow(t, 0.72) * Math.PI);
+            const w = Math.max(0.008, width * (0.24 + 0.82 * env));
+            const th = Math.max(0.005, thickness * (0.22 + 0.80 * env));
+            // Centered along Y (-length/2 .. +length/2) so rotated blades attach cleanly at their mount point
+            const yCenter = (t - 0.5) * length;
+            const zCenter = Math.sin(t * Math.PI) * curvature * length;
+
+            for (let j = 0; j <= radial; j++) {
+                const u = j / radial;
+                const a = u * Math.PI * 2;
+                const x = Math.cos(a) * th * (Math.abs(Math.cos(a)) * 0.35 + 0.65);
+                const z = zCenter + Math.sin(a) * w * 0.5;
+                positions.push(x, yCenter, z);
+                uvs.push(u, t);
+            }
+        }
+
+        for (let i = 0; i < segs; i++) {
+            for (let j = 0; j < radial; j++) {
+                const a = i * (radial + 1) + j;
+                const b = a + 1;
+                const c = (i + 1) * (radial + 1) + j + 1;
+                const d = (i + 1) * (radial + 1) + j;
+                indices.push(a, b, d, b, c, d);
+            }
+        }
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+        geo.setIndex(indices);
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+function createArticulatedMechLimbGeo(length = 0.22, topRadius = 0.058, botRadius = 0.046, armorFlare = 0.16) {
+    const key = `mechLimb_${length.toFixed(3)}_${topRadius.toFixed(3)}_${botRadius.toFixed(3)}_${armorFlare.toFixed(2)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        // Interpret armorFlare > 0.05 as a relative percentage of radius so limbs stay sleek and proportional
+        const flareScale = armorFlare > 0.05 ? armorFlare : 0.18;
+        const rTop = topRadius;
+        const rMidUpper = topRadius * (1.0 + flareScale * 0.55);
+        const rMidLower = THREE.MathUtils.lerp(botRadius, topRadius, 0.38);
+        const rBot = botRadius;
+        const halfL = length * 0.5;
+        const pts = [
+            new THREE.Vector2(0.0, -halfL),
+            new THREE.Vector2(rBot * 0.78, -halfL),
+            new THREE.Vector2(rBot * (1.0 + flareScale * 0.35), -halfL + length * 0.18),
+            new THREE.Vector2(rMidLower, -halfL + length * 0.45),
+            new THREE.Vector2(rMidUpper, -halfL + length * 0.74),
+            new THREE.Vector2(rTop * 0.85, halfL),
+            new THREE.Vector2(0.0, halfL)
+        ];
+        const geo = new THREE.LatheGeometry(pts, 14);
+        // Sculpt forward shin/forearm ridge (+Z) and flatten inner medial side slightly for natural anatomy
+        const pos = geo.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            let x = pos.getX(i);
+            let y = pos.getY(i);
+            let z = pos.getZ(i);
+            const t = (y + halfL) / Math.max(0.001, length);
+            const frontCrest = z > 0 ? Math.sin(t * Math.PI) * rTop * 0.16 : 0;
+            x *= 0.90;
+            z = z * 1.06 + frontCrest;
+            pos.setXYZ(i, x, y, z);
+        }
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+// Anatomical Armored Torso Cuirass Generator (Coherent single-piece waist -> ribcage -> pectoral -> collar mesh)
+function createAnatomicalTorsoGeo(waistW = 0.20, chestW = 0.31, torsoH = 0.36, depth = 0.21, pectoralBulk = 0.18) {
+    const key = `anatTorso_${waistW.toFixed(3)}_${chestW.toFixed(3)}_${torsoH.toFixed(3)}_${depth.toFixed(3)}_${pectoralBulk.toFixed(2)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const radialSegs = 20;
+        const heightSegs = 14;
+        const geo = new THREE.CylinderGeometry(1, 1, torsoH, radialSegs, heightSegs, false);
+        const pos = geo.attributes.position;
+        const halfH = torsoH * 0.5;
+
+        for (let i = 0; i < pos.count; i++) {
+            const vx = pos.getX(i);
+            const vy = pos.getY(i);
+            const vz = pos.getZ(i);
+            // t = 0 at waist base, t = 1 at collar top
+            const t = THREE.MathUtils.clamp((vy + halfH) / Math.max(0.001, torsoH), 0, 1);
+            const ang = Math.atan2(vx, vz); // 0 at front (+Z), PI at back (-Z), +-PI/2 at sides
+            const cosA = Math.cos(ang);
+            const sinA = Math.sin(ang);
+
+            // Anatomical width profile: slim waist (t=0..0.3), V-taper ribcage (t=0.3..0.78), sloped trapezius collar (t=0.78..1.0)
+            let halfW;
+            if (t < 0.32) {
+                halfW = THREE.MathUtils.lerp(waistW * 0.48, waistW * 0.52, t / 0.32);
+            } else if (t < 0.80) {
+                const u = (t - 0.32) / 0.48;
+                halfW = THREE.MathUtils.lerp(waistW * 0.52, chestW * 0.50, Math.sin(u * Math.PI * 0.5));
+            } else {
+                const u = (t - 0.80) / 0.20;
+                halfW = THREE.MathUtils.lerp(chestW * 0.50, waistW * 0.38, u * u);
+            }
+
+            // Anatomical depth profile: flat abdomen, sculpted pectoral plate (t=0.52..0.84), contoured upper back
+            let halfD = depth * (0.42 + 0.12 * Math.sin(t * Math.PI));
+            let zShift = 0;
+            if (cosA > 0) {
+                // Front chest & abdominal armor plates
+                const pecEnv = t > 0.44 && t < 0.88 ? Math.sin(((t - 0.44) / 0.44) * Math.PI) : 0;
+                const sternumGroove = 1.0 - 0.14 * Math.exp(-Math.pow(sinA * 4.5, 2));
+                const abSegs = t < 0.44 ? (1.0 + 0.04 * Math.cos(t * Math.PI * 10.0)) : 1.0;
+                halfD += pecEnv * depth * pectoralBulk * sternumGroove;
+                halfD *= abSegs;
+                zShift += pecEnv * depth * 0.06;
+            } else {
+                // Dorsal spine channel & latissimus taper
+                const backEnv = t > 0.38 && t < 0.86 ? Math.sin(((t - 0.38) / 0.48) * Math.PI) : 0;
+                halfD += backEnv * depth * 0.10;
+            }
+
+            // Square off pectoral and lateral ribcage facets slightly for engineered armor read
+            const facetFactor = 1.0 + 0.06 * Math.cos(ang * 4.0);
+            const finalX = sinA * halfW * facetFactor;
+            const finalZ = cosA * halfD * facetFactor + zShift;
+            // Shift so bottom of waist sits at y = 0 and collar sits at y = torsoH
+            pos.setXYZ(i, finalX, vy + halfH, finalZ);
+        }
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+// Anatomical Armored Pelvis & Hip Girdle Generator (Contoured belt, iliac hip plates & groin codpiece)
+function createAnatomicalPelvisGeo(hipW = 0.23, height = 0.13, depth = 0.17) {
+    const key = `anatPelvis_${hipW.toFixed(3)}_${height.toFixed(3)}_${depth.toFixed(3)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const geo = new THREE.CylinderGeometry(1, 1, height, 16, 6, false);
+        const pos = geo.attributes.position;
+        const halfH = height * 0.5;
+        for (let i = 0; i < pos.count; i++) {
+            const vx = pos.getX(i);
+            const vy = pos.getY(i);
+            const vz = pos.getZ(i);
+            const t = THREE.MathUtils.clamp((vy + halfH) / Math.max(0.001, height), 0, 1);
+            const ang = Math.atan2(vx, vz);
+            const sinA = Math.sin(ang);
+            const cosA = Math.cos(ang);
+
+            // Narrower at bottom groin, wider at iliac hip crest (t=0.65), matching waist at top (t=1.0)
+            const wProfile = t < 0.65
+                ? THREE.MathUtils.lerp(hipW * 0.36, hipW * 0.50, Math.sin((t / 0.65) * Math.PI * 0.5))
+                : THREE.MathUtils.lerp(hipW * 0.50, hipW * 0.44, (t - 0.65) / 0.35);
+            const dProfile = depth * (0.42 + 0.10 * t);
+            // Cut high-cut leg arches on lateral bottom sides (|sinA| > 0.55, t < 0.45) so thighs articulate cleanly
+            const legArchLift = (Math.abs(sinA) > 0.52 && t < 0.55)
+                ? (Math.abs(sinA) - 0.52) * (0.55 - t) * height * 0.65
+                : 0;
+
+            pos.setXYZ(i, sinA * wProfile, vy + legArchLift, cosA * dProfile);
+        }
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+// Contoured Wrap-Around Deltoid Pauldron Generator (Fits snugly over shoulder joint instead of a giant sphere)
+function createAnatomicalPauldronGeo(width = 0.12, height = 0.13, depth = 0.15) {
+    const key = `anatPauldron_${width.toFixed(3)}_${height.toFixed(3)}_${depth.toFixed(3)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const geo = new THREE.SphereGeometry(1.0, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.62);
+        const pos = geo.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            let x = pos.getX(i);
+            let y = pos.getY(i);
+            let z = pos.getZ(i);
+            // Flatten medial inner face (x < 0) and flare outer lateral armor plate (x > 0) with angular facet
+            const outerFlare = x > 0 ? 1.0 + 0.18 * (1.0 - y) : 0.62;
+            const facet = 1.0 + 0.08 * Math.cos(Math.atan2(z, x) * 3.0);
+            x = x * width * outerFlare * facet;
+            y = (y - 0.22) * height;
+            z = z * depth * 0.55 * facet;
+            pos.setXYZ(i, x, y, z);
+        }
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+// Articulated Combat Boot Generator (Angled ankle cuff, armored instep, toe cap & heel lug flush at y = -height)
+function createAnatomicalBootGeo(width = 0.082, height = 0.072, length = 0.165) {
+    const key = `anatBoot_${width.toFixed(3)}_${height.toFixed(3)}_${length.toFixed(3)}`;
+    return getCachedAnatomicalGeo(key, () => {
+        const geo = new THREE.BoxGeometry(width, height, length, 4, 4, 6);
+        const pos = geo.attributes.position;
+        const hw = width * 0.5, hh = height * 0.5, hl = length * 0.5;
+        for (let i = 0; i < pos.count; i++) {
+            let x = pos.getX(i);
+            let y = pos.getY(i);
+            let z = pos.getZ(i);
+            const ny = (y + hh) / Math.max(0.001, height); // 0 at sole, 1 at ankle top
+            const nz = (z + hl) / Math.max(0.001, length); // 0 at heel, 1 at toe
+
+            // Shift forward so ankle joint is at z = 0, heel at -0.32*L, toe at +0.68*L
+            z += length * 0.18;
+            // Taper toe box height and round toe tip
+            if (nz > 0.55) {
+                const u = (nz - 0.55) / 0.45;
+                if (ny > 0.35) {
+                    y -= u * height * 0.38 * ny;
+                }
+                x *= 1.0 - u * u * 0.28;
+            } else if (ny > 0.55) {
+                // Narrow ankle collar at top rear so it mates seamlessly with the lower shin greave
+                x *= 0.82;
+                z *= 0.85;
+            }
+            // Wider planted sole tread at bottom (ny < 0.2)
+            if (ny < 0.22) {
+                x *= 1.08;
+            }
+            // Place ankle pivot at y = 0, sole at y = -height * 0.78
+            pos.setXYZ(i, x, y - height * 0.28, z);
+        }
+        geo.computeVertexNormals();
+        return geo;
+    });
+}
+
+
 // Procedural Ribbed Steel Tank Track Texture + Bump Map
 let _treadHeightCanvas = null;
 const treadTex = makeProceduralTexture((ctx, w, h) => {
@@ -527,11 +918,12 @@ function createFloatingEmblem(tex, radius = 3.2, isEnemy = false) {
 function disposeHierarchy(node) {
     if (!node) return;
     scene.remove(node);
-    // Unit meshes are built from per-spawn unique geometries (never shared pools),
-    // so geometry disposal is safe here. Materials are ALWAYS shared MAT.* entries
-    // and must never be disposed.
+    // Dispose per-instance geometries while preserving cached shared geometries
+    // (_ANATOMICAL_GEO_CACHE marked with userData.isSharedAsset = true) and shared MAT.* materials.
     node.traverse(child => {
-        if (child.geometry) child.geometry.dispose();
+        if (child.geometry && (!child.geometry.userData || !child.geometry.userData.isSharedAsset)) {
+            child.geometry.dispose();
+        }
     });
 }
 
@@ -1182,31 +1574,91 @@ function createEngineeredBuilding(type, includeEmblem = true) {
         root.userData.rotor = beacon;
     }
     else if (type === 'hero') {
-        const ringBase = new THREE.Mesh(createSculptedLatheBarrelGeo(1.3, 1.48, 0.26, 8), MAT.gunmetal);
-        ringBase.position.y = 0.13;
-        const hazardCollar = new THREE.Mesh(createSculptedTorusCollarGeo(1.12, 0.1, 8, 24), MAT.hazard);
-        hazardCollar.rotation.x = Math.PI / 2; hazardCollar.position.y = 0.26;
-        mainStructure.add(ringBase, hazardCollar);
-        damageableParts.push(ringBase);
+        // REDESIGNED TERRAN DOMINION APEX VANGUARD COMMAND SANCTUARY & ORBITAL RELIQUARY
+        // Stepped Octagonal Bastion Plinth + 4 Angled Hydraulic Plasma-Coil Buttress Pylons +
+        // Recessed Holographic Hero-Armory Pedestal + Twin Dominion Banner Obelisks + Multi-Ring Quantum Core
+        const foundationOct = new THREE.Mesh(createSculptedLatheBarrelGeo(1.62, 1.86, 0.24, 8), MAT.darkSteel);
+        foundationOct.position.y = 0.12;
+        foundationOct.castShadow = true;
+        foundationOct.receiveShadow = true;
 
-        for (let i = 0; i < 3; i++) {
-            const a = (i / 3) * Math.PI * 2;
-            const coilGroup = new THREE.Group();
-            coilGroup.position.set(Math.cos(a) * 0.95, 0.25, Math.sin(a) * 0.95);
-            coilGroup.lookAt(0, 0.9, 0);
-            const rod = new THREE.Mesh(createSculptedLatheBarrelGeo(0.09, 0.15, 0.9, 10), MAT.copper);
-            rod.rotation.x = Math.PI / 2;
-            coilGroup.add(rod);
-            mainStructure.add(coilGroup);
-            damageableParts.push(rod);
+        const ringBase = new THREE.Mesh(createSculptedLatheBarrelGeo(1.34, 1.54, 0.28, 8), MAT.gunmetal);
+        ringBase.position.y = 0.32;
+        ringBase.castShadow = true;
+
+        const cobaltDeck = new THREE.Mesh(createExtrudedArmorHullGeo(1.96, 0.22, 1.96, 0.06, 0.38), MAT.terranBlue);
+        cobaltDeck.position.y = 0.50;
+
+        const hazardCollar = new THREE.Mesh(createSculptedTorusCollarGeo(1.16, 0.095, 10, 24), MAT.hazard);
+        hazardCollar.rotation.x = Math.PI / 2;
+        hazardCollar.position.y = 0.62;
+
+        const sanctumWell = new THREE.Mesh(createSculptedLatheBarrelGeo(0.76, 0.88, 0.18, 16), MAT.copper);
+        sanctumWell.position.y = 0.66;
+        const wellBeamPad = new THREE.Mesh(createSculptedLatheBarrelGeo(0.62, 0.64, 0.06, 20), MAT.cyanGlow);
+        wellBeamPad.position.y = 0.74;
+
+        mainStructure.add(foundationOct, ringBase, cobaltDeck, hazardCollar, sanctumWell, wellBeamPad);
+        damageableParts.push(foundationOct, ringBase, cobaltDeck);
+
+        // 4 Angled Hydraulic Plasma-Capacitor Buttress Pylons with Copper Inductors & Focusing Claws
+        for (let i = 0; i < 4; i++) {
+            const a = (i / 4) * Math.PI * 2 + Math.PI / 4;
+            const pylonGroup = new THREE.Group();
+            pylonGroup.position.set(Math.cos(a) * 1.18, 0.36, Math.sin(a) * 1.18);
+            pylonGroup.rotation.y = -a + Math.PI / 2;
+
+            const bastionBase = new THREE.Mesh(createExtrudedArmorHullGeo(0.46, 0.54, 0.52, 0.04, 0.10), MAT.terranPlating);
+            bastionBase.position.y = 0.22;
+            bastionBase.castShadow = true;
+
+            const angledStrut = new THREE.Mesh(createExtrudedArmorHullGeo(0.32, 1.12, 0.36, 0.03, 0.08), MAT.gunmetal);
+            angledStrut.position.set(0, 0.72, -0.18);
+            angledStrut.rotation.x = 0.36;
+            angledStrut.castShadow = true;
+
+            const copperRod = new THREE.Mesh(createSculptedLatheBarrelGeo(0.085, 0.125, 0.96, 12), MAT.copper);
+            copperRod.position.set(0, 0.78, -0.06);
+            copperRod.rotation.x = 0.36;
+
+            const plasmaCoil = new THREE.Mesh(createSculptedTorusCollarGeo(0.14, 0.032, 8, 16), i % 2 === 0 ? MAT.cyanGlow : MAT.amberGlow);
+            plasmaCoil.position.set(0, 0.92, -0.12);
+            plasmaCoil.rotation.x = Math.PI / 2 + 0.36;
+
+            const emitterTip = new THREE.Mesh(createSculptedArmorDomeGeo(0.095, 10, 10), MAT.plasmaShader);
+            emitterTip.position.set(0, 1.24, -0.34);
+
+            pylonGroup.add(bastionBase, angledStrut, copperRod, plasmaCoil, emitterTip);
+            mainStructure.add(pylonGroup);
+            damageableParts.push(bastionBase, angledStrut, copperRod);
         }
 
+        // Front & Rear Dominion Command Archways + Flanking Golden Valkyrie Wings
+        [-1, 1].forEach(side => {
+            const wingObelisk = new THREE.Mesh(createExtrudedArmorHullGeo(0.28, 1.28, 0.42, 0.03, 0.08), MAT.terranBlue);
+            wingObelisk.position.set(side * 1.38, 0.76, 0);
+            const wingCrest = new THREE.Mesh(createCurvedScytheBladeGeo(0.96, 0.08, 0.20), MAT.copper);
+            wingCrest.position.set(side * 1.48, 1.12, 0);
+            wingCrest.rotation.z = -side * 0.42;
+            const wingLight = new THREE.Mesh(createExtrudedArmorHullGeo(0.08, 0.84, 0.12), MAT.amberGlow);
+            wingLight.position.set(side * 1.52, 0.78, 0);
+            mainStructure.add(wingObelisk, wingCrest, wingLight);
+            damageableParts.push(wingObelisk);
+        });
+
+        // Levitating Multi-Ring Gyroscopic Quantum Core & Vanguard Crown (`root.userData.rotor`)
         const gyro = new THREE.Group();
-        gyro.position.y = 0.9;
-        const sphere = new THREE.Mesh(createSculptedArmorDomeGeo(0.28, 16, 16), MAT.plasmaShader);
-        const gimbal = new THREE.Mesh(createSculptedTorusCollarGeo(0.44, 0.04, 8, 24), MAT.cyanGlow);
-        gimbal.rotation.x = Math.PI / 4;
-        gyro.add(sphere, gimbal);
+        gyro.position.y = 1.28;
+        const coreCrystal = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.32, 1), MAT.plasmaShader);
+        coreCrystal.scale.set(0.9, 1.35, 0.9);
+        const innerSphere = new THREE.Mesh(createSculptedArmorDomeGeo(0.22, 16, 16), MAT.amberGlow);
+        const gimbalOuter = new THREE.Mesh(createSculptedTorusCollarGeo(0.56, 0.048, 10, 26), MAT.copper);
+        gimbalOuter.rotation.x = Math.PI / 4;
+        const gimbalInner = new THREE.Mesh(createSculptedTorusCollarGeo(0.42, 0.036, 8, 22), MAT.cyanGlow);
+        gimbalInner.rotation.y = Math.PI / 3;
+        const crownSpire = new THREE.Mesh(createSculptedOgiveSpireGeo(0.14, 0.42, 8), MAT.copper);
+        crownSpire.position.y = 0.46;
+        gyro.add(coreCrystal, innerSphere, gimbalOuter, gimbalInner, crownSpire);
         mainStructure.add(gyro);
         root.userData.rotor = gyro;
     }
@@ -2142,19 +2594,19 @@ function createEngineeredBuilding(type, includeEmblem = true) {
             sideWall.position.set(ws.x, 0, ws.z);
             sideWall.rotation.y = ws.rotY;
 
-            const panel = new THREE.Mesh(new THREE.BoxGeometry(ws.len - 0.12, barrierHeight, 0.05), barrierTarpMat);
+            const panel = new THREE.Mesh(createExtrudedArmorHullGeo(ws.len - 0.12, barrierHeight, 0.06, 0.015, 0.04), barrierTarpMat);
             panel.position.y = barrierHeight * 0.5;
             sideWall.add(panel);
 
-            const topHazardRail = new THREE.Mesh(new THREE.BoxGeometry(ws.len, 0.13, 0.08), MAT.hazard);
+            const topHazardRail = new THREE.Mesh(createExtrudedArmorHullGeo(ws.len, 0.14, 0.09, 0.02, 0.04), MAT.hazard);
             topHazardRail.position.y = barrierHeight - 0.04;
-            const midHazardRail = new THREE.Mesh(new THREE.BoxGeometry(ws.len, 0.10, 0.07), MAT.hazard);
+            const midHazardRail = new THREE.Mesh(createExtrudedArmorHullGeo(ws.len, 0.11, 0.08, 0.015, 0.03), MAT.hazard);
             midHazardRail.position.y = barrierHeight * 0.46;
             sideWall.add(topHazardRail, midHazardRail);
 
             for (let r = 1; r <= 3; r++) {
                 const rx = -ws.len * 0.5 + (r / 4) * ws.len;
-                const rib = new THREE.Mesh(new THREE.BoxGeometry(0.08, barrierHeight, 0.09), MAT.darkSteel);
+                const rib = new THREE.Mesh(createExtrudedArmorHullGeo(0.09, barrierHeight, 0.10, 0.015, 0.03), MAT.darkSteel);
                 rib.position.set(rx, barrierHeight * 0.5, 0);
                 sideWall.add(rib);
             }
@@ -2162,33 +2614,33 @@ function createEngineeredBuilding(type, includeEmblem = true) {
         });
         scaffoldGroup.add(barrierGroup);
 
-        // 3. Articulated 3D Tower Crane (Mast + Slewing Cab + Rotating Jib Boom + Sliding Trolley + Dual Plasma Welding Beams)
+        // 3. Articulated 3D Tower Crane (Sculpted Mast + Beveled Slewing Cab + Rotating Jib Boom + Sliding Trolley + Dual Plasma Welding Beams)
         const craneHeight = scafHeight + 1.45;
-        const craneMast = new THREE.Mesh(new THREE.BoxGeometry(0.24, craneHeight, 0.24), MAT.hazard);
+        const craneMast = new THREE.Mesh(createExtrudedArmorHullGeo(0.26, craneHeight, 0.26, 0.03, 0.06), MAT.hazard);
         craneMast.position.set(craneBaseX, craneHeight * 0.5, craneBaseZ);
-        const craneBasePad = new THREE.Mesh(new THREE.BoxGeometry(0.54, 0.22, 0.54), MAT.darkSteel);
-        craneBasePad.position.set(craneBaseX, 0.11, craneBaseZ);
+        const craneBasePad = new THREE.Mesh(createExtrudedArmorHullGeo(0.58, 0.24, 0.58, 0.04, 0.10), MAT.darkSteel);
+        craneBasePad.position.set(craneBaseX, 0.12, craneBaseZ);
         scaffoldGroup.add(craneMast, craneBasePad);
 
         craneJibPivot = new THREE.Group();
         craneJibPivot.position.set(craneBaseX, craneHeight, craneBaseZ);
 
-        const slewingCab = new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.32, 0.40), MAT.gunmetal);
-        slewingCab.position.set(0, 0.14, 0);
-        const jibBoom = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.18, jibLength), MAT.hazard);
+        const slewingCab = new THREE.Mesh(createExtrudedArmorHullGeo(0.42, 0.34, 0.42, 0.04, 0.08), MAT.gunmetal);
+        slewingCab.position.set(0, 0.15, 0);
+        const jibBoom = new THREE.Mesh(createExtrudedArmorHullGeo(0.20, 0.20, jibLength, 0.025, 0.06), MAT.hazard);
         jibBoom.position.set(0, 0.18, jibLength * 0.36);
-        const counterJib = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.26, 0.48), MAT.darkSteel);
+        const counterJib = new THREE.Mesh(createExtrudedArmorHullGeo(0.38, 0.28, 0.52, 0.03, 0.08), MAT.darkSteel);
         counterJib.position.set(0, 0.14, -jibLength * 0.14);
-        const apexSpire = new THREE.Mesh(new THREE.ConeGeometry(0.15, 0.52, 4), MAT.hazard);
-        apexSpire.position.set(0, 0.50, 0);
+        const apexSpire = new THREE.Mesh(createSculptedOgiveSpireGeo(0.16, 0.54, 8), MAT.hazard);
+        apexSpire.position.set(0, 0.26, 0);
         craneJibPivot.add(slewingCab, jibBoom, counterJib, apexSpire);
 
         craneTrolley = new THREE.Group();
         craneTrolley.position.set(0, 0.05, jibLength * 0.50);
-        const trolleyCar = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.14, 0.34), MAT.darkSteel);
-        const hoistCable = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.72, 6), MAT.gunmetal);
+        const trolleyCar = new THREE.Mesh(createExtrudedArmorHullGeo(0.30, 0.15, 0.36, 0.02, 0.05), MAT.darkSteel);
+        const hoistCable = new THREE.Mesh(createSculptedLatheBarrelGeo(0.024, 0.024, 0.72, 8), MAT.gunmetal);
         hoistCable.position.y = -0.36;
-        const hookBlock = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.16, 0.32), MAT.hazard);
+        const hookBlock = new THREE.Mesh(createExtrudedArmorHullGeo(0.34, 0.18, 0.34, 0.03, 0.06), MAT.hazard);
         hookBlock.position.y = -0.72;
         craneTrolley.add(trolleyCar, hoistCable, hookBlock);
 
@@ -2208,9 +2660,9 @@ function createEngineeredBuilding(type, includeEmblem = true) {
             depthWrite: false
         });
         const beamLen = scafHeight * 0.92;
-        primaryBeam = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.14, beamLen, 8), beamMatCyan);
+        primaryBeam = new THREE.Mesh(createSculptedLatheBarrelGeo(0.055, 0.14, beamLen, 10), beamMatCyan);
         primaryBeam.position.y = -0.72 - beamLen * 0.5;
-        const primaryBeamCore = new THREE.Mesh(new THREE.CylinderGeometry(0.02, 0.04, beamLen, 6), beamMatCore);
+        const primaryBeamCore = new THREE.Mesh(createSculptedLatheBarrelGeo(0.02, 0.04, beamLen, 8), beamMatCore);
         primaryBeamCore.position.y = -0.72 - beamLen * 0.5;
         craneTrolley.add(primaryBeam, primaryBeamCore);
 
@@ -2221,8 +2673,8 @@ function createEngineeredBuilding(type, includeEmblem = true) {
         laserRing = new THREE.Mesh(createSculptedTorusCollarGeo(scafRadius + 0.08, 0.055, 8, 28), MAT.cyanGlow);
         laserRing.rotation.x = Math.PI / 2;
         laserRing.position.y = 0.9;
-        const crossBeamA = new THREE.Mesh(new THREE.BoxGeometry(scafRadius * 2.0, 0.04, 0.04), beamMatCyan);
-        const crossBeamB = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.04, scafRadius * 2.0), beamMatCyan);
+        const crossBeamA = new THREE.Mesh(createExtrudedArmorHullGeo(scafRadius * 2.0, 0.045, 0.045), beamMatCyan);
+        const crossBeamB = new THREE.Mesh(createExtrudedArmorHullGeo(0.045, 0.045, scafRadius * 2.0), beamMatCyan);
         laserRing.add(crossBeamA, crossBeamB);
 
         laserRing2 = new THREE.Mesh(createSculptedTorusCollarGeo(scafRadius * 0.86, 0.042, 8, 24), MAT.amberGlow);
@@ -2234,7 +2686,7 @@ function createEngineeredBuilding(type, includeEmblem = true) {
         sparkCluster = new THREE.Group();
         for (let sp = 0; sp < 12; sp++) {
             const streak = new THREE.Mesh(
-                new THREE.BoxGeometry(0.045, 0.22, 0.045),
+                createSculptedOgiveSpireGeo(0.032, 0.24, 6),
                 sp % 3 === 0 ? MAT.cyanGlow : MAT.amberGlow
             );
             streak.userData = {
@@ -4566,22 +5018,24 @@ function createVehicleModel(vType) {
     const group = new THREE.Group();
 
     if (vType === 'tank') {
-        // REDESIGNED M80 GRIZZLY SIEGE TANK:
-        // Clean non-overlapping geometry (No Z-fighting/flicker) + StarCraft II Terran Dominion Blue Team Livery
+        // REDESIGNED M80 GRIZZLY MAIN BATTLE TANK:
+        // Compound-Sloped Chobham Glacis + Articulated Torsion-Bar Bogie Suspension + Explosive Reactive Armor (ERA) Side Skirts +
+        // Welded Composite Turret with Bustle Stowage Cage, Smoke Grenade Launchers, CITV Thermal Sight & 120mm Rifled Cannon
         const trackWidth = 0.32;
         const trackTrackDist = 0.68;
 
         [-trackTrackDist, trackTrackDist].forEach(xOff => {
             const podGroup = new THREE.Group();
             podGroup.position.set(xOff, 0, 0);
+            const sideSign = Math.sign(xOff);
 
-            // Main Ribbed Steel Track Belt (width 0.32, extending from xOff-0.16 to xOff+0.16)
+            // Main Ribbed Steel Track Belt
             const trackBelt = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth, 0.32, 2.02, 0.025, 0.08), MAT.treadMat);
             trackBelt.position.y = 0.17;
             trackBelt.castShadow = true;
             podGroup.add(trackBelt);
 
-            // Front & Rear Toothed Drive Sprockets
+            // Front Idler & Rear Toothed Drive Sprockets with Planetary Gear Hubs
             [-0.96, 0.96].forEach(zEnd => {
                 const sprocket = new THREE.Mesh(createSculptedLatheBarrelGeo(0.17, 0.17, trackWidth + 0.02, 14), MAT.treadMat);
                 sprocket.rotation.z = Math.PI / 2;
@@ -4592,18 +5046,28 @@ function createVehicleModel(vType) {
                 podGroup.add(sprocket, hub);
             });
 
-            // 5 Suspension Road Wheels along outer track face
-            [-0.72, -0.36, 0, 0.36, 0.72].forEach(zWheel => {
+            // 5 Suspension Road Wheels + Torsion-Bar Swing Arms & Upper Return Rollers
+            [-0.72, -0.36, 0, 0.36, 0.72].forEach((zWheel, wIdx) => {
                 const wheel = new THREE.Mesh(createSculptedLatheBarrelGeo(0.125, 0.125, trackWidth + 0.03, 10), MAT.darkSteel);
                 wheel.rotation.z = Math.PI / 2;
                 wheel.position.set(0, 0.14, zWheel);
                 const rim = new THREE.Mesh(createSculptedLatheBarrelGeo(0.055, 0.055, trackWidth + 0.04, 8), MAT.terranCobalt);
                 rim.rotation.z = Math.PI / 2;
                 rim.position.set(0, 0.14, zWheel);
-                podGroup.add(wheel, rim);
+                const bogieArm = new THREE.Mesh(createExtrudedArmorHullGeo(0.04, 0.12, 0.16, 0.008, 0.02), MAT.gunmetal);
+                bogieArm.rotation.x = 0.45;
+                bogieArm.position.set(sideSign * (trackWidth * 0.52), 0.21, zWheel - 0.04);
+                podGroup.add(wheel, rim, bogieArm);
+
+                if (wIdx % 2 === 1) {
+                    const returnRoller = new THREE.Mesh(createSculptedLatheBarrelGeo(0.055, 0.055, trackWidth + 0.03, 8), MAT.copper);
+                    returnRoller.rotation.z = Math.PI / 2;
+                    returnRoller.position.set(0, 0.28, zWheel);
+                    podGroup.add(returnRoller);
+                }
             });
 
-            // Heavy Chobham Side-Skirt Armor with Dominion Blue Accent Stripe
+            // Heavy Chobham Side-Skirt Armor + Segmented Explosive Reactive Armor (ERA) Bricks
             const sideSkirt = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth + 0.04, 0.14, 2.08, 0.02, 0.06), MAT.terranPlating);
             sideSkirt.position.set(0, 0.35, 0);
             sideSkirt.castShadow = true;
@@ -4611,62 +5075,77 @@ function createVehicleModel(vType) {
             const blueTrim = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth + 0.045, 0.04, 1.7), MAT.terranBlue);
             blueTrim.position.set(0, 0.37, 0);
 
+            for (let b = -2; b <= 2; b++) {
+                const eraBlock = new THREE.Mesh(createExtrudedArmorHullGeo(0.045, 0.12, 0.30, 0.008, 0.02), b % 2 === 0 ? MAT.gunmetal : MAT.terranCobalt);
+                eraBlock.position.set(sideSign * (trackWidth * 0.54), 0.31, b * 0.34);
+                podGroup.add(eraBlock);
+            }
+
             const frontMudguard = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth + 0.04, 0.11, 0.26), MAT.hazard);
             frontMudguard.rotation.x = 0.44;
             frontMudguard.position.set(0, 0.29, 1.08);
 
-            podGroup.add(sideSkirt, blueTrim, frontMudguard);
+            const rearMudguard = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth + 0.04, 0.10, 0.22), MAT.darkSteel);
+            rearMudguard.rotation.x = -0.38;
+            rearMudguard.position.set(0, 0.28, -1.04);
+
+            podGroup.add(sideSkirt, blueTrim, frontMudguard, rearMudguard);
             group.add(podGroup);
         });
 
-        // Lower Hull: width 0.90 (from -0.45 to +0.45), leaving 0.07 clearance to tracks (inner edge 0.52). ZERO penetration!
+        // Lower Hull & Compound Upper Deck
         const lowerHull = new THREE.Mesh(createExtrudedArmorHullGeo(0.90, 0.32, 1.94, 0.05, 0.16), MAT.terranPlating);
         lowerHull.position.y = 0.28;
         lowerHull.castShadow = true;
 
-        // Upper Deck: cleanly stacked above lower hull at y=0.46 (height 0.18, width 0.94, length 1.62)
         const upperDeck = new THREE.Mesh(createExtrudedArmorHullGeo(0.94, 0.18, 1.62, 0.04, 0.14), MAT.terranPlating);
         upperDeck.position.set(0, 0.46, -0.06);
         upperDeck.castShadow = true;
 
-        // Terran Dominion Blue Racing Plate along upper deck
         const deckPlate = new THREE.Mesh(createExtrudedArmorHullGeo(0.82, 0.04, 1.48, 0.015, 0.08), MAT.terranBlue);
         deckPlate.position.set(0, 0.56, -0.06);
 
-        // Angled Sloped Glacis Armor (Seated seamlessly onto front hull)
+        // Angled Sloped Glacis Armor + Driver Periscope Vision Block & Tow Shackles
         const glacisPlate = new THREE.Mesh(createExtrudedArmorHullGeo(0.90, 0.19, 0.52, 0.03, 0.12), MAT.terranBlue);
         glacisPlate.rotation.x = 0.42;
         glacisPlate.position.set(0, 0.40, 0.78);
 
+        const driverPeriscope = new THREE.Mesh(createExtrudedArmorHullGeo(0.28, 0.07, 0.14, 0.01, 0.03), MAT.canopyGlass);
+        driverPeriscope.position.set(0, 0.52, 0.66);
+
         const dozerLip = new THREE.Mesh(createExtrudedArmorHullGeo(0.94, 0.14, 0.18, 0.02, 0.06), MAT.hazard);
         dozerLip.position.set(0, 0.20, 1.02);
 
-        // Front Headlights with Terran Cyan Glow
         [-0.32, 0.32].forEach(lx => {
             const lamp = new THREE.Mesh(createSculptedLatheBarrelGeo(0.06, 0.07, 0.08, 14), MAT.terranTrim);
             lamp.rotation.x = Math.PI / 2;
             lamp.position.set(lx, 0.43, 0.96);
-            group.add(lamp);
+            const towShackle = new THREE.Mesh(createSculptedTorusCollarGeo(0.055, 0.016, 6, 12), MAT.copper);
+            towShackle.position.set(lx * 0.85, 0.22, 1.10);
+            group.add(lamp, towShackle);
         });
 
-        // Rear Engine Louver Grille & Twin Exhaust Pipes
+        // Rear Engine Louver Grille, Aux Fuel Drums & Twin Exhaust Pipes
         const engineGrille = new THREE.Mesh(createExtrudedArmorHullGeo(0.78, 0.07, 0.48, 0.02, 0.08), MAT.darkSteel);
         engineGrille.position.set(0, 0.54, -0.56);
         [-0.32, 0.32].forEach(ex => {
             const pipe = new THREE.Mesh(createSculptedLatheBarrelGeo(0.065, 0.075, 0.44, 12), MAT.copper);
             pipe.rotation.x = Math.PI / 2;
             pipe.position.set(ex, 0.41, -0.95);
-            group.add(pipe);
+            const auxDrum = new THREE.Mesh(createSculptedLatheBarrelGeo(0.085, 0.085, 0.28, 10), MAT.gunmetal);
+            auxDrum.rotation.z = Math.PI / 2;
+            auxDrum.position.set(ex * 0.9, 0.50, -0.92);
+            group.add(pipe, auxDrum);
         });
 
-        group.add(lowerHull, upperDeck, deckPlate, glacisPlate, dozerLip, engineGrille);
+        group.add(lowerHull, upperDeck, deckPlate, glacisPlate, driverPeriscope, dozerLip, engineGrille);
 
-        // Turret Turntable Ring (Prevents coplanar Z-fighting between hull and turret)
+        // Turret Turntable Ring
         const turntable = new THREE.Mesh(createSculptedLatheBarrelGeo(0.48, 0.50, 0.08, 20), MAT.darkSteel);
         turntable.position.set(0, 0.58, 0.04);
         group.add(turntable);
 
-        // Sculpted Composite Siege Turret (Independent 360° Yaw) with Terran Dominion Blue Cheeks
+        // Sculpted Composite Siege Turret (Independent 360° Yaw)
         const turret = new THREE.Group();
         snapUnitTurretToHardpoint(turret, 'tank_turret');
 
@@ -4674,25 +5153,43 @@ function createVehicleModel(vType) {
         turretBustle.position.set(0, 0.13, -0.1);
         turretBustle.castShadow = true;
 
-        // Angled Cheek Armor Wedges with Team Blue Finish
+        // Rear Turret Bustle Ammo Rack & Auxiliary APU Pod
+        const bustleRack = new THREE.Mesh(createExtrudedArmorHullGeo(0.76, 0.22, 0.34, 0.03, 0.08), MAT.gunmetal);
+        bustleRack.position.set(0, 0.16, -0.78);
+        const bustleStripe = new THREE.Mesh(createExtrudedArmorHullGeo(0.68, 0.06, 0.36), MAT.hazard);
+        bustleStripe.position.set(0, 0.16, -0.79);
+        turret.add(bustleRack, bustleStripe);
+
+        // Angled Cheek Armor Wedges + 3-Tube Smoke Grenade Launchers on Both Sides
         [-0.41, 0.41].forEach(cx => {
             const cheek = new THREE.Mesh(createExtrudedArmorHullGeo(0.22, 0.25, 0.64, 0.03, 0.07), MAT.terranBlue);
             cheek.rotation.y = cx > 0 ? -0.32 : 0.32;
             cheek.position.set(cx, 0.13, 0.26);
             cheek.castShadow = true;
             turret.add(cheek);
+
+            for (let s = 0; s < 3; s++) {
+                const smokeTube = new THREE.Mesh(createSculptedLatheBarrelGeo(0.024, 0.028, 0.16, 8), MAT.copper);
+                smokeTube.rotation.x = Math.PI / 2 - 0.35;
+                smokeTube.rotation.z = (cx > 0 ? -0.25 : 0.25) * (s - 1);
+                smokeTube.position.set(cx * 1.18, 0.16 + s * 0.045, 0.22);
+                turret.add(smokeTube);
+            }
         });
 
-        // Commander Cupola Hatch, CITV Thermal Sight & Antenna
+        // Commander Cupola Hatch, CITV Thermal Sight, Coaxial MG & Antenna
         const cupola = new THREE.Mesh(createSculptedLatheBarrelGeo(0.18, 0.21, 0.14, 16), MAT.darkSteel);
         cupola.position.set(-0.20, 0.32, -0.14);
+        const pintleMG = new THREE.Mesh(createSculptedLatheBarrelGeo(0.022, 0.028, 0.42, 8), MAT.gunmetal);
+        pintleMG.rotation.x = Math.PI / 2;
+        pintleMG.position.set(-0.20, 0.42, 0.06);
         const citv = new THREE.Mesh(createSculptedLatheBarrelGeo(0.09, 0.11, 0.15, 14), MAT.terranCobalt);
         citv.position.set(0.22, 0.33, 0.11);
         const citvLens = new THREE.Mesh(createSculptedArmorDomeGeo(0.07, 14, 12), MAT.terranTrim);
         citvLens.position.set(0.22, 0.35, 0.18);
         const whipAntenna = new THREE.Mesh(createSculptedLatheBarrelGeo(0.015, 0.022, 0.72, 8), MAT.darkSteel);
         whipAntenna.position.set(-0.31, 0.52, -0.52);
-        turret.add(turretBustle, cupola, citv, citvLens, whipAntenna);
+        turret.add(turretBustle, cupola, pintleMG, citv, citvLens, whipAntenna);
 
         // Pitching 120mm Rifled Siege Cannon Assembly with Hydraulic Recoil Cylinder
         const cannonPivot = new THREE.Group();
@@ -4700,8 +5197,9 @@ function createVehicleModel(vType) {
 
         const mantlet = new THREE.Mesh(createExtrudedArmorHullGeo(0.40, 0.26, 0.32, 0.035, 0.07), MAT.terranPlating);
         mantlet.position.set(0, 0, 0);
+        const laserRangefinder = new THREE.Mesh(createExtrudedArmorHullGeo(0.16, 0.09, 0.22, 0.015, 0.03), MAT.copper);
+        laserRangefinder.position.set(0, 0.16, 0.06);
 
-        // Subgroup for the Recoiling Barrel (Slides into mantlet during shoot animation!)
         const recoilBarrel = new THREE.Group();
         recoilBarrel.position.set(0, 0, 0.14);
 
@@ -4711,9 +5209,9 @@ function createVehicleModel(vType) {
             new THREE.Vector2(0.12, 0.44),
             new THREE.Vector2(0.088, 0.48),
             new THREE.Vector2(0.088, 0.62),
-            new THREE.Vector2(0.12, 0.66),
-            new THREE.Vector2(0.12, 0.92),
-            new THREE.Vector2(0.078, 0.96),
+            new THREE.Vector2(0.125, 0.66),
+            new THREE.Vector2(0.125, 0.94),
+            new THREE.Vector2(0.078, 0.98),
             new THREE.Vector2(0.075, 1.40),
             new THREE.Vector2(0.115, 1.44),
             new THREE.Vector2(0.115, 1.58),
@@ -4723,17 +5221,18 @@ function createVehicleModel(vType) {
         latheBarrel.rotation.x = Math.PI / 2;
         latheBarrel.castShadow = true;
 
+        const boreEvacuatorRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.122, 0.018, 8, 16), MAT.copper);
+        boreEvacuatorRing.position.set(0, 0, 0.80);
+
         const muzzleBrake = new THREE.Mesh(createExtrudedArmorHullGeo(0.22, 0.18, 0.24, 0.025, 0.05), MAT.terranCobalt);
         muzzleBrake.position.set(0, 0, 1.50);
 
-        // Realistic Multi-Chamber 120mm Cannon Muzzle-Brake Volumetric Blast Plume & Mach Shock Core
         const tankMuzzleFlash = new THREE.Group();
         tankMuzzleFlash.position.set(0, 0, 1.72);
         tankMuzzleFlash.visible = false;
 
-        // Muzzle locator node at barrel tip (all muzzle flash visuals are generated dynamically via 3D particle bursts!)
-        recoilBarrel.add(latheBarrel, muzzleBrake, tankMuzzleFlash);
-        cannonPivot.add(mantlet, recoilBarrel);
+        recoilBarrel.add(latheBarrel, boreEvacuatorRing, muzzleBrake, tankMuzzleFlash);
+        cannonPivot.add(mantlet, laserRangefinder, recoilBarrel);
         turret.add(cannonPivot);
         group.add(turret);
 
@@ -4745,8 +5244,8 @@ function createVehicleModel(vType) {
     else if (vType === 'siege_tank') {
         // ====================================================================
         // STARCRAFT CRUCIO TRANSFORMER-MECH SIEGE TANK
-        // 4 Independent Track Pods on Expanding Hydraulic Swing-Arms +
-        // Ground-Locking Anchor Claws + Elevating Chassis & Unfolding 180mm Artillery
+        // 4 Independent Quad-Bogie Track Pods on Expanding Hydraulic Swing-Arms +
+        // Ground-Locking Anchor Claws + Elevating Chassis & Unfolding 180mm Twin Shock Artillery
         // ====================================================================
         const chassisBody = new THREE.Group();
         group.add(chassisBody);
@@ -4766,20 +5265,20 @@ function createVehicleModel(vType) {
         deckAccent.position.set(0, 0.62, -0.04);
         const frontDozer = new THREE.Mesh(createExtrudedArmorHullGeo(0.88, 0.18, 0.24, 0.02, 0.06), MAT.hazard);
         frontDozer.position.set(0, 0.24, 1.02);
+        const driverCab = new THREE.Mesh(createExtrudedArmorHullGeo(0.44, 0.14, 0.28, 0.02, 0.06), MAT.canopyGlass);
+        driverCab.position.set(0, 0.56, 0.68);
         const rearExhaust = new THREE.Mesh(createExtrudedArmorHullGeo(0.76, 0.24, 0.26, 0.02, 0.05), MAT.copper);
         rearExhaust.position.set(0, 0.36, -0.96);
-        chassisBody.add(lowerHull, upperDeck, deckAccent, frontDozer, rearExhaust);
+        chassisBody.add(lowerHull, upperDeck, deckAccent, frontDozer, driverCab, rearExhaust);
 
-        // 4 Independent StarCraft Transformer Track Pods Mounted on Expanding Hydraulic Swing-Arms!
+        // 4 Independent StarCraft Transformer Track Pods Mounted on Expanding Hydraulic Swing-Arms
         const trackPods = [];
         [[-1, 1], [1, 1], [-1, -1], [1, -1]].forEach(([sx, sz]) => {
-            // Shoulder Swing-Arm Pivot attached to Central Hull
             const armPivot = new THREE.Group();
             const baseArmX = sx * 0.44;
             const baseArmZ = sz * 0.58;
             armPivot.position.set(baseArmX, 0.28, baseArmZ);
 
-            // Articulated Hydraulic Expansion Arm linking Hull to Track Pod
             const swingArm = new THREE.Mesh(createExtrudedArmorHullGeo(0.46, 0.18, 0.32, 0.02, 0.05), MAT.darkSteel);
             swingArm.position.set(sx * 0.18, 0.02, 0);
             const chromePiston = new THREE.Mesh(createSculptedLatheBarrelGeo(0.055, 0.055, 0.52, 8), MAT.titanium);
@@ -4789,7 +5288,6 @@ function createVehicleModel(vType) {
             armJoint.position.set(0, 0.02, 0);
             armPivot.add(swingArm, chromePiston, armJoint);
 
-            // Independent Armored Caterpillar Track Pod at end of Hydraulic Arm
             const podGroup = new THREE.Group();
             const basePodX = sx * 0.34;
             podGroup.position.set(basePodX, -0.28, 0);
@@ -4811,6 +5309,14 @@ function createVehicleModel(vType) {
                 podGroup.add(sprocket, hub);
             });
 
+            // 3 Bogie Road Wheels per Track Pod
+            [-0.24, 0, 0.24].forEach(zW => {
+                const bogieWheel = new THREE.Mesh(createSculptedLatheBarrelGeo(0.11, 0.11, trackWidth + 0.04, 10), MAT.darkSteel);
+                bogieWheel.rotation.z = Math.PI / 2;
+                bogieWheel.position.set(0, 0.13, zW);
+                podGroup.add(bogieWheel);
+            });
+
             const podArmorFender = new THREE.Mesh(createExtrudedArmorHullGeo(trackWidth + 0.06, 0.18, trackLen + 0.06, 0.02, 0.06), MAT.terranPlating);
             podArmorFender.position.set(0, 0.38, 0);
             podArmorFender.castShadow = true;
@@ -4820,7 +5326,7 @@ function createVehicleModel(vType) {
             podHazard.position.set(0, 0.36, sz * 0.38);
             podGroup.add(podArmorFender, podBlueStripe, podHazard);
 
-            // Outer Ground-Locking Siege Anchor Claw & Stabilizer Foot on each Track Pod!
+            // Outer Ground-Locking Siege Anchor Claw & Stabilizer Foot on each Track Pod
             const anchorClaw = new THREE.Group();
             anchorClaw.position.set(sx * 0.22, 0.32, sz * 0.18);
             const clawStrut = new THREE.Mesh(createExtrudedArmorHullGeo(0.28, 0.14, 0.30, 0.02, 0.04), MAT.darkSteel);
@@ -4855,7 +5361,9 @@ function createVehicleModel(vType) {
         const turretBustle = new THREE.Mesh(createExtrudedArmorHullGeo(1.08, 0.38, 1.42, 0.05, 0.18), MAT.terranPlating);
         turretBustle.position.set(0, 0.18, -0.16);
         turretBustle.castShadow = true;
-        turret.add(turretBustle);
+        const rearCounterweight = new THREE.Mesh(createExtrudedArmorHullGeo(0.86, 0.28, 0.42, 0.03, 0.08), MAT.gunmetal);
+        rearCounterweight.position.set(0, 0.22, -0.92);
+        turret.add(turretBustle, rearCounterweight);
 
         // Unfolding Transformer Shoulder Armor Wings on Turret Sides
         const shoulderWings = [];
@@ -4866,7 +5374,10 @@ function createVehicleModel(vType) {
             wingPlate.position.set(sx * 0.10, 0, 0);
             const wingTrim = new THREE.Mesh(createExtrudedArmorHullGeo(0.14, 0.10, 0.76), MAT.hazard);
             wingTrim.position.set(sx * 0.20, 0.12, 0);
-            wingPivot.add(wingPlate, wingTrim);
+            const stabilCylinder = new THREE.Mesh(createSculptedLatheBarrelGeo(0.045, 0.045, 0.56, 8), MAT.copper);
+            stabilCylinder.rotation.x = Math.PI / 2;
+            stabilCylinder.position.set(sx * 0.16, -0.08, 0);
+            wingPivot.add(wingPlate, wingTrim, stabilCylinder);
             turret.add(wingPivot);
             shoulderWings.push({ wingPivot, sx });
         });
@@ -4914,7 +5425,6 @@ function createVehicleModel(vType) {
             siegeBarrelExt.add(mainTube, siegeRail, plasmaCoil, muzzleBrake);
         });
 
-        // Muzzle locator node at barrel tip (all muzzle flash visuals are generated dynamically via 3D particle bursts!)
         const tankMuzzleFlash = new THREE.Group();
         tankMuzzleFlash.position.set(0, 0.02, 2.10);
 
@@ -5914,314 +6424,714 @@ function createAnimatedUnitModel(role) {
     }
 
     if (['skitterer', 'spitter', 'burster', 'crusher', 'behemoth', 'gorgon'].includes(role)) {
-        const scale = role === 'behemoth' ? 1.92 : (role === 'gorgon' ? 1.68 : (role === 'crusher' ? 1.58 : (role === 'spitter' ? 1.18 : (role === 'burster' ? 1.06 : 0.96))));
-        group.scale.setScalar(scale);
-
+        // ============================================================================
+        // ZERG SWARM — SPECIES-SPECIFIC BIOLOGICAL GROUND ORGANISMS
+        // Every Zerg ground creature possesses its own dedicated anatomical body plan,
+        // skeletal posture, carapace topology, and biological weapon organs.
+        // ============================================================================
         const bodyGroup = new THREE.Group();
         group.add(bodyGroup);
 
-        const thoraxMat = role === 'spitter' ? MAT.chitinGreen : (role === 'gorgon' ? MAT.chitinRed : (role === 'crusher' || role === 'behemoth' ? MAT.chitinArmor : MAT.chitinDark));
-        const abdomenMat = role === 'behemoth' ? MAT.hiveVeinGlow : (role === 'gorgon' || role === 'spitter' ? MAT.acidGlow : (role === 'burster' ? MAT.volatileGlow : MAT.chitinRed));
-        const crestMat = role === 'gorgon' || role === 'spitter' ? MAT.acidGlow : (role === 'burster' ? MAT.volatileGlow : MAT.chitinRed);
+        const abdomen = new THREE.Group();
+        const mandL = new THREE.Group();
+        const mandR = new THREE.Group();
+        let scytheL = null;
+        let scytheR = null;
+        const legs = [];
+        const dorsalCannons = [];
+        let tailCatapult = null;
+        let bileSac = null;
 
-        // 100% Organic Ribbed Chitin Thorax & Overlapping Curved Carapace Plates (Zero Boxy Hulls!)
-        const thorax = new THREE.Mesh(createOrganicBioCarapaceGeo(role === 'gorgon' ? 0.42 : 0.34, 0.27, 0.48, 9, 0.10), thoraxMat);
-        thorax.position.y = 0.42;
-        thorax.castShadow = true;
-        bodyGroup.add(thorax);
+        function buildArachnidLegPair(numPairs, hipX, hipY, zStart, zSpacing, L1, L2, rCoxa, rMid, legMat, clawMat) {
+            for (let i = 0; i < numPairs; i++) {
+                const zOff = zStart - i * zSpacing;
+                for (let side of [-1, 1]) {
+                    const hipPivot = new THREE.Group();
+                    hipPivot.position.set(side * hipX, hipY, zOff);
+                    const restYaw = (i - (numPairs - 1) * 0.5) * -0.34 * side;
+                    hipPivot.rotation.y = restYaw;
 
-        for (let p = 0; p < 4; p++) {
-            const shellSegment = new THREE.Mesh(
-                createOrganicBioCarapaceGeo(0.32 - p * 0.03, 0.12, 0.18, 6, 0.04),
-                role === 'crusher' || role === 'behemoth' ? MAT.chitinRed : (role === 'gorgon' ? MAT.chitinArmor : thoraxMat)
-            );
-            shellSegment.rotation.x = 0.24;
-            shellSegment.position.set(0, 0.54 - p * 0.015, 0.22 - p * 0.16);
-            bodyGroup.add(shellSegment);
-        }
+                    const femurPivot = new THREE.Group();
+                    hipPivot.add(femurPivot);
 
-        // 5 Curved Dorsal Razor Spines along the Back
-        for (let s = 0; s < 5; s++) {
-            const dorsalSpine = new THREE.Mesh(createCurvedScytheBladeGeo(0.50 - s * 0.05, 0.09 - s * 0.01, 0.18), MAT.chitinArmor);
-            dorsalSpine.rotation.x = -Math.PI * 0.68;
-            dorsalSpine.position.set(0, 0.58 - s * 0.02, 0.24 - s * 0.16);
-            bodyGroup.add(dorsalSpine);
-        }
+                    const coxaSocket = new THREE.Mesh(
+                        createSculptedMuscleMassGeo(rCoxa * 1.12, rCoxa * 0.95, rCoxa * 1.18, 4, 0.12),
+                        MAT.fleshTendon
+                    );
+                    femurPivot.add(coxaSocket);
 
-        // Sculpted Segmented Bio-Abdomen + Lateral Chitin Gill Ribs
-        const abRx = role === 'burster' ? 0.62 : (role === 'gorgon' ? 0.52 : (role === 'crusher' || role === 'behemoth' ? 0.46 : 0.39));
-        const abRy = role === 'burster' ? 0.56 : (role === 'gorgon' ? 0.38 : (role === 'crusher' || role === 'behemoth' ? 0.40 : 0.34));
-        const abdomen = new THREE.Mesh(createOrganicBioCarapaceGeo(abRx, abRy, 0.58, 10, 0.11), abdomenMat);
-        abdomen.position.set(0, 0.52, -0.52);
-        abdomen.castShadow = true;
-        bodyGroup.add(abdomen);
+                    const femur = new THREE.Mesh(
+                        createSegmentedChitinLimbGeo(L1, rCoxa * 0.94, rMid, rCoxa * 0.68, 0.04, 5),
+                        legMat
+                    );
+                    femur.position.set(side * (L1 * 0.46), L1 * 0.28, 0);
+                    femur.rotation.z = -side * 1.02;
+                    femur.castShadow = true;
+                    femurPivot.add(femur);
 
-        [-1, 1].forEach(side => {
-            for (let g = 0; g < 3; g++) {
-                const gillGuard = new THREE.Mesh(createCurvedScytheBladeGeo(0.36, 0.055, 0.12), crestMat);
-                gillGuard.rotation.z = side * 0.85;
-                gillGuard.rotation.y = -side * 0.45;
-                gillGuard.position.set(side * (abRx * 0.75), 0.50, -0.34 - g * 0.15);
-                bodyGroup.add(gillGuard);
+                    const kneePivot = new THREE.Group();
+                    kneePivot.position.set(side * (L1 * 0.85), L1 * 0.50, 0);
+                    femurPivot.add(kneePivot);
+
+                    const kneeJoint = new THREE.Mesh(
+                        createOrganicBioCarapaceGeo(rCoxa * 0.95, rCoxa * 0.95, rCoxa * 1.05, 4, 0.02),
+                        MAT.chitinRed
+                    );
+                    kneePivot.add(kneeJoint);
+
+                    const kneeSpur = new THREE.Mesh(
+                        createCurvedScytheBladeGeo(L1 * 0.68, rCoxa * 0.52, 0.09),
+                        MAT.copper
+                    );
+                    kneeSpur.position.set(side * 0.03, 0.06, 0);
+                    kneeSpur.rotation.z = -side * 0.55;
+                    kneePivot.add(kneeSpur);
+
+                    const tibia = new THREE.Mesh(
+                        createCurvedScytheBladeGeo(L2 + 0.10, rMid * 0.92, 0.16),
+                        clawMat
+                    );
+                    tibia.rotation.x = Math.PI * 0.52;
+                    tibia.rotation.y = side * 0.22;
+                    tibia.castShadow = true;
+                    kneePivot.add(tibia);
+
+                    group.add(hipPivot);
+                    const tripodGroup = ((side > 0 ? 0 : 1) + i) % 2;
+                    legs.push({
+                        pivot: hipPivot,
+                        femurPivot,
+                        kneePivot,
+                        side,
+                        idx: i,
+                        zOff,
+                        L1,
+                        L2,
+                        tripodGroup,
+                        restYaw,
+                        footWorldPos: null,
+                        stepStartPos: null,
+                        stepTargetPos: null,
+                        stepProgress: 1.0
+                    });
+                }
             }
-        });
+        }
 
-        // Twin Curved Tail Stingers & Whip Barbs
-        [-0.08, 0.08].forEach(tx => {
-            const tailStinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.58, 0.08, 0.22), crestMat);
-            tailStinger.rotation.x = Math.PI * 0.88;
-            tailStinger.rotation.z = tx > 0 ? 0.22 : -0.22;
-            tailStinger.position.set(tx, 0.55, -0.88);
-            bodyGroup.add(tailStinger);
-        });
-
-        // Role-Specific Organic Zerg Anatomy
         if (role === 'skitterer') {
-            // Zergling-style Adrenal Metabolic Dorsal Winglets & Forward Raptor Crest
+            // 1. SKITTERER (Zergling-Class Agile Raptor-Hound Predator)
+            // Forward-lunging narrow predator thorax, arched metabolic dorsal crest,
+            // twin dorsal metabolic wing-fins, raptor scythe-forelimbs, and 6 cursorial legs.
+            const thorax = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.29, 0.23, 0.54, 8, 0.09),
+                MAT.chitinDark
+            );
+            thorax.position.set(0, 0.40, 0.06);
+            thorax.rotation.x = 0.14;
+            thorax.castShadow = true;
+            bodyGroup.add(thorax);
+
+            for (let p = 0; p < 4; p++) {
+                const ridgePlate = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.27 - p * 0.03, 0.10, 0.18, 6, 0.04),
+                    MAT.chitinRed
+                );
+                ridgePlate.position.set(0, 0.50 - p * 0.02, 0.22 - p * 0.14);
+                ridgePlate.rotation.x = 0.25;
+                bodyGroup.add(ridgePlate);
+
+                const spine = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.38 - p * 0.04, 0.07, 0.14),
+                    MAT.chitinArmor
+                );
+                spine.position.set(0, 0.54 - p * 0.02, 0.20 - p * 0.14);
+                spine.rotation.x = -Math.PI * 0.68;
+                bodyGroup.add(spine);
+            }
+
+            // Twin Adrenal Metabolic Dorsal Winglets
             [-0.22, 0.22].forEach(wx => {
                 const winglet = new THREE.Mesh(createCurvedScytheBladeGeo(0.72, 0.085, 0.22), MAT.chitinRed);
                 winglet.rotation.z = wx > 0 ? -0.52 : 0.52;
                 winglet.rotation.x = -Math.PI * 0.58;
-                winglet.position.set(wx, 0.64, -0.02);
+                winglet.position.set(wx, 0.60, -0.02);
                 const subFin = new THREE.Mesh(createCurvedScytheBladeGeo(0.48, 0.06, 0.15), MAT.copper);
                 subFin.rotation.z = wx > 0 ? -0.78 : 0.78;
                 subFin.rotation.x = -Math.PI * 0.64;
-                subFin.position.set(wx * 1.15, 0.56, -0.14);
+                subFin.position.set(wx * 1.15, 0.52, -0.14);
                 bodyGroup.add(winglet, subFin);
             });
-        }
-        if (role === 'spitter') {
-            // Hydralisk-style Flared Cobra Hood Crest + Pressurized Venom Cheek Sacs & Shoulder Needle Ducts
-            [-0.24, 0.24].forEach(xSac => {
-                const venomSac = new THREE.Mesh(createOrganicBioCarapaceGeo(0.17, 0.16, 0.25, 6, 0.05), MAT.acidGlow);
-                venomSac.position.set(xSac, 0.42, 0.28);
-                const crestFin = new THREE.Mesh(createCurvedScytheBladeGeo(0.74, 0.11, 0.24), MAT.chitinGreen);
+
+            // Segmented Whip-Tail Abdomen
+            abdomen.position.set(0, 0.42, -0.46);
+            const abdCore = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.28, 0.24, 0.46, 8, 0.08),
+                MAT.chitinRed
+            );
+            abdCore.castShadow = true;
+            abdomen.add(abdCore);
+            [-0.08, 0.08].forEach(tx => {
+                const tailStinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.52, 0.075, 0.20), MAT.copper);
+                tailStinger.rotation.x = Math.PI * 0.88;
+                tailStinger.rotation.z = tx > 0 ? 0.22 : -0.22;
+                tailStinger.position.set(tx, 0.06, -0.34);
+                abdomen.add(tailStinger);
+            });
+            bodyGroup.add(abdomen);
+
+            // Elongated Hound Skull, Glowing Eyes & Jaw Mandibles
+            const skull = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.22, 0.16, 0.30, 6, 0.05),
+                MAT.chitinArmor
+            );
+            skull.position.set(0, 0.42, 0.38);
+            bodyGroup.add(skull);
+
+            for (let side of [-1, 1]) {
+                const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.058, 8, 8), MAT.amberGlow);
+                eye.position.set(side * 0.11, 0.46, 0.44);
+                bodyGroup.add(eye);
+
+                const fang = new THREE.Mesh(createCurvedScytheBladeGeo(0.42, 0.068, 0.15), MAT.copper);
+                fang.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.15, 0.36, 0.40);
+                mPivot.add(fang);
+                bodyGroup.add(mPivot);
+
+                // Raptor Mantis Scythe Forelimbs
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.25, 0.44, 0.28);
+                const upperArm = new THREE.Mesh(
+                    createSegmentedChitinLimbGeo(0.28, 0.055, 0.07, 0.045, 0.04, 5),
+                    MAT.chitinDark
+                );
+                upperArm.rotation.x = 0.55;
+                sPivot.add(upperArm);
+                const armBlade = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.76, 0.09, 0.24),
+                    MAT.chitinRed
+                );
+                armBlade.position.set(side * 0.04, -0.06, 0.08);
+                sPivot.add(armBlade);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            buildArachnidLegPair(3, 0.24, 0.35, 0.24, 0.24, 0.32, 0.44, 0.068, 0.062, MAT.chitinDark, MAT.chitinRed);
+
+        } else if (role === 'spitter') {
+            // 2. SPITTER (Hydralisk-Class Serpentine Spine-Viper)
+            // Upright S-curved muscular torso, flared armored cobra crest hood,
+            // pressurized emerald venom bladders, and needle-launching scythe arms.
+            const lowerCoil = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.38, 0.26, 0.62, 9, 0.10),
+                MAT.chitinGreen
+            );
+            lowerCoil.position.set(0, 0.38, -0.06);
+            lowerCoil.castShadow = true;
+            bodyGroup.add(lowerCoil);
+
+            const uprightTorso = new THREE.Mesh(
+                createSculptedMuscleMassGeo(0.32, 0.48, 0.30, 8, 0.08),
+                MAT.chitinGreen
+            );
+            uprightTorso.position.set(0, 0.68, 0.20);
+            uprightTorso.rotation.x = -0.24;
+            uprightTorso.castShadow = true;
+            bodyGroup.add(uprightTorso);
+
+            // Flared Cobra Carapace Hood & Pressurized Venom Cheek Sacs
+            [-0.26, 0.26].forEach(xSac => {
+                const venomSac = new THREE.Mesh(
+                    createSculptedMuscleMassGeo(0.18, 0.17, 0.24, 6, 0.14),
+                    MAT.acidGlow
+                );
+                venomSac.position.set(xSac, 0.64, 0.26);
+                const crestFin = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.84, 0.13, 0.26),
+                    MAT.chitinGreen
+                );
                 crestFin.rotation.z = xSac > 0 ? -0.62 : 0.62;
                 crestFin.rotation.x = -Math.PI * 0.62;
-                crestFin.position.set(xSac * 1.12, 0.62, 0.22);
-                const upperFrill = new THREE.Mesh(createCurvedScytheBladeGeo(0.58, 0.085, 0.18), MAT.acidGlow);
+                crestFin.position.set(xSac * 1.15, 0.84, 0.22);
+                const upperFrill = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.66, 0.095, 0.20),
+                    MAT.acidGlow
+                );
                 upperFrill.rotation.z = xSac > 0 ? -0.28 : 0.28;
                 upperFrill.rotation.x = -Math.PI * 0.55;
-                upperFrill.position.set(xSac * 0.68, 0.72, 0.16);
+                upperFrill.position.set(xSac * 0.72, 0.94, 0.16);
                 bodyGroup.add(venomSac, crestFin, upperFrill);
             });
-        }
-        if (role === 'burster') {
-            // Baneling-style Engorged Bioluminescent Acid Blisters & Strained Chitin Containment Ribs
+
+            // Viper Cranial Crest, Acid Eyes & Split Mandibles
+            const browRidge = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.26, 0.16, 0.28, 6, 0.05),
+                MAT.chitinArmor
+            );
+            browRidge.position.set(0, 0.88, 0.32);
+            bodyGroup.add(browRidge);
+
+            for (let side of [-1, 1]) {
+                const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.068, 8, 8), MAT.acidGlow);
+                eye.position.set(side * 0.12, 0.86, 0.42);
+                bodyGroup.add(eye);
+
+                const jaw = new THREE.Mesh(createCurvedScytheBladeGeo(0.48, 0.08, 0.16), MAT.copper);
+                jaw.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.16, 0.74, 0.38);
+                mPivot.add(jaw);
+                bodyGroup.add(mPivot);
+
+                // Tri-Bladed Needle-Launcher Scythe Arms
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.32, 0.68, 0.26);
+                const upperArm = new THREE.Mesh(
+                    createSegmentedChitinLimbGeo(0.36, 0.075, 0.095, 0.065, 0.05, 6),
+                    MAT.chitinGreen
+                );
+                upperArm.rotation.x = 0.52;
+                const armBlade = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.90, 0.11, 0.28),
+                    MAT.chitinRed
+                );
+                armBlade.position.set(side * 0.05, -0.06, 0.10);
+                sPivot.add(upperArm, armBlade);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            // Coiled Serpentine Tail Abdomen
+            abdomen.position.set(0, 0.42, -0.56);
+            const abdCore = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.38, 0.30, 0.58, 9, 0.10),
+                MAT.acidGlow
+            );
+            abdCore.castShadow = true;
+            abdomen.add(abdCore);
+            [-0.09, 0.09].forEach(tx => {
+                const tailStinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.62, 0.085, 0.22), MAT.acidGlow);
+                tailStinger.rotation.x = Math.PI * 0.88;
+                tailStinger.rotation.z = tx > 0 ? 0.22 : -0.22;
+                tailStinger.position.set(tx, 0.08, -0.38);
+                abdomen.add(tailStinger);
+            });
+            bodyGroup.add(abdomen);
+
+            buildArachnidLegPair(3, 0.28, 0.36, 0.24, 0.26, 0.36, 0.50, 0.078, 0.072, MAT.chitinGreen, MAT.chitinDark);
+
+        } else if (role === 'burster') {
+            // 3. BURSTER (Baneling-Class Volatile Acid-Tick)
+            // Low-slung forward thorax dominated by a massive bloated multi-chambered
+            // bioluminescent acid-pustule sac that sloshes and pulses as it scuttles.
+            const headCarapace = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.34, 0.22, 0.40, 7, 0.08),
+                MAT.chitinDark
+            );
+            headCarapace.position.set(0, 0.36, 0.24);
+            headCarapace.rotation.x = 0.20;
+            headCarapace.castShadow = true;
+            bodyGroup.add(headCarapace);
+
+            // Massive Swollen Multi-Chambered Volatile Acid Sac
+            abdomen.position.set(0, 0.58, -0.32);
+            const mainSac = new THREE.Mesh(
+                createSculptedMuscleMassGeo(0.64, 0.58, 0.66, 9, 0.20),
+                MAT.volatileGlow
+            );
+            mainSac.castShadow = true;
+            abdomen.add(mainSac);
+            bileSac = mainSac;
+
+            // 8 Engorged Bioluminescent Acid Blisters & Strained Chitin Containment Ribs
             for (let b = 0; b < 8; b++) {
                 const ba = (b / 8) * Math.PI * 2;
-                const blister = new THREE.Mesh(createOrganicBioCarapaceGeo(0.22, 0.20, 0.22, 5, 0.05), b % 2 === 0 ? MAT.amberGlow : MAT.acidGlow);
-                blister.position.set(Math.cos(ba) * 0.38, 0.68 + (b % 2) * 0.06, -0.50 + Math.sin(ba) * 0.38);
-                const ribCage = new THREE.Mesh(createCurvedScytheBladeGeo(0.44, 0.06, 0.16), MAT.chitinDark);
+                const blister = new THREE.Mesh(
+                    createSculptedMuscleMassGeo(0.24, 0.22, 0.24, 5, 0.22),
+                    b % 2 === 0 ? MAT.amberGlow : MAT.acidGlow
+                );
+                blister.position.set(Math.cos(ba) * 0.40, 0.14 + (b % 2) * 0.06, Math.sin(ba) * 0.40);
+                const ribCage = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.48, 0.065, 0.16),
+                    MAT.chitinDark
+                );
                 ribCage.rotation.y = ba;
-                ribCage.position.set(Math.cos(ba) * 0.46, 0.56, -0.50 + Math.sin(ba) * 0.46);
-                bodyGroup.add(blister, ribCage);
+                ribCage.position.set(Math.cos(ba) * 0.48, 0.02, Math.sin(ba) * 0.48);
+                abdomen.add(blister, ribCage);
             }
-        }
-        if (role === 'crusher' || role === 'behemoth') {
-            // Ultralisk / Ravager Four-Blade Kaiser Scythe Tusks & Armored Carapace Crown
-            const headShield = new THREE.Mesh(createOrganicBioCarapaceGeo(0.46, 0.24, 0.38, 7, 0.08), MAT.chitinRed);
+            bodyGroup.add(abdomen);
+
+            for (let side of [-1, 1]) {
+                const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.06, 8, 8), MAT.amberGlow);
+                eye.position.set(side * 0.13, 0.42, 0.42);
+                bodyGroup.add(eye);
+
+                const pincer = new THREE.Mesh(createCurvedScytheBladeGeo(0.42, 0.07, 0.15), MAT.volatileGlow);
+                pincer.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.16, 0.32, 0.40);
+                mPivot.add(pincer);
+                bodyGroup.add(mPivot);
+
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.26, 0.38, 0.28);
+                const claw = new THREE.Mesh(createCurvedScytheBladeGeo(0.58, 0.08, 0.20), MAT.chitinRed);
+                claw.position.set(side * 0.04, -0.05, 0.08);
+                sPivot.add(claw);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            buildArachnidLegPair(3, 0.28, 0.34, 0.22, 0.24, 0.32, 0.44, 0.072, 0.065, MAT.chitinDark, MAT.chitinRed);
+
+        } else if (role === 'crusher') {
+            // 4. CRUSHER (Roach/Ravager-Class Heavy Armored Siege Beetle)
+            // Broad fortress carapace, battering-ram cranial horn shield,
+            // dorsal corrosive-bile artillery mortar aperture, and thick armored legs.
+            const fortressCarapace = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.54, 0.40, 0.76, 10, 0.14),
+                MAT.chitinArmor
+            );
+            fortressCarapace.position.set(0, 0.56, 0.04);
+            fortressCarapace.castShadow = true;
+            bodyGroup.add(fortressCarapace);
+
+            for (let p = 0; p < 4; p++) {
+                const dorsalShield = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.50 - p * 0.05, 0.18, 0.26, 7, 0.06),
+                    MAT.chitinRed
+                );
+                dorsalShield.position.set(0, 0.74 - p * 0.03, 0.28 - p * 0.22);
+                dorsalShield.rotation.x = 0.22;
+                bodyGroup.add(dorsalShield);
+            }
+
+            // Battering-Ram Cranial Shield & Sweeping Ravager Horns
+            const headShield = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.52, 0.28, 0.44, 8, 0.09),
+                MAT.chitinRed
+            );
             headShield.rotation.x = Math.PI / 5;
-            headShield.position.set(0, 0.68, 0.36);
+            headShield.position.set(0, 0.72, 0.44);
             bodyGroup.add(headShield);
 
-            [-0.28, 0.28].forEach(xHorn => {
-                const kaiserTusk = new THREE.Mesh(createCurvedScytheBladeGeo(1.18, 0.145, 0.36), MAT.copper);
+            [-0.32, 0.32].forEach(xHorn => {
+                const kaiserTusk = new THREE.Mesh(createCurvedScytheBladeGeo(1.24, 0.15, 0.36), MAT.copper);
                 kaiserTusk.rotation.z = xHorn > 0 ? -0.45 : 0.45;
-                kaiserTusk.position.set(xHorn, 0.48, 0.36);
-                const upperHorn = new THREE.Mesh(createCurvedScytheBladeGeo(0.84, 0.105, 0.25), MAT.chitinArmor);
+                kaiserTusk.position.set(xHorn, 0.54, 0.44);
+                const upperHorn = new THREE.Mesh(createCurvedScytheBladeGeo(0.88, 0.11, 0.26), MAT.chitinArmor);
                 upperHorn.rotation.z = xHorn > 0 ? -0.25 : 0.25;
                 upperHorn.rotation.x = 0.25;
-                upperHorn.position.set(xHorn * 1.18, 0.66, 0.24);
+                upperHorn.position.set(xHorn * 1.18, 0.74, 0.30);
                 bodyGroup.add(kaiserTusk, upperHorn);
             });
-        }
 
-        // NEW UNIQUE ZERG BIO-FACTORY UNIT: 'gorgon' (Zerg Bile-Scorpion Gorgon Leviathan)
-        // Features an overarching multi-segmented Scorpion Tail-Catapult launching Corrosive Bile-Web Meteors + Twin Crusher Pincer Claws!
-        let tailCatapult = null;
-        let bileSac = null;
-        if (role === 'gorgon') {
-            // Armored Scorpion Carapace Crown & Lateral Bioluminescent Bile-Boil Sacs
-            const scorpionCrown = new THREE.Mesh(createOrganicBioCarapaceGeo(0.50, 0.22, 0.42, 7, 0.08), MAT.chitinArmor);
+            // Dorsal Corrosive-Bile Artillery Mortar Sac & Rear Carapace
+            abdomen.position.set(0, 0.58, -0.62);
+            const rearShell = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.52, 0.44, 0.68, 9, 0.12),
+                MAT.chitinRed
+            );
+            rearShell.castShadow = true;
+            abdomen.add(rearShell);
+            const mortarSac = new THREE.Mesh(
+                createSculptedMuscleMassGeo(0.34, 0.28, 0.38, 6, 0.16),
+                MAT.volatileGlow
+            );
+            mortarSac.position.set(0, 0.28, 0.08);
+            abdomen.add(mortarSac);
+            bileSac = mortarSac;
+            bodyGroup.add(abdomen);
+
+            for (let side of [-1, 1]) {
+                const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.075, 8, 8), MAT.amberGlow);
+                eye.position.set(side * 0.18, 0.58, 0.54);
+                bodyGroup.add(eye);
+
+                const jaw = new THREE.Mesh(createCurvedScytheBladeGeo(0.56, 0.095, 0.20), MAT.copper);
+                jaw.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.22, 0.44, 0.52);
+                mPivot.add(jaw);
+                bodyGroup.add(mPivot);
+
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.40, 0.58, 0.36);
+                const upperArm = new THREE.Mesh(
+                    createSegmentedChitinLimbGeo(0.46, 0.10, 0.13, 0.085, 0.06, 6),
+                    MAT.chitinArmor
+                );
+                upperArm.rotation.x = 0.55;
+                const armBlade = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(1.08, 0.14, 0.32),
+                    MAT.chitinRed
+                );
+                armBlade.position.set(side * 0.06, -0.08, 0.12);
+                sPivot.add(upperArm, armBlade);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            buildArachnidLegPair(3, 0.38, 0.46, 0.34, 0.34, 0.48, 0.64, 0.105, 0.095, MAT.chitinArmor, MAT.chitinDark);
+
+        } else if (role === 'gorgon') {
+            // 5. GORGON (8-Legged Arachnid Bile-Scorpion Leviathan)
+            // Wide arachnid cephalothorax, 8 multi-jointed legs (4 pairs),
+            // massive twin crushing chelae pincers, pulsating emerald bile-reactor sac,
+            // and a towering overarching scorpion artillery tail-catapult.
+            const cephaloThorax = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.64, 0.40, 0.80, 10, 0.14),
+                MAT.chitinRed
+            );
+            cephaloThorax.position.set(0, 0.58, 0.06);
+            cephaloThorax.castShadow = true;
+            bodyGroup.add(cephaloThorax);
+
+            const scorpionCrown = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.66, 0.28, 0.56, 8, 0.10),
+                MAT.chitinArmor
+            );
             scorpionCrown.rotation.x = 0.22;
-            scorpionCrown.position.set(0, 0.64, 0.32);
+            scorpionCrown.position.set(0, 0.78, 0.38);
             bodyGroup.add(scorpionCrown);
 
-            [-0.36, 0.36].forEach(xSac => {
-                const boilA = new THREE.Mesh(createOrganicBioCarapaceGeo(0.18, 0.16, 0.22, 5, 0.04), MAT.acidGlow);
-                boilA.position.set(xSac, 0.56, -0.26);
-                const boilB = new THREE.Mesh(createOrganicBioCarapaceGeo(0.15, 0.14, 0.18, 5, 0.04), MAT.hiveVeinGlow);
-                boilB.position.set(xSac * 1.08, 0.52, -0.56);
+            [-0.44, 0.44].forEach(xSac => {
+                const boilA = new THREE.Mesh(createSculptedMuscleMassGeo(0.24, 0.20, 0.28, 5, 0.18), MAT.acidGlow);
+                boilA.position.set(xSac, 0.68, -0.28);
+                const boilB = new THREE.Mesh(createSculptedMuscleMassGeo(0.20, 0.18, 0.24, 5, 0.18), MAT.hiveVeinGlow);
+                boilB.position.set(xSac * 1.08, 0.64, -0.64);
                 bodyGroup.add(boilA, boilB);
             });
 
+            // Swollen Pressurized Emerald Bile-Reactor Abdomen
+            abdomen.position.set(0, 0.64, -0.68);
+            const abdCore = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.64, 0.48, 0.74, 10, 0.14),
+                MAT.acidGlow
+            );
+            abdCore.castShadow = true;
+            abdomen.add(abdCore);
+            bodyGroup.add(abdomen);
+
             // Overarching Articulated Scorpion Tail-Catapult Pivot
             tailCatapult = new THREE.Group();
-            tailCatapult.position.set(0, 0.58, -0.78);
+            tailCatapult.position.set(0, 0.70, -0.92);
             const tailCurve = new THREE.CatmullRomCurve3([
                 new THREE.Vector3(0, 0, 0),
-                new THREE.Vector3(0, 0.55, -0.26),
-                new THREE.Vector3(0, 1.05, 0.18),
-                new THREE.Vector3(0, 1.16, 0.82)
+                new THREE.Vector3(0, 0.72, -0.34),
+                new THREE.Vector3(0, 1.38, 0.24),
+                new THREE.Vector3(0, 1.52, 1.08)
             ]);
-            const tailTube = new THREE.Mesh(new THREE.TubeGeometry(tailCurve, 12, 0.12, 8, false), MAT.chitinArmor);
+            const tailTube = new THREE.Mesh(new THREE.TubeGeometry(tailCurve, 14, 0.16, 8, false), MAT.chitinArmor);
             tailTube.castShadow = true;
             tailCatapult.add(tailTube);
 
-            // Chitin Vertebral Armor Plates & Razor Spines along the Scorpion Tail Arch
             for (let t = 1; t <= 4; t++) {
                 const pt = tailCurve.getPoint(t / 5);
-                const segPlate = new THREE.Mesh(createOrganicBioCarapaceGeo(0.18 - t * 0.015, 0.12, 0.20, 5, 0.04), MAT.chitinRed);
+                const segPlate = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.24 - t * 0.02, 0.16, 0.26, 6, 0.05),
+                    MAT.chitinRed
+                );
                 segPlate.position.copy(pt);
-                const barb = new THREE.Mesh(createCurvedScytheBladeGeo(0.38, 0.06, 0.14), MAT.copper);
-                barb.position.set(pt.x, pt.y + 0.08, pt.z - 0.06);
+                const barb = new THREE.Mesh(createCurvedScytheBladeGeo(0.48, 0.08, 0.18), MAT.copper);
+                barb.position.set(pt.x, pt.y + 0.10, pt.z - 0.08);
                 barb.rotation.x = -Math.PI * 0.55;
                 tailCatapult.add(segPlate, barb);
             }
 
-            // Glowing Bile-Plasma Mortar Organ & Twin Stinger Mandibles at the Scorpion Tail Tip
-            bileSac = new THREE.Mesh(createOrganicBioCarapaceGeo(0.24, 0.22, 0.30, 6, 0.05), MAT.acidGlow);
-            bileSac.position.set(0, 1.16, 0.88);
-            const nozzleCollar = new THREE.Mesh(createSculptedTorusCollarGeo(0.15, 0.045, 7, 12), MAT.hiveVeinGlow);
-            nozzleCollar.position.set(0, 1.16, 1.12);
-            [-0.14, 0.14].forEach(sx => {
-                const stinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.52, 0.075, 0.18), MAT.copper);
-                stinger.position.set(sx, 1.18, 0.96);
+            bileSac = new THREE.Mesh(createSculptedMuscleMassGeo(0.32, 0.28, 0.38, 6, 0.16), MAT.acidGlow);
+            bileSac.position.set(0, 1.52, 1.16);
+            const nozzleCollar = new THREE.Mesh(createSculptedTorusCollarGeo(0.20, 0.055, 7, 12), MAT.hiveVeinGlow);
+            nozzleCollar.position.set(0, 1.52, 1.44);
+            [-0.18, 0.18].forEach(sx => {
+                const stinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.68, 0.095, 0.24), MAT.copper);
+                stinger.position.set(sx, 1.54, 1.26);
                 stinger.rotation.y = sx > 0 ? -0.28 : 0.28;
                 tailCatapult.add(stinger);
             });
             tailCatapult.add(bileSac, nozzleCollar);
             bodyGroup.add(tailCatapult);
-        }
 
-        const dorsalCannons = [];
-        if (role === 'behemoth') {
-            [-0.26, 0.26].forEach(xCan => {
+            for (let side of [-1, 1]) {
+                for (let e = 0; e < 2; e++) {
+                    const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.075 - e * 0.015, 8, 8), MAT.acidGlow);
+                    eye.position.set(side * (0.16 + e * 0.09), 0.64 + e * 0.04, 0.58 - e * 0.04);
+                    bodyGroup.add(eye);
+                }
+
+                const fang = new THREE.Mesh(createCurvedScytheBladeGeo(0.60, 0.095, 0.22), MAT.copper);
+                fang.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.24, 0.48, 0.54);
+                mPivot.add(fang);
+                bodyGroup.add(mPivot);
+
+                // Heavy Twin Crushing Scorpion Chelae Pincer-Claws
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.48, 0.62, 0.38);
+                const upperArm = new THREE.Mesh(
+                    createSegmentedChitinLimbGeo(0.52, 0.12, 0.16, 0.10, 0.07, 6),
+                    MAT.chitinRed
+                );
+                upperArm.rotation.x = 0.55;
+                const outerClaw = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(1.26, 0.16, 0.34),
+                    MAT.chitinRed
+                );
+                outerClaw.position.set(side * 0.06, -0.08, 0.12);
+                const innerThumb = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.84, 0.11, -0.24),
+                    MAT.copper
+                );
+                innerThumb.position.set(-side * 0.10, -0.06, 0.22);
+                innerThumb.rotation.y = side * 0.32;
+                sPivot.add(upperArm, outerClaw, innerThumb);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            buildArachnidLegPair(4, 0.44, 0.48, 0.48, 0.32, 0.52, 0.70, 0.115, 0.105, MAT.chitinRed, MAT.chitinDark);
+
+        } else if (role === 'behemoth') {
+            // 6. BEHEMOTH (Ultralisk-Class Colossal Apex Juggernaut)
+            // Towering hunched muscular shoulder-mass, 4 sweeping Kaiser Tusk Scythe Blades,
+            // twin dorsal symbiotic bio-plasma cannons, and heavy elephantine chitin legs.
+            const colossalThorax = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.68, 0.52, 0.92, 11, 0.16),
+                MAT.chitinArmor
+            );
+            colossalThorax.position.set(0, 0.76, 0.06);
+            colossalThorax.castShadow = true;
+            bodyGroup.add(colossalThorax);
+
+            const shoulderHump = new THREE.Mesh(
+                createSculptedMuscleMassGeo(0.64, 0.46, 0.62, 8, 0.14),
+                MAT.chitinRed
+            );
+            shoulderHump.position.set(0, 1.06, 0.22);
+            shoulderHump.castShadow = true;
+            bodyGroup.add(shoulderHump);
+
+            for (let p = 0; p < 5; p++) {
+                const plate = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.62 - p * 0.06, 0.22, 0.32, 7, 0.08),
+                    MAT.chitinRed
+                );
+                plate.position.set(0, 1.12 - p * 0.06, 0.36 - p * 0.26);
+                plate.rotation.x = 0.24;
+                bodyGroup.add(plate);
+
+                const spine = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(0.86 - p * 0.08, 0.15, 0.28),
+                    MAT.chitinArmor
+                );
+                spine.position.set(0, 1.22 - p * 0.06, 0.38 - p * 0.26);
+                spine.rotation.x = -Math.PI * 0.68;
+                bodyGroup.add(spine);
+            }
+
+            // Armored Carapace Crown & Four-Blade Kaiser Scythe Tusks
+            const headShield = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.68, 0.38, 0.58, 8, 0.12),
+                MAT.chitinRed
+            );
+            headShield.rotation.x = Math.PI / 5;
+            headShield.position.set(0, 1.02, 0.58);
+            bodyGroup.add(headShield);
+
+            [-0.44, 0.44].forEach(xHorn => {
+                const kaiserTusk = new THREE.Mesh(createCurvedScytheBladeGeo(1.78, 0.22, 0.52), MAT.copper);
+                kaiserTusk.rotation.z = xHorn > 0 ? -0.45 : 0.45;
+                kaiserTusk.position.set(xHorn, 0.76, 0.58);
+                const upperHorn = new THREE.Mesh(createCurvedScytheBladeGeo(1.28, 0.16, 0.38), MAT.chitinArmor);
+                upperHorn.rotation.z = xHorn > 0 ? -0.25 : 0.25;
+                upperHorn.rotation.x = 0.25;
+                upperHorn.position.set(xHorn * 1.18, 1.04, 0.38);
+                bodyGroup.add(kaiserTusk, upperHorn);
+            });
+
+            // Twin Dorsal Symbiotic Bio-Plasma Cannons
+            [-0.42, 0.42].forEach(xCan => {
                 const canPivot = new THREE.Group();
-                canPivot.position.set(xCan, 0.90, -0.12);
-                canPivot.userData = { baseX: xCan, baseY: 0.90, baseZ: -0.12, baseRotX: Math.PI / 3.4 };
+                canPivot.position.set(xCan, 1.38, -0.16);
+                canPivot.userData = { baseX: xCan, baseY: 1.38, baseZ: -0.16, baseRotX: Math.PI / 3.4 };
                 canPivot.rotation.x = Math.PI / 3.4;
 
-                const bioCannon = new THREE.Mesh(createOrganicBioCarapaceGeo(0.20, 0.52, 0.22, 7, 0.06), MAT.zergTeamPurple);
-                const cannonCowl = new THREE.Mesh(createCurvedScytheBladeGeo(0.72, 0.10, 0.18), MAT.chitinArmor);
-                cannonCowl.position.set(0, 0.12, -0.12);
-                const cannonTip = new THREE.Mesh(createOrganicBioCarapaceGeo(0.15, 0.15, 0.15, 6, 0.04), MAT.hiveVeinGlow);
-                cannonTip.position.y = 0.50;
+                const bioCannon = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.30, 0.78, 0.34, 8, 0.08),
+                    MAT.zergTeamPurple
+                );
+                const cannonCowl = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(1.08, 0.15, 0.28),
+                    MAT.chitinArmor
+                );
+                cannonCowl.position.set(0, 0.18, -0.18);
+                const cannonTip = new THREE.Mesh(
+                    createOrganicBioCarapaceGeo(0.22, 0.22, 0.22, 6, 0.06),
+                    MAT.hiveVeinGlow
+                );
+                cannonTip.position.y = 0.76;
                 canPivot.add(bioCannon, cannonCowl, cannonTip);
                 bodyGroup.add(canPivot);
                 dorsalCannons.push(canPivot);
             });
-        }
 
-        // Organic Raptorial Fore-Scythes (or Heavy Twin Crusher Pincer-Claws for Gorgon)
-        const scytheL = new THREE.Group();
-        scytheL.position.set(role === 'gorgon' ? -0.36 : -0.28, 0.48, 0.28);
-        const upperArmL = new THREE.Mesh(createOrganicBioCarapaceGeo(role === 'gorgon' ? 0.12 : 0.08, 0.16, 0.16, 5, 0.03), thoraxMat);
-        upperArmL.rotation.x = 0.55;
-        const armBladeL = new THREE.Mesh(createCurvedScytheBladeGeo(role === 'gorgon' ? 0.96 : 0.82, role === 'gorgon' ? 0.12 : 0.095, 0.26), MAT.chitinRed);
-        armBladeL.position.set(-0.04, -0.06, 0.08);
-        scytheL.add(upperArmL, armBladeL);
-
-        const scytheR = new THREE.Group();
-        scytheR.position.set(role === 'gorgon' ? 0.36 : 0.28, 0.48, 0.28);
-        const upperArmR = upperArmL.clone();
-        const armBladeR = new THREE.Mesh(createCurvedScytheBladeGeo(role === 'gorgon' ? 0.96 : 0.82, role === 'gorgon' ? 0.12 : 0.095, 0.26), MAT.chitinRed);
-        armBladeR.position.set(0.04, -0.06, 0.08);
-        scytheR.add(upperArmR, armBladeR);
-        if (role === 'gorgon') {
-            // Inner opposing pincer thumb-blades so Gorgon has true crushing scorpion claws!
-            const thumbL = new THREE.Mesh(createCurvedScytheBladeGeo(0.64, 0.085, -0.18), MAT.copper);
-            thumbL.position.set(0.08, -0.05, 0.16);
-            thumbL.rotation.y = -0.32;
-            scytheL.add(thumbL);
-            const thumbR = new THREE.Mesh(createCurvedScytheBladeGeo(0.64, 0.085, -0.18), MAT.copper);
-            thumbR.position.set(-0.08, -0.05, 0.16);
-            thumbR.rotation.y = 0.32;
-            scytheR.add(thumbR);
-        }
-        bodyGroup.add(scytheL, scytheR);
-
-        const mandL = new THREE.Mesh(createCurvedScytheBladeGeo(0.46, 0.072, 0.16), MAT.copper);
-        mandL.rotation.z = -Math.PI * 0.42;
-        mandL.position.set(-0.16, 0.36, 0.38);
-        const mandR = new THREE.Mesh(createCurvedScytheBladeGeo(0.46, 0.072, 0.16), MAT.copper);
-        mandR.rotation.z = Math.PI * 0.42;
-        mandR.position.set(0.16, 0.36, 0.38);
-        bodyGroup.add(mandL, mandR);
-
-        // Organic Chitin Brow Crest & 4 Compound Glowing Bio-Eyes
-        const browRidge = new THREE.Mesh(createOrganicBioCarapaceGeo(0.22, 0.07, 0.14, 5, 0.03), MAT.chitinArmor);
-        browRidge.position.set(0, 0.56, 0.38);
-        bodyGroup.add(browRidge);
-        const eyeMat = (role === 'spitter' || role === 'gorgon') ? MAT.acidGlow : MAT.amberGlow;
-        [-0.14, -0.07, 0.07, 0.14].forEach((ex, eIdx) => {
-            const eye = new THREE.Mesh(createSculptedArmorDomeGeo(eIdx === 0 || eIdx === 3 ? 0.052 : 0.072, 8, 8), eyeMat);
-            eye.position.set(ex, 0.49 + (eIdx === 0 || eIdx === 3 ? 0.05 : 0), 0.42);
-            bodyGroup.add(eye);
-        });
-
-        // Articulated 2-Bone IK Organic Chitin Legs (8 arachnid legs for Gorgon, 6 for standard Zerg)
-        const legs = [];
-        const legZOffsets = role === 'gorgon' ? [-0.36, -0.12, 0.12, 0.36] : [-0.26, 0, 0.26];
-        [-1, 1].forEach(side => {
-            legZOffsets.forEach((zOff, idx) => {
-                const hipPivot = new THREE.Group();
-                hipPivot.position.set(side * (role === 'gorgon' ? 0.30 : 0.25), 0.36, zOff);
-
-                const femurPivot = new THREE.Group();
-                hipPivot.add(femurPivot);
-
-                const L1 = 0.34;
-                const L2 = 0.48;
-
-                const coxaSocket = new THREE.Mesh(createOrganicBioCarapaceGeo(0.072, 0.072, 0.085, 4, 0.02), MAT.chitinDark);
-                femurPivot.add(coxaSocket);
-
-                const femur = new THREE.Mesh(createOrganicBioCarapaceGeo(0.075, L1 * 0.58, 0.085, 5, 0.025), thoraxMat);
-                femur.position.set(side * (L1 * 0.46), L1 * 0.28, 0);
-                femur.rotation.z = -side * 1.02;
-                femurPivot.add(femur);
-
-                const kneePivot = new THREE.Group();
-                kneePivot.position.set(side * 0.29, 0.17, 0);
-                femurPivot.add(kneePivot);
-
-                const kneeJoint = new THREE.Mesh(createOrganicBioCarapaceGeo(0.078, 0.078, 0.09, 4, 0.02), MAT.chitinRed);
-                kneePivot.add(kneeJoint);
-
-                const kneeSpur = new THREE.Mesh(createCurvedScytheBladeGeo(0.28, 0.042, 0.09), MAT.copper);
-                kneeSpur.position.set(side * 0.03, 0.06, 0);
-                kneeSpur.rotation.z = -side * 0.55;
-                kneePivot.add(kneeSpur);
-
-                const tibia = new THREE.Mesh(createCurvedScytheBladeGeo(L2 + 0.10, 0.068, 0.16), MAT.chitinDark);
-                tibia.position.set(0, 0, 0);
-                tibia.rotation.x = Math.PI * 0.52;
-                tibia.rotation.y = side * 0.22;
-                kneePivot.add(tibia);
-
-                group.add(hipPivot);
-                const tripodGroup = ((side > 0 ? 0 : 1) + idx) % 2;
-                const restYaw = (idx - 1) * -0.34 * side;
-                legs.push({
-                    pivot: hipPivot,
-                    femurPivot,
-                    kneePivot,
-                    side,
-                    idx,
-                    zOff,
-                    L1,
-                    L2,
-                    tripodGroup,
-                    restYaw,
-                    footWorldPos: null,
-                    stepStartPos: null,
-                    stepTargetPos: null,
-                    stepProgress: 1.0
-                });
+            // Bioluminescent Hive-Core Abdomen & Twin Tail Stingers
+            abdomen.position.set(0, 0.82, -0.86);
+            const hiveAbdomen = new THREE.Mesh(
+                createOrganicBioCarapaceGeo(0.72, 0.62, 0.88, 10, 0.16),
+                MAT.hiveVeinGlow
+            );
+            hiveAbdomen.castShadow = true;
+            abdomen.add(hiveAbdomen);
+            [-0.14, 0.14].forEach(tx => {
+                const tailStinger = new THREE.Mesh(createCurvedScytheBladeGeo(0.92, 0.14, 0.34), MAT.chitinRed);
+                tailStinger.rotation.x = Math.PI * 0.88;
+                tailStinger.rotation.z = tx > 0 ? 0.22 : -0.22;
+                tailStinger.position.set(tx, 0.12, -0.58);
+                abdomen.add(tailStinger);
             });
-        });
+            bodyGroup.add(abdomen);
+
+            for (let side of [-1, 1]) {
+                const eye = new THREE.Mesh(createSculptedArmorDomeGeo(0.095, 8, 8), MAT.amberGlow);
+                eye.position.set(side * 0.24, 0.84, 0.72);
+                bodyGroup.add(eye);
+
+                const jaw = new THREE.Mesh(createCurvedScytheBladeGeo(0.76, 0.12, 0.26), MAT.copper);
+                jaw.rotation.z = side * Math.PI * 0.42;
+                const mPivot = side < 0 ? mandL : mandR;
+                mPivot.position.set(side * 0.28, 0.64, 0.68);
+                mPivot.add(jaw);
+                bodyGroup.add(mPivot);
+
+                const sPivot = new THREE.Group();
+                sPivot.position.set(side * 0.52, 0.82, 0.48);
+                const upperArm = new THREE.Mesh(
+                    createSegmentedChitinLimbGeo(0.58, 0.14, 0.18, 0.12, 0.08, 6),
+                    MAT.chitinArmor
+                );
+                upperArm.rotation.x = 0.55;
+                const armBlade = new THREE.Mesh(
+                    createCurvedScytheBladeGeo(1.42, 0.18, 0.42),
+                    MAT.chitinRed
+                );
+                armBlade.position.set(side * 0.08, -0.10, 0.14);
+                sPivot.add(upperArm, armBlade);
+                bodyGroup.add(sPivot);
+                if (side < 0) scytheL = sPivot;
+                else scytheR = sPivot;
+            }
+
+            buildArachnidLegPair(3, 0.46, 0.62, 0.46, 0.46, 0.62, 0.84, 0.135, 0.125, MAT.chitinArmor, MAT.chitinDark);
+        }
 
         group.userData = {
             isBug: true, isAir: false, variant: role, bodyGroup, abdomen, mandL, mandR, scytheL, scytheR, legs, dorsalCannons,
@@ -6231,7 +7141,7 @@ function createAnimatedUnitModel(role) {
         return group;
     }
 
-    // --- 3RD FACTION: THE SOLARIS CHRONO-SYNOD UNITS (ZEALOT / STALKER / ARCHON) — ENHANCED HIGH-POLY MESHES ---
+    // --- 3RD FACTION: THE SOLARIS CHRONO-SYNOD UNITS (ZEALOT / STALKER / ARCHON) — ENHANCED ALIEN ARCHITECTURE ---
     if (role === 'zealot' || role === 'stalker' || role === 'archon') {
         if (role === 'stalker') {
             // SOLARIS PRISM STALKER: Sculpted Quad-Legged Golden-Obsidian Void Walker with Dorsal Khaydarin Spine, Levitating Oracle Head & Twin Particle Disruptors
@@ -6239,15 +7149,15 @@ function createAnimatedUnitModel(role) {
             bodyGroup.position.y = 0.58;
             group.add(bodyGroup);
 
-            const hull = new THREE.Mesh(createExtrudedArmorHullGeo(0.74, 0.36, 1.06, 0.05, 0.18), MAT.solarisObsidian);
+            const hull = new THREE.Mesh(createCompoundArmorChestGeo(0.76, 0.36, 1.06, 0.22, 0.28), MAT.solarisObsidian);
             hull.castShadow = true;
-            const goldCarapace = new THREE.Mesh(createExtrudedArmorHullGeo(0.80, 0.18, 0.90, 0.04, 0.16), MAT.solarisGold);
+            const goldCarapace = new THREE.Mesh(createCompoundArmorChestGeo(0.82, 0.18, 0.90, 0.24, 0.22), MAT.solarisGold);
             goldCarapace.position.y = 0.18;
-            const ivoryWingL = new THREE.Mesh(createCurvedScytheBladeGeo(0.76, 0.09, 0.18), MAT.solarisIvory);
-            ivoryWingL.position.set(-0.38, 0.22, -0.08);
+            const ivoryWingL = new THREE.Mesh(createProtossArchBladeGeo(0.82, 0.16, 0.05, 0.26), MAT.solarisIvory);
+            ivoryWingL.position.set(-0.42, 0.22, -0.08);
             ivoryWingL.rotation.set(-0.35, -0.25, 0.55);
-            const ivoryWingR = new THREE.Mesh(createCurvedScytheBladeGeo(0.76, 0.09, 0.18), MAT.solarisIvory);
-            ivoryWingR.position.set(0.38, 0.22, -0.08);
+            const ivoryWingR = new THREE.Mesh(createProtossArchBladeGeo(0.82, 0.16, 0.05, 0.26), MAT.solarisIvory);
+            ivoryWingR.position.set(0.42, 0.22, -0.08);
             ivoryWingR.rotation.set(-0.35, 0.25, -0.55);
 
             // Dorsal Khaydarin Void Capacitor Core & Floating Containment Ring
@@ -6264,13 +7174,13 @@ function createAnimatedUnitModel(role) {
             stalkerHead.position.set(0, 0.24, 0.50);
             const headProw = new THREE.Mesh(createSculptedOgiveSpireGeo(0.26, 0.64, 6), MAT.solarisIvory);
             headProw.rotation.x = Math.PI / 2;
-            const goldCrest = new THREE.Mesh(createCurvedScytheBladeGeo(0.52, 0.07, 0.14), MAT.solarisGold);
+            const goldCrest = new THREE.Mesh(createProtossArchBladeGeo(0.56, 0.12, 0.04, 0.24), MAT.solarisGold);
             goldCrest.position.set(0, 0.14, -0.05);
             goldCrest.rotation.x = -0.45;
             const opticEye = new THREE.Mesh(createSculptedArmorDomeGeo(0.12, 12, 12), MAT.solarisCrystal);
             opticEye.position.set(0, 0.04, 0.25);
             [-0.28, 0.28].forEach(bx => {
-                const shroud = new THREE.Mesh(createExtrudedArmorHullGeo(0.12, 0.14, 0.48, 0.02, 0.06), MAT.solarisObsidian);
+                const shroud = new THREE.Mesh(createCompoundArmorChestGeo(0.14, 0.15, 0.48, 0.20, 0.16), MAT.solarisObsidian);
                 shroud.position.set(bx, -0.05, 0.18);
                 const disruptor = new THREE.Mesh(createSculptedLatheBarrelGeo(0.048, 0.068, 0.78, 10), MAT.solarisGold);
                 disruptor.rotation.x = Math.PI / 2;
@@ -6290,7 +7200,7 @@ function createAnimatedUnitModel(role) {
                 const legPivot = new THREE.Group();
                 legPivot.position.set(side * 0.36, 0.54, zOff);
                 const hipNode = new THREE.Mesh(createSculptedArmorDomeGeo(0.085, 10, 10), MAT.solarisCrystal);
-                const femur = new THREE.Mesh(createExtrudedArmorHullGeo(0.13, 0.46, 0.15, 0.02, 0.04), MAT.solarisGold);
+                const femur = new THREE.Mesh(createArticulatedMechLimbGeo(0.46, 0.075, 0.06, 0.18), MAT.solarisGold);
                 femur.position.set(side * 0.19, 0.14, 0);
                 femur.rotation.z = -side * 0.80;
                 const kneeGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.075, 0), MAT.solarisPrismGlow);
@@ -6298,7 +7208,7 @@ function createAnimatedUnitModel(role) {
                 const shin = new THREE.Mesh(createCurvedScytheBladeGeo(0.72, 0.08, 0.15), MAT.solarisObsidian);
                 shin.position.set(side * 0.36, -0.18, 0);
                 shin.rotation.x = Math.PI * 0.48;
-                const goldGreave = new THREE.Mesh(createCurvedScytheBladeGeo(0.54, 0.055, 0.11), MAT.solarisGold);
+                const goldGreave = new THREE.Mesh(createProtossArchBladeGeo(0.56, 0.10, 0.035, 0.22), MAT.solarisGold);
                 goldGreave.position.set(side * 0.38, -0.14, 0.02);
                 goldGreave.rotation.x = Math.PI * 0.48;
                 const footGlow = new THREE.Mesh(createSculptedArmorDomeGeo(0.072, 10, 10), MAT.solarisCrystal);
@@ -6316,14 +7226,14 @@ function createAnimatedUnitModel(role) {
         }
 
         if (role === 'archon') {
-            // AETHER ARCHON SOVEREIGN: Levitating Psionic Star-Entity Clad in Golden High-Templar Battle Mantle & 3 Astrolabe Rings
+            // AETHER ARCHON SOVEREIGN: Levitating Psionic Star-Entity Clad in Fractured Golden High-Templar Battle Mantle & 3 Astrolabe Rings
             const bodyGroup = new THREE.Group();
             bodyGroup.position.y = 1.12;
             group.add(bodyGroup);
 
             const coreSphere = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.46, 2), MAT.solarisCrystal);
             const innerSun = new THREE.Mesh(createSculptedArmorDomeGeo(0.32, 16, 16), MAT.solarisPrismGlow);
-            const torsoCrest = new THREE.Mesh(createExtrudedArmorHullGeo(0.68, 0.50, 0.40, 0.04, 0.14), MAT.solarisGold);
+            const torsoCrest = new THREE.Mesh(createCompoundArmorChestGeo(0.68, 0.50, 0.40, 0.24, 0.32), MAT.solarisGold);
             torsoCrest.position.y = 0.12;
             const chestCrystal = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.14, 0), MAT.solarisPrismGlow);
             chestCrystal.position.set(0, 0.16, 0.24);
@@ -6332,8 +7242,8 @@ function createAnimatedUnitModel(role) {
 
             // Levitating Golden Pauldrons & Psionic Shockwave Gauntlets
             [-1, 1].forEach(side => {
-                const pauldron = new THREE.Mesh(createCurvedScytheBladeGeo(0.58, 0.14, 0.22), MAT.solarisGold);
-                pauldron.position.set(side * 0.48, 0.26, 0);
+                const pauldron = new THREE.Mesh(createProtossArchBladeGeo(0.66, 0.20, 0.06, 0.30), MAT.solarisGold);
+                pauldron.position.set(side * 0.50, 0.26, 0);
                 pauldron.rotation.z = -side * 0.72;
                 const wristOrb = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.13, 1), MAT.solarisPrismGlow);
                 wristOrb.position.set(side * 0.56, -0.06, 0.22);
@@ -6341,6 +7251,13 @@ function createAnimatedUnitModel(role) {
             });
 
             const ringOuter = new THREE.Mesh(createSculptedTorusCollarGeo(0.84, 0.06, 12, 32), MAT.solarisGold);
+            for (let i = 0; i < 6; i++) {
+                const ang = (i * Math.PI) / 3;
+                const fin = new THREE.Mesh(createProtossArchBladeGeo(0.38, 0.10, 0.035, 0.22), MAT.solarisGold);
+                fin.position.set(Math.cos(ang) * 0.88, Math.sin(ang) * 0.88, 0);
+                fin.rotation.z = ang + Math.PI * 0.5;
+                ringOuter.add(fin);
+            }
             const ringInner = new THREE.Mesh(createSculptedTorusCollarGeo(0.64, 0.045, 10, 28), MAT.solarisPrismGlow);
             ringInner.rotation.x = Math.PI / 2;
             const ringCorona = new THREE.Mesh(createSculptedTorusCollarGeo(0.50, 0.032, 8, 24), MAT.solarisCrystal);
@@ -6354,66 +7271,186 @@ function createAnimatedUnitModel(role) {
             return group;
         }
 
-        // CHRONO-ZEALOT TEMPLAR: High-Poly Ornate Aurelian Gold & Ivory Cuirass + Dorsal Warp Fins + Solar Halo + Twin Psi-Blades
-        const pelvis = new THREE.Mesh(createSculptedLatheBarrelGeo(0.17, 0.21, 0.22, 14), MAT.solarisObsidian);
-        pelvis.position.y = 0.38;
-        const beltSash = new THREE.Mesh(createExtrudedArmorHullGeo(0.22, 0.28, 0.08, 0.02, 0.04), MAT.solarisGold);
-        beltSash.position.set(0, -0.08, 0.16);
-        pelvis.add(beltSash);
-        group.add(pelvis);
+        // CHRONO-ZEALOT TEMPLAR: Athletic Alien High-Templar with V-Tapered Aurelian Cuirass,
+        // Connected Upper Arms, Digitigrade Greaves, Braided Khaydarin Nerve Cords & Twin Forearm Psi-Blades
+        const pelvisGroup = new THREE.Group();
+        pelvisGroup.position.set(0, 0.42, 0);
+        const pelvisMesh = new THREE.Mesh(
+            createAnatomicalPelvisGeo(0.20, 0.12, 0.15),
+            MAT.solarisObsidian
+        );
+        const lumbarJoint = new THREE.Mesh(
+            createSculptedLatheBarrelGeo(0.088, 0.082, 0.11, 12),
+            MAT.solarisObsidian
+        );
+        lumbarJoint.position.set(0, 0.06, 0);
+        const beltBuckle = new THREE.Mesh(
+            createSculptedFacetedCrystalGeo(0.048, 0),
+            MAT.solarisCrystal
+        );
+        beltBuckle.position.set(0, 0.01, 0.09);
+        const beltSash = new THREE.Mesh(
+            createProtossArchBladeGeo(0.24, 0.09, 0.024, 0.10),
+            MAT.solarisGold
+        );
+        beltSash.position.set(0, -0.09, 0.09);
+        pelvisGroup.add(pelvisMesh, lumbarJoint, beltBuckle, beltSash);
+        group.add(pelvisGroup);
 
         const upperBody = new THREE.Group();
-        upperBody.position.y = 0.52;
+        upperBody.position.set(0, 0.48, 0);
         group.add(upperBody);
 
-        const chest = new THREE.Mesh(createExtrudedArmorHullGeo(0.48, 0.44, 0.32, 0.04, 0.12), MAT.solarisIvory);
-        chest.position.y = 0.22;
+        const chest = new THREE.Mesh(
+            createAnatomicalTorsoGeo(0.17, 0.31, 0.35, 0.19, 0.18),
+            MAT.solarisIvory
+        );
+        chest.position.set(0, 0.175, 0);
         chest.castShadow = true;
-        const goldCuirass = new THREE.Mesh(createExtrudedArmorHullGeo(0.52, 0.28, 0.34, 0.04, 0.12), MAT.solarisGold);
-        goldCuirass.position.set(0, 0.26, 0.02);
-        const chestGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.095, 1), MAT.solarisCrystal);
-        chestGem.position.set(0, 0.26, 0.20);
-        const solarHalo = new THREE.Mesh(createSculptedTorusCollarGeo(0.35, 0.036, 10, 24), MAT.solarisGold);
-        solarHalo.position.set(0, 0.44, -0.18);
+
+        const goldCuirass = new THREE.Mesh(
+            createCompoundArmorChestGeo(0.29, 0.19, 0.16, 0.22, 0.14),
+            MAT.solarisGold
+        );
+        goldCuirass.position.set(0, 0.24, 0.035);
+
+        const chestGem = new THREE.Mesh(
+            createSculptedFacetedCrystalGeo(0.056, 1),
+            MAT.solarisCrystal
+        );
+        chestGem.position.set(0, 0.25, 0.125);
+
+        const collarRing = new THREE.Mesh(
+            createSculptedTorusCollarGeo(0.095, 0.022, 10, 18),
+            MAT.solarisGold
+        );
+        collarRing.rotation.x = Math.PI / 2;
+        collarRing.position.set(0, 0.35, 0.01);
+
+        const solarHalo = new THREE.Mesh(
+            createSculptedTorusCollarGeo(0.24, 0.024, 10, 24),
+            MAT.solarisGold
+        );
+        solarHalo.position.set(0, 0.34, -0.13);
+
         [-1, 1].forEach(side => {
-            const dorsalFin = new THREE.Mesh(createCurvedScytheBladeGeo(0.48, 0.06, 0.12), MAT.solarisCrystal);
-            dorsalFin.position.set(side * 0.22, 0.42, -0.16);
-            dorsalFin.rotation.z = -side * 0.48;
+            const dorsalFin = new THREE.Mesh(
+                createProtossArchBladeGeo(0.38, 0.085, 0.028, 0.18),
+                MAT.solarisCrystal
+            );
+            dorsalFin.position.set(side * 0.15, 0.30, -0.11);
+            dorsalFin.rotation.z = -side * 0.42;
             upperBody.add(dorsalFin);
         });
-        upperBody.add(chest, goldCuirass, chestGem, solarHalo);
+        upperBody.add(chest, goldCuirass, chestGem, collarRing, solarHalo);
 
         const headGroup = new THREE.Group();
-        headGroup.position.y = 0.54;
-        const helm = new THREE.Mesh(createSculptedOgiveSpireGeo(0.19, 0.42, 6), MAT.solarisGold);
-        helm.position.y = 0.07;
-        const crestBlade = new THREE.Mesh(createCurvedScytheBladeGeo(0.38, 0.05, 0.12), MAT.solarisIvory);
-        crestBlade.position.set(0, 0.16, -0.04);
-        crestBlade.rotation.x = -0.38;
-        const visor = new THREE.Mesh(createSculptedArmorDomeGeo(0.135, 14, 14), MAT.solarisCrystal);
-        visor.position.set(0, 0.02, 0.09);
-        headGroup.add(helm, crestBlade, visor);
+        headGroup.position.set(0, 0.37, 0.01);
+        const neckSeal = new THREE.Mesh(
+            createSculptedLatheBarrelGeo(0.052, 0.060, 0.06, 10),
+            MAT.solarisObsidian
+        );
+        neckSeal.position.set(0, 0.01, 0);
+        const helm = new THREE.Mesh(
+            createSculptedOgiveSpireGeo(0.118, 0.28, 8),
+            MAT.solarisGold
+        );
+        helm.position.set(0, 0.11, 0);
+        const crestBlade = new THREE.Mesh(
+            createProtossArchBladeGeo(0.28, 0.075, 0.026, 0.16),
+            MAT.solarisIvory
+        );
+        crestBlade.position.set(0, 0.16, -0.03);
+        crestBlade.rotation.x = -0.36;
+        const visor = new THREE.Mesh(
+            createSculptedArmorDomeGeo(0.088, 12, 10),
+            MAT.solarisCrystal
+        );
+        visor.scale.set(0.92, 0.65, 0.95);
+        visor.position.set(0, 0.08, 0.055);
+        headGroup.add(neckSeal, helm, crestBlade, visor);
+
+        // Braided Dorsal Khaydarin Nerve Cords sweeping cleanly from the occipital crest
+        for (let c = -1; c <= 1; c++) {
+            const nerveCord = new THREE.Mesh(
+                createSegmentedChitinLimbGeo(0.36, 0.026, 0.020, 0.012, 0.06, 6),
+                c === 0 ? MAT.solarisCrystal : MAT.solarisGold
+            );
+            nerveCord.position.set(c * 0.045, 0.04, -0.09);
+            nerveCord.rotation.x = 0.46;
+            headGroup.add(nerveCord);
+        }
         upperBody.add(headGroup);
 
         function makeZealotArm(side) {
             const shoulder = new THREE.Group();
-            shoulder.position.set(side * 0.33, 0.36, 0);
-            const pauldron = new THREE.Mesh(createCurvedScytheBladeGeo(0.42, 0.12, 0.16), MAT.solarisGold);
-            pauldron.rotation.z = -side * 0.85;
-            const pauldronGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.055, 0), MAT.solarisCrystal);
-            pauldronGem.position.set(side * 0.08, 0.06, 0.06);
+            shoulder.position.set(side * 0.195, 0.31, 0);
+
+            const shoulderJoint = new THREE.Mesh(
+                createSculptedArmorDomeGeo(0.048, 10, 8),
+                MAT.solarisObsidian
+            );
+            const pauldron = new THREE.Mesh(
+                createAnatomicalPauldronGeo(0.14, 0.15, 0.16),
+                MAT.solarisGold
+            );
+            pauldron.position.set(side * 0.02, 0.01, 0);
+            pauldron.rotation.z = side > 0 ? -0.18 : 0.18;
+
+            const pauldronWing = new THREE.Mesh(
+                createProtossArchBladeGeo(0.28, 0.095, 0.030, 0.16),
+                MAT.solarisGold
+            );
+            pauldronWing.position.set(side * 0.05, 0.03, -0.01);
+            pauldronWing.rotation.z = -side * 0.78;
+
+            const pauldronGem = new THREE.Mesh(
+                createSculptedFacetedCrystalGeo(0.038, 0),
+                MAT.solarisCrystal
+            );
+            pauldronGem.position.set(side * 0.065, 0.02, 0.04);
+
+            // Connected Upper Arm (bicep/tricep segment bridging shoulder socket to elbow pivot)
+            const upperArm = new THREE.Mesh(
+                createArticulatedMechLimbGeo(0.19, 0.046, 0.038, 0.14),
+                MAT.solarisObsidian
+            );
+            upperArm.position.set(0, -0.095, 0);
+            upperArm.castShadow = true;
+
             const elbow = new THREE.Group();
-            elbow.position.set(0, -0.20, 0.06);
-            const gauntlet = new THREE.Mesh(createSculptedLatheBarrelGeo(0.070, 0.058, 0.26, 12), MAT.solarisIvory);
+            elbow.position.set(0, -0.19, 0.01);
+            const elbowJoint = new THREE.Mesh(
+                createSculptedArmorDomeGeo(0.040, 10, 8),
+                MAT.solarisGold
+            );
+            const gauntlet = new THREE.Mesh(
+                createArticulatedMechLimbGeo(0.20, 0.046, 0.036, 0.16),
+                MAT.solarisIvory
+            );
             gauntlet.rotation.x = Math.PI / 2;
-            const gauntletTrim = new THREE.Mesh(createSculptedTorusCollarGeo(0.068, 0.016, 8, 14), MAT.solarisGold);
+            gauntlet.position.set(0, 0, 0.10);
+            const gauntletTrim = new THREE.Mesh(
+                createSculptedTorusCollarGeo(0.046, 0.012, 8, 14),
+                MAT.solarisGold
+            );
             gauntletTrim.position.set(0, 0, 0.08);
-            const psiBlade = new THREE.Mesh(createCurvedScytheBladeGeo(0.74, 0.072, 0.14), MAT.solarisCrystal);
-            psiBlade.position.set(0, 0, 0.16);
-            const psiCore = new THREE.Mesh(createCurvedScytheBladeGeo(0.62, 0.042, 0.11), MAT.solarisPrismGlow);
-            psiCore.position.set(0, 0.01, 0.18);
-            elbow.add(gauntlet, gauntletTrim, psiBlade, psiCore);
-            shoulder.add(pauldron, pauldronGem, elbow);
+
+            const psiBlade = new THREE.Mesh(
+                createProtossArchBladeGeo(0.64, 0.095, 0.028, 0.14),
+                MAT.solarisCrystal
+            );
+            psiBlade.rotation.x = Math.PI * 0.5;
+            psiBlade.position.set(0, 0, 0.34);
+            const psiCore = new THREE.Mesh(
+                createProtossArchBladeGeo(0.54, 0.065, 0.032, 0.12),
+                MAT.solarisPrismGlow
+            );
+            psiCore.rotation.x = Math.PI * 0.5;
+            psiCore.position.set(0, 0.008, 0.32);
+
+            elbow.add(elbowJoint, gauntlet, gauntletTrim, psiBlade, psiCore);
+            shoulder.add(shoulderJoint, pauldron, pauldronWing, pauldronGem, upperArm, elbow);
             upperBody.add(shoulder);
             return { shoulder, elbow };
         }
@@ -6422,25 +7459,63 @@ function createAnimatedUnitModel(role) {
 
         function makeZealotLeg(xOff) {
             const hip = new THREE.Group();
-            hip.position.set(xOff, 0.40, 0);
-            const thigh = new THREE.Mesh(createSculptedLatheBarrelGeo(0.085, 0.072, 0.22, 12), MAT.solarisObsidian);
-            thigh.position.y = -0.10;
+            hip.position.set(xOff, 0, 0);
+
+            const hipJoint = new THREE.Mesh(
+                createSculptedArmorDomeGeo(0.052, 10, 8),
+                MAT.solarisObsidian
+            );
+            const thigh = new THREE.Mesh(
+                createArticulatedMechLimbGeo(0.21, 0.058, 0.046, 0.16),
+                MAT.solarisObsidian
+            );
+            thigh.position.set(0, -0.105, 0.01);
+            thigh.rotation.x = -0.12;
+            thigh.castShadow = true;
+
             const knee = new THREE.Group();
-            knee.position.y = -0.20;
-            const kneeGem = new THREE.Mesh(createSculptedFacetedCrystalGeo(0.055, 0), MAT.solarisCrystal);
-            kneeGem.position.set(0, 0, 0.06);
-            const greave = new THREE.Mesh(createSculptedLatheBarrelGeo(0.078, 0.064, 0.22, 12), MAT.solarisGold);
-            greave.position.y = -0.11;
-            knee.add(kneeGem, greave);
-            hip.add(thigh, knee);
-            group.add(hip);
-            return { hip, knee };
+            knee.position.set(0, -0.20, 0.025);
+            const kneeJoint = new THREE.Mesh(
+                createSculptedArmorDomeGeo(0.046, 10, 8),
+                MAT.solarisObsidian
+            );
+            const kneeGem = new THREE.Mesh(
+                createSculptedFacetedCrystalGeo(0.042, 0),
+                MAT.solarisCrystal
+            );
+            kneeGem.position.set(0, 0.01, 0.048);
+
+            const greave = new THREE.Mesh(
+                createArticulatedMechLimbGeo(0.21, 0.054, 0.040, 0.18),
+                MAT.solarisGold
+            );
+            greave.position.set(0, -0.105, -0.01);
+            greave.rotation.x = 0.10;
+            greave.castShadow = true;
+
+            const ankle = new THREE.Group();
+            ankle.position.set(0, -0.20, -0.02);
+            const ankleJoint = new THREE.Mesh(
+                createSculptedArmorDomeGeo(0.038, 8, 8),
+                MAT.solarisObsidian
+            );
+            const clovenBoot = new THREE.Mesh(
+                createAnatomicalBootGeo(0.088, 0.068, 0.165),
+                MAT.solarisGold
+            );
+            clovenBoot.position.set(0, -0.02, 0.035);
+            ankle.add(ankleJoint, clovenBoot);
+
+            knee.add(kneeJoint, kneeGem, greave, ankle);
+            hip.add(hipJoint, thigh, knee);
+            pelvisGroup.add(hip);
+            return { hip, knee, ankle };
         }
-        const legL = makeZealotLeg(-0.12);
-        const legR = makeZealotLeg(0.12);
+        const legL = makeZealotLeg(-0.105);
+        const legR = makeZealotLeg(0.105);
 
         group.userData = {
-            isSolaris: true, role: 'zealot', upperBody, headGroup, solarHalo,
+            isSolaris: true, role: 'zealot', upperBody, pelvisGroup, headGroup, solarHalo,
             shoulderL: armL.shoulder, elbowL: armL.elbow,
             shoulderR: armR.shoulder, elbowR: armR.elbow,
             legL, legR, phase: Math.random() * 10, attackAnim: 0
@@ -6448,7 +7523,11 @@ function createAnimatedUnitModel(role) {
         return group;
     }
 
-    // --- SCULPTED STARCRAFT II CMC POWERED COMBAT SUIT (MARINE / MEDIC / ROCKETMAN / REAPER / FIREBAT / MARAUDER / HERO) ---
+    // ============================================================================
+    // TERRAN DOMINION — ANATOMICAL INFANTRY & POWERED EXOSUIT ARCHITECTURE
+    // Athletic, heroic RTS proportions with V-tapered cuirasses, articulated waist/pelvis
+    // transitions, close-fitting contoured pauldrons, sealed joint sockets, and tapered limbs.
+    // ============================================================================
     const isHero = role === 'hero';
     const isMelee = role === 'grunt';
     const isMedic = role === 'medic';
@@ -6456,137 +7535,144 @@ function createAnimatedUnitModel(role) {
     const isReaper = role === 'reaper';
     const isFirebat = role === 'firebat';
     const isMarauder = role === 'marauder';
-    const scale = isHero ? 1.38 : (isMarauder ? 1.22 : (isFirebat ? 1.14 : (isRocket ? 1.10 : (isReaper ? 1.04 : 1.02))));
-    group.scale.setScalar(scale);
+    const isRanger = role === 'ranger';
 
-    // Faction Team Coloring: distinct silhouette & livery per role
+    // Calibrated anatomical proportions per infantry class (no uniform group.scale hacks)
+    const classSpecs = {
+        reaper:    { waistW: 0.170, chestW: 0.265, torsoH: 0.33, chestD: 0.180, pecBulk: 0.16, shX: 0.168, pScale: 0.80, armR: 0.042, legR: 0.050, hipX: 0.095, helmR: 0.108 },
+        ranger:    { waistW: 0.180, chestW: 0.285, torsoH: 0.34, chestD: 0.195, pecBulk: 0.18, shX: 0.178, pScale: 0.88, armR: 0.045, legR: 0.054, hipX: 0.100, helmR: 0.112 },
+        medic:     { waistW: 0.182, chestW: 0.285, torsoH: 0.34, chestD: 0.195, pecBulk: 0.18, shX: 0.180, pScale: 0.88, armR: 0.045, legR: 0.054, hipX: 0.100, helmR: 0.112 },
+        grunt:     { waistW: 0.192, chestW: 0.305, torsoH: 0.35, chestD: 0.205, pecBulk: 0.20, shX: 0.190, pScale: 0.95, armR: 0.048, legR: 0.057, hipX: 0.105, helmR: 0.114 },
+        rocketman: { waistW: 0.198, chestW: 0.315, torsoH: 0.35, chestD: 0.210, pecBulk: 0.21, shX: 0.196, pScale: 0.98, armR: 0.049, legR: 0.058, hipX: 0.106, helmR: 0.116 },
+        firebat:   { waistW: 0.228, chestW: 0.355, torsoH: 0.36, chestD: 0.240, pecBulk: 0.24, shX: 0.220, pScale: 1.14, armR: 0.055, legR: 0.064, hipX: 0.116, helmR: 0.122 },
+        marauder:  { waistW: 0.248, chestW: 0.385, torsoH: 0.37, chestD: 0.260, pecBulk: 0.26, shX: 0.238, pScale: 1.24, armR: 0.060, legR: 0.068, hipX: 0.122, helmR: 0.125 },
+        hero:      { waistW: 0.215, chestW: 0.350, torsoH: 0.38, chestD: 0.225, pecBulk: 0.24, shX: 0.220, pScale: 1.15, armR: 0.054, legR: 0.062, hipX: 0.112, helmR: 0.120 }
+    };
+    const spec = classSpecs[role] || classSpecs.ranger;
+
     const armorMat = isMedic ? MAT.medicArmor : (isHero ? MAT.copper : (isFirebat ? MAT.medicCross : (isMarauder ? MAT.darkSteel : (isRocket ? MAT.oliveArmor : (isReaper ? MAT.darkSteel : MAT.terranPlating)))));
     const pauldronMat = isMedic ? MAT.medicArmor : (isFirebat ? MAT.hazard : (isMarauder ? MAT.copper : (isRocket ? MAT.medicCross : (isReaper ? MAT.hazard : MAT.terranBlue))));
-
-    // Lathe-Sculpted Armored Pelvis & Waist Girdle
-    const pelvisPts = [
-        new THREE.Vector2(0.0, 0.0),
-        new THREE.Vector2(0.17, 0.0),
-        new THREE.Vector2(0.21, 0.09),
-        new THREE.Vector2(0.18, 0.18),
-        new THREE.Vector2(0.0, 0.18)
-    ];
-    const pelvis = new THREE.Mesh(new THREE.LatheGeometry(pelvisPts, 16), MAT.darkSteel);
-    pelvis.position.y = 0.34;
-    group.add(pelvis);
+    const plastronMat = isMedic ? MAT.medicArmor : (isHero ? MAT.terranCobalt : (isFirebat ? MAT.hazard : (isMarauder ? MAT.copper : (isRocket ? MAT.hazard : (isReaper ? MAT.gunmetal : MAT.terranBlue)))));
 
     const upperBody = new THREE.Group();
-    upperBody.position.y = 0.5;
+    upperBody.position.set(0, 0.48, 0);
     group.add(upperBody);
 
-    // Lathe-Sculpted Bulky SC2 CMC Chest Torso + Gorget Armor Collar + Twin Fusion Pack
-    const chestLathePts = [
-        new THREE.Vector2(0.0, 0.0),
-        new THREE.Vector2(0.19, 0.0),
-        new THREE.Vector2(0.27, 0.18),
-        new THREE.Vector2(0.29, 0.34),
-        new THREE.Vector2(0.22, 0.44),
-        new THREE.Vector2(0.15, 0.48),
-        new THREE.Vector2(0.0, 0.48)
-    ];
-    const chest = new THREE.Mesh(new THREE.LatheGeometry(chestLathePts, 18), armorMat);
-    chest.scale.set(isMarauder ? 1.22 : (isFirebat ? 1.15 : 1.08), 1.0, isMarauder ? 1.06 : 0.92);
+    // 1. ANATOMICAL V-TAPERED CUIRASS TORSO, SEGMENTED ABDOMEN & CONTOURED STERNUM PLASTRON
+    const chest = new THREE.Mesh(
+        createAnatomicalTorsoGeo(spec.waistW, spec.chestW, spec.torsoH, spec.chestD, spec.pecBulk),
+        armorMat
+    );
+    chest.position.set(0, spec.torsoH * 0.50, 0);
     chest.castShadow = true;
 
-    // Chest Plating with Team Color Insignia
+    // Contoured upper sternum pectoral plastron (flushed cleanly into the upper ribcage without boxy double-stacking)
     const chestPlate = new THREE.Mesh(
-        createExtrudedArmorHullGeo(0.42, 0.26, 0.24, 0.04, 0.1),
-        isMedic ? MAT.medicArmor : (isHero ? MAT.terranCobalt : (isFirebat ? MAT.hazard : (isMarauder ? MAT.copper : (isRocket ? MAT.hazard : (isReaper ? MAT.gunmetal : MAT.terranBlue)))))
+        createCompoundArmorChestGeo(spec.chestW * 0.82, spec.torsoH * 0.46, spec.chestD * 0.52, 0.22, 0.14),
+        plastronMat
     );
-    chestPlate.position.set(0, 0.25, 0.14);
+    chestPlate.position.set(0, spec.torsoH * 0.64, spec.chestD * 0.28);
+
+    // Segmented abdominal waist bridge linking upperBody down into the pelvis without any gap
+    const waistSeal = new THREE.Mesh(
+        createSculptedLatheBarrelGeo(spec.waistW * 0.48, spec.waistW * 0.44, 0.09, 12),
+        MAT.darkSteel
+    );
+    waistSeal.position.set(0, 0.01, 0);
 
     let heroCoreRing = null;
     let heroWings = null;
     let heroWeapon = null;
 
+    const frontPlateZ = spec.chestD * 0.56 + 0.018;
     if (isMedic) {
-        // Red Caduceus Cross on Medic Chest
-        const c1 = new THREE.Mesh(createExtrudedArmorHullGeo(0.18, 0.05, 0.015), MAT.medicDecalCross);
-        c1.position.set(0, 0.25, 0.27);
-        const c2 = new THREE.Mesh(createExtrudedArmorHullGeo(0.05, 0.18, 0.015), MAT.medicDecalCross);
-        c2.position.set(0, 0.25, 0.27);
+        const c1 = new THREE.Mesh(createExtrudedArmorHullGeo(0.13, 0.036, 0.014), MAT.medicDecalCross);
+        c1.position.set(0, spec.torsoH * 0.65, frontPlateZ);
+        const c2 = new THREE.Mesh(createExtrudedArmorHullGeo(0.036, 0.13, 0.014), MAT.medicDecalCross);
+        c2.position.set(0, spec.torsoH * 0.65, frontPlateZ);
         upperBody.add(c1, c2);
     } else if (isHero) {
-        // HERO VANGUARD BESPOKE STERNUM ARC-REACTOR CORE & GOLDEN AEGIS TRIM!
-        const coreBezel = new THREE.Mesh(createSculptedTorusCollarGeo(0.095, 0.022, 10, 20), MAT.copper);
-        coreBezel.position.set(0, 0.26, 0.265);
-        const coreOrb = new THREE.Mesh(createSculptedArmorDomeGeo(0.072, 12, 12), MAT.plasmaShader);
+        const coreBezel = new THREE.Mesh(createSculptedTorusCollarGeo(0.068, 0.016, 10, 20), MAT.copper);
+        coreBezel.position.set(0, spec.torsoH * 0.65, frontPlateZ);
+        const coreOrb = new THREE.Mesh(createSculptedArmorDomeGeo(0.052, 12, 12), MAT.plasmaShader);
         coreOrb.scale.set(1, 1, 0.45);
-        coreOrb.position.set(0, 0.26, 0.265);
-        heroCoreRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.064, 0.018, 6, 12), MAT.amberGlow);
-        heroCoreRing.position.set(0, 0.26, 0.285);
+        coreOrb.position.set(0, spec.torsoH * 0.65, frontPlateZ);
+        heroCoreRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.046, 0.013, 6, 12), MAT.amberGlow);
+        heroCoreRing.position.set(0, spec.torsoH * 0.65, frontPlateZ + 0.015);
         upperBody.add(coreBezel, coreOrb, heroCoreRing);
     }
 
-    const gorgetCollar = new THREE.Mesh(createSculptedTorusCollarGeo(0.18, 0.045, 12, 18), isHero || isMarauder ? MAT.copper : (isFirebat ? MAT.hazard : MAT.terranCobalt));
+    const gorgetCollar = new THREE.Mesh(
+        createSculptedTorusCollarGeo(spec.chestW * 0.34, isMarauder || isFirebat ? 0.036 : 0.028, 10, 18),
+        isHero || isMarauder ? MAT.copper : (isFirebat ? MAT.hazard : MAT.terranCobalt)
+    );
     gorgetCollar.rotation.x = Math.PI / 2;
-    gorgetCollar.position.set(0, 0.44, 0.02);
+    gorgetCollar.position.set(0, spec.torsoH * 0.96, 0.01);
 
-    const backpack = new THREE.Mesh(createExtrudedArmorHullGeo(0.38, 0.38, 0.24, 0.05, 0.1), isMedic ? MAT.medicArmor : (isHero ? MAT.copper : (isFirebat ? MAT.medicCross : MAT.darkSteel)));
-    backpack.position.set(0, 0.25, -0.22);
-    const thrusterGlow = new THREE.Mesh(createSculptedLatheBarrelGeo(0.065, 0.065, 0.3, 14), isMedic ? MAT.healGlow : (isFirebat ? MAT.volatileGlow : (isReaper || isHero || isMarauder ? MAT.amberGlow : MAT.cyanGlow)));
+    const dorsalZ = -spec.chestD * 0.48 - 0.065;
+    const backpack = new THREE.Mesh(
+        createCompoundArmorChestGeo(spec.chestW * 0.72, spec.torsoH * 0.74, 0.15, 0.18, 0.12),
+        isMedic ? MAT.medicArmor : (isHero ? MAT.copper : (isFirebat ? MAT.medicCross : MAT.darkSteel))
+    );
+    backpack.position.set(0, spec.torsoH * 0.56, dorsalZ);
+    const thrusterGlow = new THREE.Mesh(
+        createSculptedLatheBarrelGeo(0.046, 0.046, 0.22, 12),
+        isMedic ? MAT.healGlow : (isFirebat ? MAT.volatileGlow : (isReaper || isHero || isMarauder ? MAT.amberGlow : MAT.cyanGlow))
+    );
     thrusterGlow.rotation.z = Math.PI / 2;
-    thrusterGlow.position.set(0, 0.32, -0.34);
-    upperBody.add(chest, chestPlate, gorgetCollar, backpack, thrusterGlow);
+    thrusterGlow.position.set(0, spec.torsoH * 0.64, dorsalZ - 0.075);
+    upperBody.add(chest, chestPlate, waistSeal, gorgetCollar, backpack, thrusterGlow);
 
+    // 2. CLASS-SPECIFIC DORSAL POWER RIGS, FUEL DRUMS, AUTOLOADERS & JUMP JETS
     if (isMedic) {
-        // Twin Pressurized Nano-Serum Tanks on Medic Backpack
-        [-0.14, 0.14].forEach(bx => {
-            const tank = new THREE.Mesh(createSculptedLatheBarrelGeo(0.06, 0.06, 0.36, 12), MAT.healGlow);
-            tank.position.set(bx, 0.32, -0.35);
+        [-0.10, 0.10].forEach(bx => {
+            const tank = new THREE.Mesh(createSculptedLatheBarrelGeo(0.045, 0.045, 0.28, 12), MAT.healGlow);
+            tank.position.set(bx, spec.torsoH * 0.60, dorsalZ - 0.07);
             upperBody.add(tank);
         });
     } else if (isFirebat) {
-        // Twin High-Pressure Volatile Napalm Cylinders + Thermal Blast Shielding on Firebat Backpack
-        [-0.15, 0.15].forEach(fx => {
-            const fuelTank = new THREE.Mesh(createSculptedLatheBarrelGeo(0.085, 0.085, 0.46, 14), MAT.medicCross);
-            fuelTank.position.set(fx, 0.34, -0.34);
-            const tankCap = new THREE.Mesh(createSculptedArmorDomeGeo(0.085, 12, 10), MAT.hazard);
-            tankCap.position.set(fx, 0.57, -0.34);
-            const gaugeGlow = new THREE.Mesh(createSculptedLatheBarrelGeo(0.088, 0.088, 0.08, 12), MAT.volatileGlow);
-            gaugeGlow.position.set(fx, 0.36, -0.34);
+        [-0.125, 0.125].forEach(fx => {
+            const fuelTank = new THREE.Mesh(createSculptedLatheBarrelGeo(0.072, 0.072, 0.36, 14), MAT.medicCross);
+            fuelTank.position.set(fx, spec.torsoH * 0.62, dorsalZ - 0.08);
+            const tankCap = new THREE.Mesh(createSculptedArmorDomeGeo(0.072, 10, 8), MAT.hazard);
+            tankCap.position.set(fx, spec.torsoH * 0.62 + 0.18, dorsalZ - 0.08);
+            const gaugeGlow = new THREE.Mesh(createSculptedLatheBarrelGeo(0.075, 0.075, 0.06, 12), MAT.volatileGlow);
+            gaugeGlow.position.set(fx, spec.torsoH * 0.64, dorsalZ - 0.08);
             upperBody.add(fuelTank, tankCap, gaugeGlow);
         });
     } else if (isMarauder) {
-        // Heavy Dorsal Punisher Grenade Autoloader Drum & Armored Blast Cowl on Marauder
-        const ammoDrum = new THREE.Mesh(createSculptedLatheBarrelGeo(0.16, 0.16, 0.44, 14), MAT.copper);
+        const ammoDrum = new THREE.Mesh(createSculptedLatheBarrelGeo(0.125, 0.125, 0.36, 14), MAT.copper);
         ammoDrum.rotation.z = Math.PI / 2;
-        ammoDrum.position.set(0, 0.44, -0.28);
-        [-0.18, 0.18].forEach(mx => {
-            const feedChute = new THREE.Mesh(createExtrudedArmorHullGeo(0.10, 0.28, 0.20, 0.02, 0.04), MAT.gunmetal);
-            feedChute.position.set(mx, 0.48, -0.14);
+        ammoDrum.position.set(0, spec.torsoH * 0.78, dorsalZ - 0.06);
+        [-0.145, 0.145].forEach(mx => {
+            const feedChute = new THREE.Mesh(createCompoundArmorChestGeo(0.09, 0.22, 0.16, 0.18, 0.12), MAT.gunmetal);
+            feedChute.position.set(mx, spec.torsoH * 0.82, dorsalZ + 0.03);
             upperBody.add(feedChute);
         });
         upperBody.add(ammoDrum);
     } else if (isRocket) {
-        // Dorsal Multi-Warhead Missile Reload Rack on Rocket Man Backpack
-        [-0.12, -0.04, 0.04, 0.12].forEach(mx => {
-            const spareMissile = new THREE.Mesh(createSculptedLatheBarrelGeo(0.032, 0.032, 0.36, 8), MAT.oliveArmor);
-            spareMissile.position.set(mx, 0.46, -0.24);
-            const tip = new THREE.Mesh(createSculptedOgiveSpireGeo(0.034, 0.09, 8), MAT.medicCross);
-            tip.position.set(mx, 0.68, -0.24);
+        [-0.09, -0.03, 0.03, 0.09].forEach(mx => {
+            const spareMissile = new THREE.Mesh(createSculptedLatheBarrelGeo(0.025, 0.025, 0.28, 8), MAT.oliveArmor);
+            spareMissile.position.set(mx, spec.torsoH * 0.82, dorsalZ - 0.03);
+            const tip = new THREE.Mesh(createSculptedOgiveSpireGeo(0.027, 0.07, 8), MAT.medicCross);
+            tip.position.set(mx, spec.torsoH * 0.82 + 0.17, dorsalZ - 0.03);
             upperBody.add(spareMissile, tip);
         });
     }
+
     const reaperNozzles = [];
     if (isReaper) {
-        // Dual Canted Jump-Jet Vector Thruster Turbines + Dynamic 3D Particle Exhaust Nozzles (Zero basic cone shapes!)
-        [-0.18, 0.18].forEach(jx => {
-            const jetPod = new THREE.Mesh(createSculptedLatheBarrelGeo(0.085, 0.11, 0.48, 12), MAT.gunmetal);
-            jetPod.rotation.z = jx > 0 ? -0.28 : 0.28;
+        [-0.135, 0.135].forEach(jx => {
+            const jetPod = new THREE.Mesh(createSculptedLatheBarrelGeo(0.064, 0.082, 0.36, 12), MAT.gunmetal);
+            jetPod.rotation.z = jx > 0 ? -0.26 : 0.26;
             jetPod.rotation.x = 0.22;
-            jetPod.position.set(jx, 0.34, -0.28);
-            const nozzleRim = new THREE.Mesh(createSculptedTorusCollarGeo(0.082, 0.018, 8, 12), MAT.copper);
+            jetPod.position.set(jx, spec.torsoH * 0.64, dorsalZ - 0.06);
+            const nozzleRim = new THREE.Mesh(createSculptedTorusCollarGeo(0.062, 0.014, 8, 12), MAT.copper);
             nozzleRim.rotation.x = Math.PI / 2 + 0.22;
-            nozzleRim.rotation.y = jx > 0 ? -0.28 : 0.28;
-            nozzleRim.position.set(jx * 1.32, 0.12, -0.33);
+            nozzleRim.rotation.y = jx > 0 ? -0.26 : 0.26;
+            nozzleRim.position.set(jx * 1.30, 0.06, dorsalZ - 0.10);
             const jetNozzleNode = new THREE.Object3D();
-            jetNozzleNode.position.set(jx * 1.38, 0.08, -0.35);
+            jetNozzleNode.position.set(jx * 1.36, 0.03, dorsalZ - 0.12);
             reaperNozzles.push({
                 node: jetNozzleNode,
                 dir: new THREE.Vector3(jx * 0.45, -0.92, -0.38).normalize()
@@ -6594,21 +7680,20 @@ function createAnimatedUnitModel(role) {
             upperBody.add(jetPod, nozzleRim, jetNozzleNode);
         });
     } else if (isHero) {
-        // HERO VANGUARD DORSAL HARD-LIGHT ENERGY WINGS & TACTICAL BANNER PYLONS!
         heroWings = new THREE.Group();
-        heroWings.position.set(0, 0.36, -0.32);
+        heroWings.position.set(0, spec.torsoH * 0.72, dorsalZ - 0.06);
         [-1, 1].forEach(side => {
-            const pylon = new THREE.Mesh(createExtrudedArmorHullGeo(0.10, 0.44, 0.14, 0.015, 0.04), MAT.copper);
-            pylon.position.set(side * 0.18, 0.12, 0);
+            const pylon = new THREE.Mesh(createCompoundArmorChestGeo(0.075, 0.34, 0.11, 0.18, 0.14), MAT.copper);
+            pylon.position.set(side * 0.135, 0.09, 0);
             pylon.rotation.z = -side * 0.36;
 
-            const wingBlade1 = new THREE.Mesh(createCurvedScytheBladeGeo(0.64, 0.06, 0.16), MAT.cyanGlow);
-            wingBlade1.position.set(side * 0.24, 0.22, -0.04);
+            const wingBlade1 = new THREE.Mesh(createProtossArchBladeGeo(0.54, 0.09, 0.024, 0.16), MAT.cyanGlow);
+            wingBlade1.position.set(side * 0.19, 0.18, -0.03);
             wingBlade1.rotation.z = -side * 0.72;
             wingBlade1.rotation.y = -side * 0.28;
 
-            const wingBlade2 = new THREE.Mesh(createCurvedScytheBladeGeo(0.48, 0.045, 0.12), MAT.amberGlow);
-            wingBlade2.position.set(side * 0.22, 0.04, -0.05);
+            const wingBlade2 = new THREE.Mesh(createProtossArchBladeGeo(0.42, 0.075, 0.020, 0.14), MAT.amberGlow);
+            wingBlade2.position.set(side * 0.17, 0.03, -0.04);
             wingBlade2.rotation.z = -side * 1.05;
             wingBlade2.rotation.y = -side * 0.28;
 
@@ -6617,91 +7702,151 @@ function createAnimatedUnitModel(role) {
         upperBody.add(heroWings);
     }
 
+    // 3. PROPORTIONAL ANATOMICAL HELMET, NECK SEAL, JAW GUARD & RECESSED PANORAMIC VISOR
     const headGroup = new THREE.Group();
-    headGroup.position.y = 0.52;
-    const helmet = new THREE.Mesh(createSculptedArmorDomeGeo(0.195, 18, 16), isMedic ? MAT.medicArmor : (isHero ? MAT.copper : (isFirebat ? MAT.medicCross : (isMarauder ? MAT.darkSteel : (isRocket ? MAT.oliveArmor : (isReaper ? MAT.darkSteel : MAT.terranPlating))))));
-    const visor = new THREE.Mesh(createSculptedArmorDomeGeo(0.17, 16, 14), isMedic ? MAT.healGlow : (isFirebat ? MAT.volatileGlow : (isHero || isReaper || isRocket || isMarauder ? MAT.amberGlow : MAT.cyanGlow)));
-    visor.scale.set(1.06, 0.52, 0.96);
-    visor.position.set(0, 0, 0.06);
-    headGroup.add(helmet, visor);
+    headGroup.position.set(0, spec.torsoH + 0.04, 0.01);
+    const helmR = spec.helmR;
+
+    const neckSeal = new THREE.Mesh(
+        createSculptedLatheBarrelGeo(helmR * 0.56, helmR * 0.64, 0.07, 10),
+        MAT.darkSteel
+    );
+    neckSeal.position.set(0, -0.01, -0.005);
+
+    const helmet = new THREE.Mesh(
+        createSculptedArmorDomeGeo(helmR, 14, 12),
+        armorMat
+    );
+    helmet.scale.set(0.95, 1.06, 1.08);
+    helmet.position.set(0, helmR * 0.52, 0);
+
+    const jawGuard = new THREE.Mesh(
+        createCompoundArmorChestGeo(helmR * 1.52, helmR * 0.72, helmR * 1.38, 0.22, 0.12),
+        isHero || isMarauder ? MAT.copper : MAT.gunmetal
+    );
+    jawGuard.position.set(0, helmR * 0.18, helmR * 0.22);
+
+    const visor = new THREE.Mesh(
+        createSculptedArmorDomeGeo(helmR * 0.88, 12, 10),
+        isMedic ? MAT.healGlow : (isFirebat ? MAT.volatileGlow : (isHero || isReaper || isRocket || isMarauder ? MAT.amberGlow : MAT.cyanGlow))
+    );
+    visor.scale.set(0.96, 0.50, 0.94);
+    visor.position.set(0, helmR * 0.54, helmR * 0.28);
+    headGroup.add(neckSeal, helmet, jawGuard, visor);
 
     if (isHero) {
-        // Crowned Commander Crest & Dual Valkyrie Horn Antennas on Hero Helmet
-        const crestFin = new THREE.Mesh(createExtrudedArmorHullGeo(0.05, 0.16, 0.28, 0.01, 0.04), MAT.amberGlow);
-        crestFin.position.set(0, 0.18, 0.02);
-        [-0.14, 0.14].forEach(hx => {
-            const horn = new THREE.Mesh(createCurvedScytheBladeGeo(0.28, 0.035, 0.08), MAT.copper);
-            horn.position.set(hx, 0.10, 0.02);
-            horn.rotation.z = hx > 0 ? -0.38 : 0.38;
-            horn.rotation.x = -0.35;
+        const crestFin = new THREE.Mesh(createProtossArchBladeGeo(0.24, 0.075, 0.024, 0.16), MAT.amberGlow);
+        crestFin.position.set(0, helmR * 1.45, 0.01);
+        crestFin.rotation.y = Math.PI * 0.5;
+        [-0.095, 0.095].forEach(hx => {
+            const horn = new THREE.Mesh(createCurvedScytheBladeGeo(0.20, 0.024, 0.055), MAT.copper);
+            horn.position.set(hx, helmR * 0.95, 0.01);
+            horn.rotation.z = hx > 0 ? -0.36 : 0.36;
+            horn.rotation.x = -0.32;
             headGroup.add(horn);
         });
         headGroup.add(crestFin);
+    } else if (isReaper) {
+        [-0.048, 0.048].forEach(rx => {
+            const rebreather = new THREE.Mesh(createSculptedLatheBarrelGeo(0.025, 0.020, 0.055, 10), MAT.gunmetal);
+            rebreather.rotation.x = Math.PI * 0.5;
+            rebreather.position.set(rx, helmR * 0.14, helmR * 0.92);
+            headGroup.add(rebreather);
+        });
     }
     upperBody.add(headGroup);
 
-    // Oversized SC2 Domed Shoulder Pauldrons
+    // 4. ANATOMICAL DELTOID SOCKETS, CONTOURED PAULDRONS, TAPERED UPPER ARMS, ELBOW SOCKETS & FOREARMS
+    const shoulderY = spec.torsoH * 0.86;
+    const pWidth = 0.135 * spec.pScale;
+    const pHeight = 0.145 * spec.pScale;
+    const pDepth = 0.165 * spec.pScale;
+
     const shoulderR = new THREE.Group();
-    shoulderR.position.set(0.31, 0.36, 0);
-    const pauldronR = new THREE.Mesh(createSculptedArmorDomeGeo(0.165, 16, 14), isHero ? MAT.terranBlue : pauldronMat);
-    pauldronR.scale.set(isHero || isMarauder ? 1.30 : (isFirebat ? 1.22 : 1.12), 0.92, isHero || isMarauder ? 1.28 : 1.16);
-    const pauldronRimR = new THREE.Mesh(createSculptedTorusCollarGeo(0.155, 0.025, 10, 16), isHero ? MAT.copper : (isMedic ? MAT.medicDecalCross : MAT.terranCobalt));
+    shoulderR.position.set(spec.shX, shoulderY, 0);
+    const shoulderJointR = new THREE.Mesh(createSculptedArmorDomeGeo(spec.armR * 1.08, 10, 8), MAT.darkSteel);
+    const pauldronR = new THREE.Mesh(
+        createAnatomicalPauldronGeo(pWidth, pHeight, pDepth),
+        isHero ? MAT.terranBlue : pauldronMat
+    );
+    pauldronR.position.set(0.018 * spec.pScale, 0.012, 0);
+    pauldronR.rotation.z = -0.16;
+
+    const pauldronRimR = new THREE.Mesh(
+        createSculptedTorusCollarGeo(pWidth * 0.56, 0.016 * spec.pScale, 8, 14),
+        isHero ? MAT.copper : (isMedic ? MAT.medicDecalCross : MAT.terranCobalt)
+    );
+    pauldronRimR.position.set(0.018 * spec.pScale, -0.01, 0);
     pauldronRimR.rotation.x = Math.PI / 2.2;
-    const upperArmR = new THREE.Mesh(createSculptedLatheBarrelGeo(0.07, 0.06, 0.24, 14), armorMat);
-    upperArmR.position.y = -0.11;
-    shoulderR.add(pauldronR, pauldronRimR, upperArmR);
+    pauldronRimR.rotation.y = 0.22;
+
+    const upperArmR = new THREE.Mesh(
+        createArticulatedMechLimbGeo(0.20, spec.armR, spec.armR * 0.84, 0.14),
+        armorMat
+    );
+    upperArmR.position.set(0, -0.10, 0);
+    upperArmR.castShadow = true;
+    shoulderR.add(shoulderJointR, pauldronR, pauldronRimR, upperArmR);
 
     if (isHero) {
-        // Shoulder-Mounted Micro-Missile Pod on Hero Pauldrons
-        const podR = new THREE.Mesh(createExtrudedArmorHullGeo(0.14, 0.12, 0.20, 0.015, 0.04), MAT.gunmetal);
-        podR.position.set(0.06, 0.16, 0.02);
-        const podTipR = new THREE.Mesh(createExtrudedArmorHullGeo(0.10, 0.08, 0.04), MAT.medicCross);
-        podTipR.position.set(0.06, 0.16, 0.12);
+        const podR = new THREE.Mesh(createCompoundArmorChestGeo(0.10, 0.09, 0.15, 0.18, 0.12), MAT.gunmetal);
+        podR.position.set(0.04, 0.10, 0.01);
+        const podTipR = new THREE.Mesh(createExtrudedArmorHullGeo(0.075, 0.06, 0.03), MAT.medicCross);
+        podTipR.position.set(0.04, 0.10, 0.085);
         shoulderR.add(podR, podTipR);
     }
 
     const elbowR = new THREE.Group();
-    elbowR.position.set(0, -0.22, 0);
-    const forearmR = new THREE.Mesh(createSculptedLatheBarrelGeo(0.068, 0.058, 0.24, 14), isMedic ? MAT.medicArmor : (isHero ? MAT.copper : MAT.gunmetal));
-    forearmR.position.y = -0.11;
-    const handR = new THREE.Mesh(createSculptedArmorDomeGeo(0.058, 12, 12), MAT.darkSteel);
-    handR.position.set(0, -0.23, 0);
-    elbowR.add(forearmR, handR);
+    elbowR.position.set(0, -0.20, 0);
+    const elbowJointR = new THREE.Mesh(createSculptedArmorDomeGeo(spec.armR * 0.92, 10, 8), MAT.darkSteel);
+    const forearmR = new THREE.Mesh(
+        createArticulatedMechLimbGeo(0.21, spec.armR * 0.94, spec.armR * 0.76, 0.16),
+        isMedic ? MAT.medicArmor : (isHero ? MAT.copper : MAT.gunmetal)
+    );
+    forearmR.position.set(0, -0.105, 0);
+    forearmR.castShadow = true;
+    const handR = new THREE.Mesh(createSculptedArmorDomeGeo(spec.armR * 0.86, 10, 10), MAT.darkSteel);
+    handR.position.set(0, -0.21, 0);
+    elbowR.add(elbowJointR, forearmR, handR);
     shoulderR.add(elbowR);
     upperBody.add(shoulderR);
 
     const shoulderL = new THREE.Group();
-    shoulderL.position.set(-0.31, 0.36, 0);
+    shoulderL.position.set(-spec.shX, shoulderY, 0);
+    const shoulderJointL = shoulderJointR.clone();
     const pauldronL = pauldronR.clone();
+    pauldronL.position.set(-0.018 * spec.pScale, 0.012, 0);
+    pauldronL.rotation.z = 0.16;
     const pauldronRimL = pauldronRimR.clone();
+    pauldronRimL.position.set(-0.018 * spec.pScale, -0.01, 0);
+    pauldronRimL.rotation.y = -0.22;
     const upperArmL = upperArmR.clone();
-    shoulderL.add(pauldronL, pauldronRimL, upperArmL);
+    shoulderL.add(shoulderJointL, pauldronL, pauldronRimL, upperArmL);
 
     if (isHero) {
-        const podL = new THREE.Mesh(createExtrudedArmorHullGeo(0.14, 0.12, 0.20, 0.015, 0.04), MAT.gunmetal);
-        podL.position.set(-0.06, 0.16, 0.02);
-        const podTipL = new THREE.Mesh(createExtrudedArmorHullGeo(0.10, 0.08, 0.04), MAT.medicCross);
-        podTipL.position.set(-0.06, 0.16, 0.12);
+        const podL = new THREE.Mesh(createCompoundArmorChestGeo(0.10, 0.09, 0.15, 0.18, 0.12), MAT.gunmetal);
+        podL.position.set(-0.04, 0.10, 0.01);
+        const podTipL = new THREE.Mesh(createExtrudedArmorHullGeo(0.075, 0.06, 0.03), MAT.medicCross);
+        podTipL.position.set(-0.04, 0.10, 0.085);
         shoulderL.add(podL, podTipL);
     }
 
     const elbowL = new THREE.Group();
-    elbowL.position.set(0, -0.22, 0);
+    elbowL.position.set(0, -0.20, 0);
+    const elbowJointL = elbowJointR.clone();
     const forearmL = forearmR.clone();
     const handL = handR.clone();
-    elbowL.add(forearmL, handL);
+    elbowL.add(elbowJointL, forearmL, handL);
     shoulderL.add(elbowL);
     upperBody.add(shoulderL);
 
     if (isMedic) {
-        // Dedicated Medical Caduceus Gauntlet on right hand (NO assault rifle!)
         const medGauntlet = createCaduceusMedicalGauntlet();
-        medGauntlet.position.set(-0.02, -0.14, 0.10);
+        medGauntlet.position.set(-0.02, -0.12, 0.09);
         handR.add(medGauntlet);
 
-        // Wrist-mounted Biometric Scanner on left forearm
         const scannerPad = createBiometricScannerPad();
-        scannerPad.position.set(0.05, -0.08, 0.08);
+        scannerPad.position.set(0.045, -0.08, 0.07);
         scannerPad.rotation.y = -Math.PI / 3;
         elbowL.add(scannerPad);
 
@@ -6710,19 +7855,17 @@ function createAnimatedUnitModel(role) {
         shoulderL.rotation.set(-0.52, 0.35, 0);
         elbowL.rotation.set(-0.82, 0.15, 0);
     } else if (isHero) {
-        // BESPOKE HERO VANGUARD HYPERION TWIN-CORE PLASMA RAIL-CANNON + LEFT FOREARM AEGIS HOLO-SHIELD!
         heroWeapon = createHeroHyperionRailbladeCannon();
-        heroWeapon.position.set(-0.05, -0.02, 0.16);
+        heroWeapon.position.set(-0.04, -0.02, 0.14);
         heroWeapon.rotation.x = Math.PI / 2;
         handR.add(heroWeapon);
 
-        // Left Forearm Projected Golden-Cyan Aegis Buckler Emitter
-        const bucklerFrame = new THREE.Mesh(createSculptedLatheBarrelGeo(0.12, 0.12, 0.04, 8), MAT.copper);
+        const bucklerFrame = new THREE.Mesh(createSculptedLatheBarrelGeo(0.10, 0.10, 0.035, 8), MAT.copper);
         bucklerFrame.rotation.z = Math.PI / 2;
-        bucklerFrame.position.set(-0.07, -0.10, 0.04);
-        const bucklerRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.16, 0.018, 8, 18), MAT.cyanGlow);
+        bucklerFrame.position.set(-0.06, -0.10, 0.035);
+        const bucklerRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.135, 0.015, 8, 18), MAT.cyanGlow);
         bucklerRing.rotation.y = Math.PI / 2;
-        bucklerRing.position.set(-0.09, -0.10, 0.04);
+        bucklerRing.position.set(-0.075, -0.10, 0.035);
         elbowL.add(bucklerFrame, bucklerRing);
 
         shoulderR.rotation.set(-0.62, -0.10, 0);
@@ -6730,21 +7873,20 @@ function createAnimatedUnitModel(role) {
         shoulderL.rotation.set(-0.74, 0.58, 0);
         elbowL.rotation.set(-0.84, 0.22, 0);
     } else if (isFirebat) {
-        // CMC-660 PYRO-FIREBAT: Twin Wrist-Mounted Perdition Plasma Flamethrower Gauntlets + Pilot Igniters!
         [handR, handL].forEach(handNode => {
             const gauntletGroup = new THREE.Group();
-            const shroud = new THREE.Mesh(createExtrudedArmorHullGeo(0.15, 0.15, 0.38, 0.02, 0.06), MAT.medicCross);
-            shroud.position.set(0, 0, 0.14);
-            const hazardBand = new THREE.Mesh(createExtrudedArmorHullGeo(0.16, 0.16, 0.08), MAT.hazard);
-            hazardBand.position.set(0, 0, 0.22);
-            const nozzleL = new THREE.Mesh(createSculptedLatheBarrelGeo(0.032, 0.042, 0.26, 10), MAT.gunmetal);
+            const shroud = new THREE.Mesh(createCompoundArmorChestGeo(0.13, 0.13, 0.32, 0.20, 0.14), MAT.medicCross);
+            shroud.position.set(0, 0, 0.12);
+            const hazardBand = new THREE.Mesh(createExtrudedArmorHullGeo(0.14, 0.14, 0.065), MAT.hazard);
+            hazardBand.position.set(0, 0, 0.19);
+            const nozzleL = new THREE.Mesh(createSculptedLatheBarrelGeo(0.026, 0.034, 0.22, 10), MAT.gunmetal);
             nozzleL.rotation.x = Math.PI / 2;
-            nozzleL.position.set(-0.035, 0, 0.34);
-            const nozzleR = new THREE.Mesh(createSculptedLatheBarrelGeo(0.032, 0.042, 0.26, 10), MAT.gunmetal);
+            nozzleL.position.set(-0.03, 0, 0.29);
+            const nozzleR = new THREE.Mesh(createSculptedLatheBarrelGeo(0.026, 0.034, 0.22, 10), MAT.gunmetal);
             nozzleR.rotation.x = Math.PI / 2;
-            nozzleR.position.set(0.035, 0, 0.34);
-            const pilotFlame = new THREE.Mesh(createSculptedArmorDomeGeo(0.042, 8, 8), MAT.volatileGlow);
-            pilotFlame.position.set(0, -0.02, 0.48);
+            nozzleR.position.set(0.03, 0, 0.29);
+            const pilotFlame = new THREE.Mesh(createSculptedArmorDomeGeo(0.035, 8, 8), MAT.volatileGlow);
+            pilotFlame.position.set(0, -0.015, 0.41);
             gauntletGroup.add(shroud, hazardBand, nozzleL, nozzleR, pilotFlame);
             gauntletGroup.rotation.x = Math.PI / 2;
             handNode.add(gauntletGroup);
@@ -6754,18 +7896,17 @@ function createAnimatedUnitModel(role) {
         shoulderL.rotation.set(-0.64, 0.14, 0);
         elbowL.rotation.set(-0.88, 0, 0);
     } else if (isMarauder) {
-        // CMC-700 CONCUSSIVE MARAUDER: Dual Arm-Mounted Quad-Barrel Punisher Grenade Launchers!
         [handR, handL].forEach(handNode => {
             const cannonGroup = new THREE.Group();
-            const housing = new THREE.Mesh(createExtrudedArmorHullGeo(0.18, 0.20, 0.48, 0.025, 0.08), MAT.darkSteel);
-            housing.position.set(0, 0, 0.18);
-            const copperTrim = new THREE.Mesh(createExtrudedArmorHullGeo(0.19, 0.08, 0.36), MAT.copper);
-            copperTrim.position.set(0, 0.08, 0.18);
-            const bore = new THREE.Mesh(createSculptedLatheBarrelGeo(0.062, 0.072, 0.34, 12), MAT.gunmetal);
+            const housing = new THREE.Mesh(createCompoundArmorChestGeo(0.16, 0.17, 0.40, 0.22, 0.15), MAT.darkSteel);
+            housing.position.set(0, 0, 0.15);
+            const copperTrim = new THREE.Mesh(createExtrudedArmorHullGeo(0.168, 0.065, 0.30), MAT.copper);
+            copperTrim.position.set(0, 0.065, 0.15);
+            const bore = new THREE.Mesh(createSculptedLatheBarrelGeo(0.050, 0.058, 0.28, 12), MAT.gunmetal);
             bore.rotation.x = Math.PI / 2;
-            bore.position.set(0, 0, 0.38);
-            const muzzleRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.065, 0.016, 8, 14), MAT.amberGlow);
-            muzzleRing.position.set(0, 0, 0.54);
+            bore.position.set(0, 0, 0.32);
+            const muzzleRing = new THREE.Mesh(createSculptedTorusCollarGeo(0.052, 0.013, 8, 14), MAT.amberGlow);
+            muzzleRing.position.set(0, 0, 0.45);
             cannonGroup.add(housing, copperTrim, bore, muzzleRing);
             cannonGroup.rotation.x = Math.PI / 2;
             handNode.add(cannonGroup);
@@ -6775,9 +7916,8 @@ function createAnimatedUnitModel(role) {
         shoulderL.rotation.set(-0.68, 0.10, 0);
         elbowL.rotation.set(-0.92, 0, 0);
     } else if (isRocket) {
-        // Heavy Shoulder-Mounted Twin-Tube Anti-Armor & Anti-Air Rocket Launcher
         const rocketLauncher = createShoulderRocketLauncher();
-        rocketLauncher.position.set(-0.04, -0.02, 0.16);
+        rocketLauncher.position.set(-0.035, -0.02, 0.14);
         rocketLauncher.rotation.x = Math.PI / 2;
         handR.add(rocketLauncher);
 
@@ -6786,14 +7926,13 @@ function createAnimatedUnitModel(role) {
         shoulderL.rotation.set(-0.75, 0.55, 0);
         elbowL.rotation.set(-0.85, 0.25, 0);
     } else if (isReaper) {
-        // Dual P-45 Gauss Pistols (One in each hand!)
         const pistolR = createReaperGaussPistol();
-        pistolR.position.set(0, -0.02, 0.12);
+        pistolR.position.set(0, -0.02, 0.11);
         pistolR.rotation.x = Math.PI / 2;
         handR.add(pistolR);
 
         const pistolL = createReaperGaussPistol();
-        pistolL.position.set(0, -0.02, 0.12);
+        pistolL.position.set(0, -0.02, 0.11);
         pistolL.rotation.x = Math.PI / 2;
         handL.add(pistolL);
 
@@ -6805,11 +7944,10 @@ function createAnimatedUnitModel(role) {
         const sword = createPlasmaBroadsword();
         handR.add(sword);
 
-        // Heavy Riot Blast Shield with Dominion Blue livery
-        const shield = new THREE.Mesh(createExtrudedArmorHullGeo(0.12, 0.58, 0.40, 0.03, 0.1), MAT.terranBlue);
-        shield.position.set(-0.08, -0.1, 0.08);
-        const shieldBorder = new THREE.Mesh(createExtrudedArmorHullGeo(0.13, 0.60, 0.06), MAT.hazard);
-        shieldBorder.position.set(-0.08, -0.1, 0.28);
+        const shield = new THREE.Mesh(createCompoundArmorChestGeo(0.10, 0.50, 0.34, 0.20, 0.16), MAT.terranBlue);
+        shield.position.set(-0.065, -0.10, 0.07);
+        const shieldBorder = new THREE.Mesh(createExtrudedArmorHullGeo(0.11, 0.52, 0.05), MAT.hazard);
+        shieldBorder.position.set(-0.065, -0.10, 0.24);
         shield.add(shieldBorder);
         elbowL.add(shield);
 
@@ -6819,7 +7957,7 @@ function createAnimatedUnitModel(role) {
         elbowL.rotation.set(-0.9, 0, 0);
     } else {
         const rifle = createDetailedAssaultRifle(false);
-        rifle.position.set(-0.06, -0.02, 0.14);
+        rifle.position.set(-0.045, -0.02, 0.13);
         rifle.rotation.x = Math.PI / 2;
         handR.add(rifle);
 
@@ -6829,50 +7967,76 @@ function createAnimatedUnitModel(role) {
         elbowL.rotation.set(-0.82, 0.25, 0);
     }
 
-    // Articulated IK Pelvis Assembly + Lathe-Sculpted Contoured Thigh & Greave Leg Armor + Armored Combat Boots
+    // 5. ANATOMICAL PELVIS, HIP/KNEE/ANKLE BALL SOCKETS, TAPERED THIGHS, GREAVES & COMBAT BOOTS
     const pelvisGroup = new THREE.Group();
-    pelvisGroup.position.set(0, 0.40, 0);
+    pelvisGroup.position.set(0, 0.42, 0);
     const pelvisArmor = new THREE.Mesh(
-        createExtrudedArmorHullGeo(0.26, 0.12, 0.20, 0.02, 0.05),
+        createAnatomicalPelvisGeo(spec.waistW * 1.16, 0.125, spec.chestD * 0.84),
         isHero ? MAT.terranBlue : armorMat
     );
-    pelvisArmor.position.set(0, 0.02, 0);
-    pelvisGroup.add(pelvisArmor);
+    pelvisArmor.position.set(0, 0.01, 0);
+    const beltPod = new THREE.Mesh(
+        createExtrudedArmorHullGeo(spec.waistW * 0.46, 0.042, 0.032),
+        isHero || isMarauder ? MAT.copper : MAT.gunmetal
+    );
+    beltPod.position.set(0, 0.04, spec.chestD * 0.42 + 0.01);
+    pelvisGroup.add(pelvisArmor, beltPod);
     group.add(pelvisGroup);
-
-    const greavePts = [
-        new THREE.Vector2(0.0, 0.0),
-        new THREE.Vector2(0.085, 0.0),
-        new THREE.Vector2(0.072, 0.08),
-        new THREE.Vector2(0.092, 0.16),
-        new THREE.Vector2(0.08, 0.22),
-        new THREE.Vector2(0.0, 0.22)
-    ];
-    const greaveGeo = new THREE.LatheGeometry(greavePts, 14);
 
     function makeLeg(xOff) {
         const hip = new THREE.Group();
         hip.position.set(xOff, 0, 0);
-        const thigh = new THREE.Mesh(createSculptedLatheBarrelGeo(0.088, 0.078, 0.22, 14), armorMat);
-        thigh.position.y = -0.10;
+
+        const hipJoint = new THREE.Mesh(
+            createSculptedArmorDomeGeo(spec.legR * 0.94, 10, 8),
+            MAT.darkSteel
+        );
+        const thigh = new THREE.Mesh(
+            createArticulatedMechLimbGeo(0.20, spec.legR, spec.legR * 0.82, 0.16),
+            armorMat
+        );
+        thigh.position.set(0, -0.10, 0);
+        thigh.castShadow = true;
+
         const knee = new THREE.Group();
-        knee.position.y = -0.20;
-        const kneePad = new THREE.Mesh(createSculptedArmorDomeGeo(0.065, 12, 10), isMedic ? MAT.medicArmor : (isHero ? MAT.amberGlow : MAT.terranCobalt));
-        kneePad.position.set(0, 0, 0.04);
-        const shin = new THREE.Mesh(greaveGeo, isHero ? MAT.terranBlue : MAT.gunmetal);
-        shin.position.y = -0.20;
+        knee.position.set(0, -0.20, 0);
+        const kneeJoint = new THREE.Mesh(
+            createSculptedArmorDomeGeo(spec.legR * 0.84, 10, 8),
+            MAT.darkSteel
+        );
+        const kneePad = new THREE.Mesh(
+            createCompoundArmorChestGeo(spec.legR * 1.45, spec.legR * 1.50, spec.legR * 1.20, 0.24, 0.14),
+            isMedic ? MAT.medicArmor : (isHero ? MAT.amberGlow : MAT.terranCobalt)
+        );
+        kneePad.position.set(0, 0.005, spec.legR * 0.72);
+
+        const shin = new THREE.Mesh(
+            createArticulatedMechLimbGeo(0.20, spec.legR * 0.92, spec.legR * 0.74, 0.18),
+            isHero ? MAT.terranBlue : MAT.gunmetal
+        );
+        shin.position.set(0, -0.10, 0);
+        shin.castShadow = true;
+
         const ankle = new THREE.Group();
         ankle.position.set(0, -0.20, 0);
-        const boot = new THREE.Mesh(createExtrudedArmorHullGeo(0.105, 0.075, 0.18, 0.015, 0.04), MAT.darkSteel);
-        boot.position.set(0, -0.02, 0.045);
-        ankle.add(boot);
-        knee.add(kneePad, shin, ankle);
-        hip.add(thigh, knee);
+        const ankleJoint = new THREE.Mesh(
+            createSculptedArmorDomeGeo(spec.legR * 0.72, 8, 8),
+            MAT.darkSteel
+        );
+        const boot = new THREE.Mesh(
+            createAnatomicalBootGeo(spec.legR * 1.62, 0.068, 0.168),
+            MAT.darkSteel
+        );
+        boot.position.set(0, -0.02, 0.036);
+        ankle.add(ankleJoint, boot);
+
+        knee.add(kneeJoint, kneePad, shin, ankle);
+        hip.add(hipJoint, thigh, knee);
         pelvisGroup.add(hip);
         return { hip, knee, ankle };
     }
-    const legL = makeLeg(-0.125);
-    const legR = makeLeg(0.125);
+    const legL = makeLeg(-spec.hipX);
+    const legR = makeLeg(spec.hipX);
 
     group.userData = {
         isBug: false, role, upperBody,
@@ -6883,6 +8047,195 @@ function createAnimatedUnitModel(role) {
     };
     return group;
 }
+
+// ============================================================================
+// OBJECT POOLING FOR PARTICLES, SMOKE CLOUDS, SHELL CASINGS, SHOCKWAVES & VECTORS
+// Eliminates per-frame THREE.Mesh, ShaderMaterial.clone(), and THREE.Vector3 GC churn
+// ============================================================================
+const _particleMeshPool = [];
+const _smokeMeshPool = [];
+const _casingMeshPool = [];
+const _shockwaveMeshPool = [];
+const _shockMatPoolCyan = [];
+const _shockMatPoolAmber = [];
+const _shockMatPoolWater = [];
+const _vec3Pool = [];
+const _animLocalAimScratch = new THREE.Vector3();
+const _defaultThrustDir = new THREE.Vector3(0, -1, 0);
+const _emitterScratchVec = new THREE.Vector3();
+const _emitterRightVec = new THREE.Vector3();
+const _creepPosScratch = new THREE.Vector3();
+
+const FX_POOL = {
+    acquireVec3(x = 0, y = 0, z = 0) {
+        if (_vec3Pool.length > 0) {
+            return _vec3Pool.pop().set(x, y, z);
+        }
+        return new THREE.Vector3(x, y, z);
+    },
+    releaseVec3(v) {
+        if (v && v.isVector3 && _vec3Pool.length < 600) {
+            _vec3Pool.push(v);
+        }
+    },
+    acquireParticleMesh(geo, mat) {
+        let m;
+        if (_particleMeshPool.length > 0) {
+            m = _particleMeshPool.pop();
+            m.geometry = geo;
+            m.material = mat;
+            m.visible = true;
+            m.rotation.set(0, 0, 0);
+            m.scale.set(1, 1, 1);
+        } else {
+            m = new THREE.Mesh(geo, mat);
+            m.castShadow = false;
+            m.receiveShadow = false;
+        }
+        if (!m.parent && typeof scene !== 'undefined') scene.add(m);
+        return m;
+    },
+    releaseParticleEntry(p) {
+        if (!p) return;
+        if (p.vel) this.releaseVec3(p.vel);
+        if (p.rotVel) this.releaseVec3(p.rotVel);
+        p.vel = null;
+        p.rotVel = null;
+        const m = p.mesh;
+        if (m) {
+            m.visible = false;
+            if (_particleMeshPool.length < 280) {
+                _particleMeshPool.push(m);
+            } else if (m.parent) {
+                m.parent.remove(m);
+            }
+        }
+        if (window.PERF_PROFILER && window.PERF_PROFILER.counts) {
+            window.PERF_PROFILER.counts.pooledParticles = _particleMeshPool.length;
+        }
+    },
+    acquireSmokeMesh(geo, mat) {
+        let m;
+        if (_smokeMeshPool.length > 0) {
+            m = _smokeMeshPool.pop();
+            m.geometry = geo;
+            m.material = mat;
+            m.visible = true;
+            m.rotation.set(0, 0, 0);
+            m.scale.set(1, 1, 1);
+        } else {
+            m = new THREE.Mesh(geo, mat);
+            m.castShadow = false;
+            m.receiveShadow = false;
+        }
+        if (!m.parent && typeof scene !== 'undefined') scene.add(m);
+        return m;
+    },
+    releaseSmokeEntry(sm) {
+        if (!sm) return;
+        if (sm.vel) this.releaseVec3(sm.vel);
+        sm.vel = null;
+        const m = sm.mesh;
+        if (m) {
+            if (sm.ownsMaterial && m.material && typeof m.material.dispose === 'function') {
+                m.material.dispose();
+            }
+            m.visible = false;
+            if (_smokeMeshPool.length < 90) {
+                _smokeMeshPool.push(m);
+            } else if (m.parent) {
+                m.parent.remove(m);
+            }
+        }
+    },
+    acquireCasingMesh(geo, mat) {
+        let m;
+        if (_casingMeshPool.length > 0) {
+            m = _casingMeshPool.pop();
+            m.geometry = geo;
+            m.material = mat;
+            m.visible = true;
+            m.rotation.set(0, 0, 0);
+            m.scale.set(1, 1, 1);
+        } else {
+            m = new THREE.Mesh(geo, mat);
+            m.castShadow = false;
+            m.receiveShadow = false;
+        }
+        if (!m.parent && typeof scene !== 'undefined') scene.add(m);
+        return m;
+    },
+    releaseCasingEntry(c) {
+        if (!c) return;
+        if (c.vel) this.releaseVec3(c.vel);
+        if (c.rotVel) this.releaseVec3(c.rotVel);
+        c.vel = null;
+        c.rotVel = null;
+        const m = c.mesh;
+        if (m) {
+            m.visible = false;
+            if (_casingMeshPool.length < 64) {
+                _casingMeshPool.push(m);
+            } else if (m.parent) {
+                m.parent.remove(m);
+            }
+        }
+    },
+    acquireShockwaveMesh(geo, matKind = 'cyan') {
+        let matPool = matKind === 'amber' ? _shockMatPoolAmber : (matKind === 'water' ? _shockMatPoolWater : _shockMatPoolCyan);
+        let mat = matPool.length > 0 ? matPool.pop() : null;
+        if (!mat) {
+            const baseMat = matKind === 'amber'
+                ? SHARED_FX_MAT.shockAmber
+                : (matKind === 'water' ? SHARED_FX_MAT.waterRipple : SHARED_FX_MAT.shockCyan);
+            mat = baseMat.clone();
+            mat._poolKind = matKind;
+        }
+        if (mat.uniforms && mat.uniforms.uOpacity) mat.uniforms.uOpacity.value = 0.9;
+        else mat.opacity = 0.85;
+
+        let m;
+        if (_shockwaveMeshPool.length > 0) {
+            m = _shockwaveMeshPool.pop();
+            m.geometry = geo;
+            m.material = mat;
+            m.visible = true;
+            m.rotation.set(0, 0, 0);
+            m.scale.set(1, 1, 1);
+        } else {
+            m = new THREE.Mesh(geo, mat);
+            m.castShadow = false;
+            m.receiveShadow = false;
+        }
+        if (!m.parent && typeof scene !== 'undefined') scene.add(m);
+        return m;
+    },
+    releaseShockwaveEntry(sw) {
+        if (!sw || !sw.mesh) return;
+        const m = sw.mesh;
+        m.visible = false;
+        const mat = m.material;
+        if (mat && mat._poolKind) {
+            const matPool = mat._poolKind === 'amber' ? _shockMatPoolAmber : (mat._poolKind === 'water' ? _shockMatPoolWater : _shockMatPoolCyan);
+            if (matPool.length < 36) matPool.push(mat);
+        }
+        if (_shockwaveMeshPool.length < 48) {
+            _shockwaveMeshPool.push(m);
+        } else if (m.parent) {
+            m.parent.remove(m);
+        }
+    },
+    getPoolStats() {
+        return {
+            particles: _particleMeshPool.length,
+            smoke: _smokeMeshPool.length,
+            casings: _casingMeshPool.length,
+            shockwaves: _shockwaveMeshPool.length,
+            vec3: _vec3Pool.length
+        };
+    }
+};
+window.FX_POOL = FX_POOL;
 
 // ============================================================================
 // DYNAMIC 3D THRUSTER EXHAUST PARTICLE GENERATOR (SLEEK ADDITIVE ION PLASMA & THERMAL JET STREAM)
@@ -6896,7 +8249,6 @@ let _thrusterMats = null;
 
 function ensureThrusterParticleAssets() {
     if (!_thrusterMicroGeo) {
-        // Sculpted 3D tapered mach-diamond plasma core geometry (zero basic spheres or flat planes!)
         const pts = [];
         for (let i = 0; i <= 8; i++) {
             const t = i / 8;
@@ -6930,24 +8282,33 @@ function ensureThrusterParticleAssets() {
 
 function emitThrusterExhaustParticles(nozzleNode, localDir, colorMode = 'amber', scale = 1.0, isMoving = false) {
     if (!nozzleNode || typeof particles === 'undefined') return;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
     const totalActors = (window.units ? window.units.length : 0) + (window.enemies ? window.enemies.length : 0);
-    const maxAllowedParticles = totalActors > 42 ? 95 : 165;
+    const profileCap = perf ? perf.maxParticles : 165;
+    const maxAllowedParticles = Math.min(profileCap, totalActors > 80 ? 55 : (totalActors > 42 ? 85 : 155));
     if (particles.length >= maxAllowedParticles) return;
 
     ensureThrusterParticleAssets();
 
     if (nozzleNode.isVector3) {
         _thrusterWorldPos.copy(nozzleNode);
-        _thrusterWorldDir.copy(localDir || new THREE.Vector3(0, -1, 0)).normalize();
+        _thrusterWorldDir.copy(localDir || _defaultThrustDir).normalize();
     } else if (typeof nozzleNode.getWorldPosition === 'function') {
         nozzleNode.getWorldPosition(_thrusterWorldPos);
         nozzleNode.getWorldQuaternion(_thrusterWorldQuat);
-        _thrusterWorldDir.copy(localDir || new THREE.Vector3(0, -1, 0)).applyQuaternion(_thrusterWorldQuat).normalize();
+        _thrusterWorldDir.copy(localDir || _defaultThrustDir).applyQuaternion(_thrusterWorldQuat).normalize();
     } else {
         return;
     }
 
-    // Viewport Frustum Culling: skip emitting thruster particles for off-screen units!
+    // Distance & Viewport Frustum Culling: skip emitting thruster particles for distant or off-screen units
+    if (typeof camera !== 'undefined' && camera) {
+        const dxCam = _thrusterWorldPos.x - camera.position.x;
+        const dyCam = _thrusterWorldPos.y - camera.position.y;
+        const dzCam = _thrusterWorldPos.z - camera.position.z;
+        const maxDistSq = perf ? perf.animNormalDistSq : 6400;
+        if (dxCam * dxCam + dyCam * dyCam + dzCam * dzCam > maxDistSq) return;
+    }
     if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(_thrusterWorldPos.x, _thrusterWorldPos.y, _thrusterWorldPos.z, 6.0)) {
         return;
     }
@@ -6955,33 +8316,31 @@ function emitThrusterExhaustParticles(nozzleNode, localDir, colorMode = 'amber',
     const isCyan = (colorMode === 'cyan' || colorMode === false || scale === 'cyan');
     const effScale = (typeof colorMode === 'number') ? colorMode : (typeof scale === 'number' ? scale : 1.0);
     const boost = isMoving ? 1.32 : 0.96;
-    const count = (totalActors > 42) ? 2 : 3;
+    const rawCount = (totalActors > 60 || (perf && perf.tierIndex >= 2)) ? 1 : (totalActors > 35 ? 2 : 3);
 
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < rawCount; i++) {
+        if (particles.length >= maxAllowedParticles) break;
         const isCore = (i === 0);
         const isMidPlume = (i === 1);
         const mat = isCyan
             ? (isCore ? _thrusterMats.coreWhite : (isMidPlume ? _thrusterMats.cyanHot : (Math.random() > 0.4 ? _thrusterMats.cyanIon : _thrusterMats.cyanTail)))
             : (isCore ? _thrusterMats.coreWhite : (isMidPlume ? _thrusterMats.amberHot : (Math.random() > 0.4 ? _thrusterMats.amberFlame : _thrusterMats.amberTail)));
 
-        const jet = new THREE.Mesh(_thrusterMicroGeo, mat);
+        const jet = FX_POOL.acquireParticleMesh(_thrusterMicroGeo, mat);
         const s = (isCore ? 0.88 : (isMidPlume ? 1.05 : 0.78 + Math.random() * 0.35)) * effScale * boost;
-        // Multi-stage Mach-Diamond Core + Supersonic Tapered Exhaust Plume
         jet.scale.set(s * (isCore ? 0.68 : 0.95), s * (isCore ? 0.68 : 0.95), s * (isCore ? 1.85 : 2.55));
 
         const jitter = isCore ? 0.008 : 0.022;
-        jet.position.copy(_thrusterWorldPos)
-            .addScaledVector(_thrusterWorldDir, isCore ? 0.02 : (0.06 + i * 0.045))
-            .add(new THREE.Vector3(
-                (Math.random() - 0.5) * jitter,
-                (Math.random() - 0.5) * jitter,
-                (Math.random() - 0.5) * jitter
-            ));
-        scene.add(jet);
+        const adv = isCore ? 0.02 : (0.06 + i * 0.045);
+        jet.position.set(
+            _thrusterWorldPos.x + _thrusterWorldDir.x * adv + (Math.random() - 0.5) * jitter,
+            _thrusterWorldPos.y + _thrusterWorldDir.y * adv + (Math.random() - 0.5) * jitter,
+            _thrusterWorldPos.z + _thrusterWorldDir.z * adv + (Math.random() - 0.5) * jitter
+        );
 
         const speed = ((isMoving ? 7.8 : 5.2) + i * 1.8 + Math.random() * 1.4) * Math.max(0.65, effScale);
         const spread = isCore ? 0.14 : 0.42;
-        const vel = new THREE.Vector3(
+        const vel = FX_POOL.acquireVec3(
             _thrusterWorldDir.x * speed + (Math.random() - 0.5) * spread,
             _thrusterWorldDir.y * speed + (Math.random() - 0.5) * spread,
             _thrusterWorldDir.z * speed + (Math.random() - 0.5) * spread
@@ -7003,26 +8362,60 @@ function emitThrusterExhaustParticles(nozzleNode, localDir, colorMode = 'amber',
 window.emitThrusterExhaustParticles = emitThrusterExhaustParticles;
 
 // Ambient & Combat Zerg Creep Viscoelastic Goo / Spore Bubble Particle Emitter
+// Supports both (worldPos, count, isBurst) and (cx, cz, radius, dt) signatures!
 let _creepGooGeo = null;
-function emitZergCreepGooParticles(worldPos, count = 2, isBurst = false) {
-    if (!worldPos || typeof particles === 'undefined') return;
+let _ambientCreepAccum = 0;
+function emitZergCreepGooParticles(arg1, arg2 = 2, arg3 = false, arg4 = undefined) {
+    if (typeof particles === 'undefined') return;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxCap = perf ? Math.min(135, perf.maxParticles) : 135;
+    if (particles.length >= maxCap) return;
+
+    let worldPos = null;
+    let count = 2;
+    let isBurst = false;
+
+    if (typeof arg1 === 'number' && typeof arg2 === 'number') {
+        // Called from animate() as emitZergCreepGooParticles(cx, cz, creepRadius, dt)
+        const dt = typeof arg4 === 'number' ? arg4 : 0.016;
+        const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+        _ambientCreepAccum += dt * 5.0 * rateMult;
+        if (_ambientCreepAccum < 1.0) return;
+        _ambientCreepAccum = 0;
+        const r = Math.max(2.0, (typeof arg3 === 'number' ? arg3 : 12.0) * Math.sqrt(Math.random()));
+        const ang = Math.random() * Math.PI * 2;
+        const wx = arg1 + Math.cos(ang) * r;
+        const wz = arg2 + Math.sin(ang) * r;
+        const wy = typeof getTerrainHeight === 'function' ? getTerrainHeight(wx, wz) : 0;
+        _creepPosScratch.set(wx, wy, wz);
+        worldPos = _creepPosScratch;
+        count = 1;
+        isBurst = false;
+    } else if (arg1 && typeof arg1.x === 'number') {
+        worldPos = arg1;
+        const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+        count = Math.max(1, Math.round((typeof arg2 === 'number' ? arg2 : 2) * rateMult));
+        isBurst = !!arg3;
+    } else {
+        return;
+    }
+
     if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(worldPos.x, worldPos.y || 0, worldPos.z, 8.0)) return;
-    if (particles.length >= 145) return;
     if (!_creepGooGeo) {
         _creepGooGeo = createProceduralViscoelasticGooGeo(0.085, 0.075, 0.11, 2);
     }
     for (let i = 0; i < count; i++) {
+        if (particles.length >= maxCap) break;
         const isAcid = (i % 2 === 0);
         const gooMat = isAcid ? MAT.acidGlow : (MAT.hiveVeinGlow || MAT.zergBioShader);
-        const droplet = new THREE.Mesh(_creepGooGeo, gooMat);
+        const droplet = FX_POOL.acquireParticleMesh(_creepGooGeo, gooMat);
         const sc = (isBurst ? 0.95 : 0.65) + Math.random() * 0.45;
         droplet.scale.set(sc, sc * 0.85, sc * 1.25);
         const ox = (Math.random() - 0.5) * (isBurst ? 0.8 : 2.4);
         const oz = (Math.random() - 0.5) * (isBurst ? 0.8 : 2.4);
         const gy = typeof getTerrainHeight === 'function' ? getTerrainHeight(worldPos.x + ox, worldPos.z + oz) : (worldPos.y || 0);
         droplet.position.set(worldPos.x + ox, gy + 0.08, worldPos.z + oz);
-        scene.add(droplet);
-        const vel = new THREE.Vector3(
+        const vel = FX_POOL.acquireVec3(
             (Math.random() - 0.5) * (isBurst ? 3.8 : 1.1),
             (isBurst ? 3.2 : 1.45) + Math.random() * 1.6,
             (Math.random() - 0.5) * (isBurst ? 3.8 : 1.1)
@@ -7041,24 +8434,140 @@ function emitZergCreepGooParticles(worldPos, count = 2, isBurst = false) {
 }
 window.emitZergCreepGooParticles = emitZergCreepGooParticles;
 
+// Analytical 2-Bone IK Solvers hoisted to module scope to avoid per-frame closure creation
+function _solveValkyrieTwoBoneIK(targetY, targetZ, L1 = 0.65, L2 = 0.72, outObj) {
+    const dist = Math.hypot(targetY, targetZ);
+    const maxReach = L1 + L2 - 0.005;
+    const minReach = Math.abs(L1 - L2) + 0.05;
+    const D = Math.max(minReach, Math.min(maxReach, dist));
+
+    const cosKnee = Math.max(-1, Math.min(1, (L1 * L1 + L2 * L2 - D * D) / (2 * L1 * L2)));
+    const internalKnee = Math.acos(cosKnee);
+    const kneeAngle = -(Math.PI - internalKnee);
+
+    const baseAngle = Math.atan2(targetZ, -targetY);
+    const cosHip = Math.max(-1, Math.min(1, (L1 * L1 + D * D - L2 * L2) / (2 * L1 * D)));
+    const internalHip = Math.acos(cosHip);
+    const hipAngle = baseAngle + internalHip;
+
+    const ankleAngle = -(hipAngle + kneeAngle);
+    outObj.hipAngle = hipAngle;
+    outObj.kneeAngle = kneeAngle;
+    outObj.ankleAngle = ankleAngle;
+    return outObj;
+}
+const _ikScratchA = { hipAngle: 0, kneeAngle: 0, ankleAngle: 0 };
+const _ikScratchB = { hipAngle: 0, kneeAngle: 0, ankleAngle: 0 };
+
+function _solveHumanoidLegIK(footZ, footY, gaitPhase, outObj) {
+    const L1 = 0.20, L2 = 0.20;
+    const d = THREE.MathUtils.clamp(Math.hypot(footZ, footY), 0.12, 0.398);
+    const basePitch = Math.atan2(footZ, -footY);
+    const cosHip = THREE.MathUtils.clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -0.99, 0.99);
+    const cosKnee = THREE.MathUtils.clamp((L1 * L1 + L2 * L2 - d * d) / (2 * L1 * L2), -0.99, 0.99);
+    const hipAngle = -(basePitch + Math.acos(cosHip));
+    const kneeAngle = Math.PI - Math.acos(cosKnee);
+    const heelToeWave = Math.sin(gaitPhase) * 0.24 - Math.max(0, Math.cos(gaitPhase)) * 0.18;
+    const ankleAngle = -(hipAngle + kneeAngle) * 0.65 - heelToeWave;
+    outObj.hipAngle = hipAngle;
+    outObj.kneeAngle = kneeAngle;
+    outObj.ankleAngle = ankleAngle;
+    return outObj;
+}
+
+let _nextAnimHash = 1;
 function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
     if (!mesh || !mesh.visible) return;
     const ud = mesh.userData;
     if (!ud) return;
 
+    const _tAnim0 = (window.PERF_PROFILER && window.PERF_PROFILER.enabled) ? performance.now() : 0;
+
+    // Gameplay-linked animation timers always advance regardless of LOD
     if (ud.attackAnim > 0) ud.attackAnim = Math.max(0, ud.attackAnim - dt * 3.8);
+    if (ud._animHash === undefined) ud._animHash = (_nextAnimHash++) & 255;
+
+    // Compute 4-Tier Distance & Viewport Animation LOD:
+    // 0 = Close (Full IK & detail), 1 = Normal (Simplified), 2 = Distant (Decimated every 3rd frame), 3 = Off-screen/Culled
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const frameCounter = (window.PERF_MANAGER && window.PERF_MANAGER.frameCounter) || 0;
+    let lodTier = 0;
+    let distSqToCam = 0;
+    if (typeof camera !== 'undefined' && camera) {
+        const dx = mesh.position.x - camera.position.x;
+        const dy = mesh.position.y - camera.position.y;
+        const dz = mesh.position.z - camera.position.z;
+        distSqToCam = dx * dx + dy * dy + dz * dz;
+        const closeSq = perf ? perf.animCloseDistSq : 2600;
+        const normSq = perf ? perf.animNormalDistSq : 6800;
+        const farSq = perf ? perf.animFarDistSq : 15500;
+        if (distSqToCam > farSq) {
+            lodTier = 3;
+        } else if (distSqToCam > normSq) {
+            lodTier = 2;
+        } else if (distSqToCam > closeSq) {
+            lodTier = 1;
+        }
+    }
+    if (lodTier < 3 && typeof window.isWorldPosInViewport === 'function') {
+        if (!window.isWorldPosInViewport(mesh.position.x, mesh.position.y + 0.8, mesh.position.z, 4.2)) {
+            lodTier = 3;
+        }
+    }
+
+    // Off-screen / Culled Tier (LOD 3): preserve only gameplay state transitions (Valkyrie transform, Siege Tank transform, Transport ramp)
+    if (lodTier === 3) {
+        if (ud.isVehicle) {
+            if (ud.vType === 'transport' && ud.dropAnim > 0) {
+                ud.dropAnim = Math.max(0, ud.dropAnim - dt * 1.4);
+            } else if (ud.vType === 'valkyrie') {
+                const targetTrans = ud.mechMode ? 1.0 : 0.0;
+                ud.prevMechMode = !!ud.mechMode;
+                if (ud.transformAnimTimer > 0) ud.transformAnimTimer = Math.max(0, ud.transformAnimTimer - dt);
+                const transRate = dt / 3.0;
+                if (ud.mechTransition === undefined || Math.abs(targetTrans - ud.mechTransition) <= transRate) {
+                    ud.mechTransition = targetTrans;
+                } else {
+                    ud.mechTransition += Math.sign(targetTrans - ud.mechTransition) * transRate;
+                }
+            } else if (ud.vType === 'siege_tank') {
+                const targetSiege = ud.siegeMode ? 1.0 : 0.0;
+                ud.siegeTransition = THREE.MathUtils.lerp(ud.siegeTransition || 0, targetSiege, Math.min(1, dt * 3.8));
+            }
+        }
+        if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
+        return;
+    }
+
+    // Distant Tier (LOD 2): decimate cosmetic skeletal updates to every 3rd frame unless actively transforming or mid-attack
+    const isTransforming = (ud.vType === 'valkyrie' && ud.transformAnimTimer > 0) ||
+                           (ud.vType === 'siege_tank' && Math.abs((ud.siegeMode ? 1.0 : 0.0) - (ud.siegeTransition || 0)) > 0.02);
+    let effDt = dt;
+    if (lodTier === 2 && !isTransforming && ud.attackAnim <= 0.01) {
+        if (((frameCounter + ud._animHash) % 3) !== 0) {
+            if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
+            return;
+        }
+        effDt = dt * 3.0;
+    }
+
+    const thrusterIntervalMult = (perf ? perf.thrusterIntervalScale : 1.0) * (lodTier === 1 ? 1.85 : 1.0);
 
     if (ud.isVehicle) {
-        ud.phase += dt * 16;
-        if (ud.rotor) ud.rotor.rotation.y += dt * 28;
-        if (ud.tailRotor) ud.tailRotor.rotation.x += dt * 34;
-        if (ud.rotors) ud.rotors.forEach((r, idx) => { r.rotation.y += dt * 30 * (idx % 2 === 0 ? 1 : -1); });
+        ud.phase += effDt * 16;
+        if (ud.rotor) ud.rotor.rotation.y += effDt * 28;
+        if (ud.tailRotor) ud.tailRotor.rotation.x += effDt * 34;
+        if (ud.rotors) {
+            for (let ri = 0; ri < ud.rotors.length; ri++) {
+                ud.rotors[ri].rotation.y += effDt * 30 * (ri % 2 === 0 ? 1 : -1);
+            }
+        }
 
-        // Dynamic 3D Thruster Particle Emission for Gunship & Dropship Nacelles
-        if (ud.thrusterNozzles && ud.thrusterNozzles.length > 0) {
-            ud.thrusterEmitTimer = (ud.thrusterEmitTimer || 0) - dt;
+        // Dynamic 3D Thruster Particle Emission for Gunship & Dropship Nacelles (Skipped at LOD 2)
+        if (lodTier <= 1 && ud.thrusterNozzles && ud.thrusterNozzles.length > 0) {
+            ud.thrusterEmitTimer = (ud.thrusterEmitTimer || 0) - effDt;
             if (ud.thrusterEmitTimer <= 0) {
-                ud.thrusterEmitTimer = isMoving ? 0.016 : 0.028;
+                ud.thrusterEmitTimer = (isMoving ? 0.020 : 0.036) * thrusterIntervalMult;
                 for (let ti = 0; ti < ud.thrusterNozzles.length; ti++) {
                     const tn = ud.thrusterNozzles[ti];
                     if (tn && tn.node) {
@@ -7068,14 +8577,17 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
             }
         }
         if (ud.vType === 'transport') {
-            if (ud.dropAnim > 0) ud.dropAnim = Math.max(0, ud.dropAnim - dt * 1.4);
+            if (ud.dropAnim > 0) ud.dropAnim = Math.max(0, ud.dropAnim - effDt * 1.4);
             if (ud.nacelles) {
                 const tiltAngle = isMoving ? 0.28 : -0.06;
-                ud.nacelles.forEach(n => { n.rotation.x = THREE.MathUtils.lerp(n.rotation.x, tiltAngle, dt * 6); });
+                for (let ni = 0; ni < ud.nacelles.length; ni++) {
+                    const n = ud.nacelles[ni];
+                    n.rotation.x = THREE.MathUtils.lerp(n.rotation.x, tiltAngle, Math.min(1, effDt * 6));
+                }
             }
             if (ud.cargoRamp) {
                 const targetRampRot = ud.dropAnim > 0 ? -0.65 : 0;
-                ud.cargoRamp.rotation.x = THREE.MathUtils.lerp(ud.cargoRamp.rotation.x, targetRampRot, dt * 8);
+                ud.cargoRamp.rotation.x = THREE.MathUtils.lerp(ud.cargoRamp.rotation.x, targetRampRot, Math.min(1, effDt * 8));
             }
             if (ud.airframe) {
                 ud.airframe.position.y = Math.sin(ud.phase * 0.45) * 0.08;
@@ -7089,19 +8601,18 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 ud.prevMechMode = !!ud.mechMode;
                 ud.transformAnimTimer = 3.0;
                 ud.touchdownShockFired = false;
-                const ring = new THREE.Mesh(SHARED_FX_GEO.shockRing, SHARED_FX_MAT.shockCyan.clone());
+                const ring = FX_POOL.acquireShockwaveMesh(SHARED_FX_GEO.shockRing, 'cyan');
                 const gy = typeof getSurfaceHeightWithBridges === 'function'
                     ? getSurfaceHeightWithBridges(mesh.position.x, mesh.position.z)
                     : getTerrainHeight(mesh.position.x, mesh.position.z);
                 ring.position.set(mesh.position.x, gy + 0.18, mesh.position.z);
-                scene.add(ring);
                 shockwaves.push({ mesh: ring, scale: 0.35, speed: 6.5, alpha: 0.85 });
             }
             if (ud.transformAnimTimer > 0) {
-                ud.transformAnimTimer = Math.max(0, ud.transformAnimTimer - dt);
+                ud.transformAnimTimer = Math.max(0, ud.transformAnimTimer - effDt);
             }
 
-            const transRate = dt / 3.0;
+            const transRate = effDt / 3.0;
             if (ud.mechTransition === undefined) ud.mechTransition = targetTrans;
             if (Math.abs(targetTrans - ud.mechTransition) <= transRate) {
                 ud.mechTransition = targetTrans;
@@ -7122,12 +8633,11 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
 
             if (ud.mechMode && mt >= 0.78 && !ud.touchdownShockFired) {
                 ud.touchdownShockFired = true;
-                const tdRing = new THREE.Mesh(SHARED_FX_GEO.shockRing, SHARED_FX_MAT.shockAmber.clone());
+                const tdRing = FX_POOL.acquireShockwaveMesh(SHARED_FX_GEO.shockRing, 'amber');
                 const gy = typeof getSurfaceHeightWithBridges === 'function'
                     ? getSurfaceHeightWithBridges(mesh.position.x, mesh.position.z)
                     : getTerrainHeight(mesh.position.x, mesh.position.z);
                 tdRing.position.set(mesh.position.x, gy + 0.15, mesh.position.z);
-                scene.add(tdRing);
                 shockwaves.push({ mesh: tdRing, scale: 0.45, speed: 7.5, alpha: 0.9 });
             }
 
@@ -7158,7 +8668,7 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 ud.upperTorso.position.y = THREE.MathUtils.lerp(0.14, 0.28 - isLandingCrouch * 0.08, chassisDeployT);
                 let torsoYaw = isMoving ? Math.sin(ud.phase * 0.75) * 0.10 * chassisDeployT : 0;
                 if (aimTargetPos && smoothMt > 0.5) {
-                    const localAim = mesh.worldToLocal(aimTargetPos.clone());
+                    const localAim = mesh.worldToLocal(_animLocalAimScratch.copy(aimTargetPos));
                     const desiredYaw = THREE.MathUtils.clamp(Math.atan2(localAim.x, Math.max(0.5, localAim.z)), -0.55, 0.55);
                     torsoYaw = THREE.MathUtils.lerp(torsoYaw, desiredYaw, smoothMt);
                 }
@@ -7183,7 +8693,8 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
             }
 
             if (ud.mechArms) {
-                ud.mechArms.forEach((arm, aIdx) => {
+                for (let aIdx = 0; aIdx < ud.mechArms.length; aIdx++) {
+                    const arm = ud.mechArms[aIdx];
                     const armSwing = isMoving ? Math.sin(ud.phase * 0.75 + (aIdx === 0 ? Math.PI : 0)) * 0.20 * chassisDeployT : 0;
                     arm.shoulder.position.x = arm.side * THREE.MathUtils.lerp(0.50, 0.86, chassisDeployT);
                     arm.shoulder.position.y = THREE.MathUtils.lerp(0.04, 0.36 - isLandingCrouch * 0.06, chassisDeployT);
@@ -7194,21 +8705,22 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                     if (arm.haloPod) {
                         arm.haloPod.scale.setScalar(THREE.MathUtils.lerp(0.65, 1.0, chassisDeployT));
                     }
-                });
+                }
             }
 
             if (ud.wingPivots) {
-                ud.wingPivots.forEach(wp => {
+                for (let wi = 0; wi < ud.wingPivots.length; wi++) {
+                    const wp = ud.wingPivots[wi];
                     wp.pivot.rotation.y = wp.side * wingFoldT * 0.56;
                     wp.pivot.rotation.z = wp.side * wingFoldT * 0.58;
                     wp.pivot.rotation.x = -wingFoldT * 0.24;
-                });
+                }
             }
-            if (ud.afterburners && ud.afterburners.length > 0) {
-                ud.valkThrustTimer = (ud.valkThrustTimer || 0) - dt;
+            if (lodTier <= 1 && ud.afterburners && ud.afterburners.length > 0) {
+                ud.valkThrustTimer = (ud.valkThrustTimer || 0) - effDt;
                 const isAirborneOrTransforming = (smoothMt < 0.75 || midTransFlare > 0.15);
                 if (isAirborneOrTransforming && ud.valkThrustTimer <= 0) {
-                    ud.valkThrustTimer = isMoving ? 0.028 : 0.048;
+                    ud.valkThrustTimer = (isMoving ? 0.032 : 0.055) * thrusterIntervalMult;
                     const boostScale = 0.85 + (1.0 - smoothMt) * 0.45 + midTransFlare * 0.65;
                     for (let ai = 0; ai < ud.afterburners.length; ai++) {
                         const ab = ud.afterburners[ai];
@@ -7219,32 +8731,14 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 }
             }
             if (ud.mechCannons) {
-                ud.mechCannons.forEach(mc => {
-                    mc.position.z = 0.40 - ud.attackAnim * 0.22;
-                });
-            }
-
-            function solveTwoBoneIK(targetY, targetZ, L1 = 0.65, L2 = 0.72) {
-                const dist = Math.hypot(targetY, targetZ);
-                const maxReach = L1 + L2 - 0.005;
-                const minReach = Math.abs(L1 - L2) + 0.05;
-                const D = Math.max(minReach, Math.min(maxReach, dist));
-
-                const cosKnee = Math.max(-1, Math.min(1, (L1 * L1 + L2 * L2 - D * D) / (2 * L1 * L2)));
-                const internalKnee = Math.acos(cosKnee);
-                const kneeAngle = -(Math.PI - internalKnee);
-
-                const baseAngle = Math.atan2(targetZ, -targetY);
-                const cosHip = Math.max(-1, Math.min(1, (L1 * L1 + D * D - L2 * L2) / (2 * L1 * D)));
-                const internalHip = Math.acos(cosHip);
-                const hipAngle = baseAngle + internalHip;
-
-                const ankleAngle = -(hipAngle + kneeAngle);
-                return { hipAngle, kneeAngle, ankleAngle };
+                for (let ci = 0; ci < ud.mechCannons.length; ci++) {
+                    ud.mechCannons[ci].position.z = 0.40 - ud.attackAnim * 0.22;
+                }
             }
 
             if (ud.mechLegs) {
-                ud.mechLegs.forEach((leg, idx) => {
+                for (let idx = 0; idx < ud.mechLegs.length; idx++) {
+                    const leg = ud.mechLegs[idx];
                     leg.hip.visible = true;
                     leg.hip.position.x = leg.side * THREE.MathUtils.lerp(0.36, 0.46, chassisDeployT);
                     leg.hip.position.y = THREE.MathUtils.lerp(0.08, -0.10, chassisDeployT);
@@ -7257,7 +8751,7 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                     const deployedGroundY = -1.24 + isLandingCrouch * 0.32 + strideLift;
                     const deployedGroundZ = 0.06 + strideZ + midTransFlare * 0.22;
 
-                    const ik = solveTwoBoneIK(deployedGroundY, deployedGroundZ, leg.L1 || 0.65, leg.L2 || 0.72);
+                    const ik = _solveValkyrieTwoBoneIK(deployedGroundY, deployedGroundZ, leg.L1 || 0.65, leg.L2 || 0.72, _ikScratchA);
 
                     const flightHipRotX = -Math.PI * 0.5;
                     const flightKneeRotX = -0.04;
@@ -7267,18 +8761,18 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                     if (leg.knee) leg.knee.rotation.x = THREE.MathUtils.lerp(flightKneeRotX, ik.kneeAngle, chassisDeployT);
                     if (leg.ankle) leg.ankle.rotation.x = THREE.MathUtils.lerp(flightAnkleRotX, ik.ankleAngle, chassisDeployT);
                     leg.hip.rotation.z = isMoving ? Math.cos(walkPhase) * 0.045 * chassisDeployT : 0;
-                });
+                }
             }
         }
         if (isMoving && ud.vType === 'tank') {
-            treadTex.offset.y -= dt * 1.8;
+            treadTex.offset.y -= effDt * 1.8;
         }
 
         // GUNSHIP HELICOPTER 360° UNDER-BELLY MINIGUN TURRET HEAD AIMING, SPIN & MUZZLE FLASH
         if (ud.vType === 'heli' && ud.bellyTurret) {
             if (aimTargetPos) {
                 const refObj = ud.airframe || mesh;
-                const localTarget = refObj.worldToLocal(aimTargetPos.clone());
+                const localTarget = refObj.worldToLocal(_animLocalAimScratch.copy(aimTargetPos));
                 const relX = localTarget.x - ud.bellyTurret.position.x;
                 const relY = localTarget.y - ud.bellyTurret.position.y;
                 const relZ = localTarget.z - ud.bellyTurret.position.z;
@@ -7286,44 +8780,40 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 let curYaw = ud.bellyTurret.rotation.y || 0;
                 let diff = (desiredYaw - curYaw + Math.PI) % (Math.PI * 2) - Math.PI;
                 if (diff < -Math.PI) diff += Math.PI * 2;
-                const maxTurn = 14.0 * dt;
+                const maxTurn = 14.0 * effDt;
                 ud.bellyTurret.rotation.y = curYaw + (Math.abs(diff) <= maxTurn ? diff : Math.sign(diff) * maxTurn);
 
                 if (ud.bellyPitchPivot) {
                     const hDist = Math.max(0.5, Math.hypot(relX, relZ));
                     const desiredPitch = Math.atan2(-relY, hDist);
                     const clampedPitch = THREE.MathUtils.clamp(desiredPitch, -0.35, 1.25);
-                    ud.bellyPitchPivot.rotation.x = THREE.MathUtils.lerp(ud.bellyPitchPivot.rotation.x, clampedPitch, Math.min(1, dt * 14));
+                    ud.bellyPitchPivot.rotation.x = THREE.MathUtils.lerp(ud.bellyPitchPivot.rotation.x, clampedPitch, Math.min(1, effDt * 14));
                 }
             } else {
                 let curYaw = ud.bellyTurret.rotation.y || 0;
                 let diff = (0 - curYaw + Math.PI) % (Math.PI * 2) - Math.PI;
                 if (diff < -Math.PI) diff += Math.PI * 2;
-                ud.bellyTurret.rotation.y = curYaw + diff * Math.min(1, dt * 5);
-                if (ud.bellyPitchPivot) ud.bellyPitchPivot.rotation.x = THREE.MathUtils.lerp(ud.bellyPitchPivot.rotation.x, 0.15, Math.min(1, dt * 5));
+                ud.bellyTurret.rotation.y = curYaw + diff * Math.min(1, effDt * 5);
+                if (ud.bellyPitchPivot) ud.bellyPitchPivot.rotation.x = THREE.MathUtils.lerp(ud.bellyPitchPivot.rotation.x, 0.15, Math.min(1, effDt * 5));
             }
             if (ud.bellyMinigunCluster) {
-                ud.bellyMinigunCluster.rotation.z += dt * (ud.attackAnim > 0.05 ? 48 : 4);
+                ud.bellyMinigunCluster.rotation.z += effDt * (ud.attackAnim > 0.05 ? 48 : 4);
             }
             if (ud.bellyMuzzleFlash) {
                 ud.bellyMuzzleFlash.visible = ud.attackAnim > 0.32;
                 if (ud.bellyMuzzleFlash.visible) {
-                    ud.bellyMuzzleFlash.rotation.z += dt * 42;
+                    ud.bellyMuzzleFlash.rotation.z += effDt * 42;
                     ud.bellyMuzzleFlash.scale.setScalar(0.88 + Math.random() * 0.48);
                 }
             }
         }
 
-        // TANK & STARCRAFT TRANSFORMER SIEGE TANK ANIMATION (EXPANDING TRACK ARMS, ANCHOR CLAWS & UNFOLDING ARTILLERY)
+        // TANK & STARCRAFT TRANSFORMER SIEGE TANK ANIMATION
         if ((ud.vType === 'tank' || ud.vType === 'siege_tank') && ud.turret && ud.cannonPivot) {
             if (ud.vType === 'siege_tank') {
                 const targetSiege = ud.siegeMode ? 1.0 : 0.0;
-                ud.siegeTransition = THREE.MathUtils.lerp(ud.siegeTransition || 0, targetSiege, Math.min(1, dt * 3.8));
+                ud.siegeTransition = THREE.MathUtils.lerp(ud.siegeTransition || 0, targetSiege, Math.min(1, effDt * 3.8));
                 const st = ud.siegeTransition;
-                // 3-Stage Transformer Curves:
-                // Stage 1 (0..0.5): Hydraulic Arms & 4 Track Pods swing out into an X-stance
-                // Stage 2 (0.3..0.8): Outer Anchor Claws slam down into ground & Chassis elevates
-                // Stage 3 (0.5..1.0): Turret shoulders open, breech cowl lifts & 180mm Twin Shock-Cannons telescope out
                 const stageArm = THREE.MathUtils.smoothstep(st, 0.0, 0.55);
                 const stageClaw = THREE.MathUtils.smoothstep(st, 0.30, 0.80);
                 const stageCannon = THREE.MathUtils.smoothstep(st, 0.45, 1.0);
@@ -7337,7 +8827,6 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 if (ud.trackPods) {
                     for (let i = 0; i < ud.trackPods.length; i++) {
                         const tp = ud.trackPods[i];
-                        // Swing hydraulic arm outward in an X-configuration & telescope track pod laterally
                         tp.armPivot.rotation.y = tp.sx * tp.sz * (-0.52 * stageArm);
                         tp.armPivot.position.x = tp.baseArmX + tp.sx * (0.26 * stageArm);
                         tp.armPivot.position.z = tp.baseArmZ + tp.sz * (0.18 * stageArm);
@@ -7367,29 +8856,29 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                     ud.siegeBarrelExt.position.z = stageCannon * 0.42;
                 }
                 if (ud.radarDish) {
-                    ud.radarDish.rotation.y += dt * (ud.siegeMode ? 4.8 : 1.5);
+                    ud.radarDish.rotation.y += effDt * (ud.siegeMode ? 4.8 : 1.5);
                 }
             }
 
             const st = ud.vType === 'siege_tank' ? (ud.siegeTransition || 0) : 0;
             const siegePitchOffset = -0.36 * st;
             if (aimTargetPos) {
-                const localTarget = mesh.worldToLocal(aimTargetPos.clone());
+                const localTarget = mesh.worldToLocal(_animLocalAimScratch.copy(aimTargetPos));
                 const desiredYaw = Math.atan2(localTarget.x, localTarget.z);
                 let diff = (desiredYaw - ud.turretYaw + Math.PI) % (Math.PI * 2) - Math.PI;
                 if (diff < -Math.PI) diff += Math.PI * 2;
-                const maxStep = (ud.siegeMode ? 3.4 : 4.6) * dt;
+                const maxStep = (ud.siegeMode ? 3.4 : 4.6) * effDt;
                 ud.turretYaw += Math.abs(diff) <= maxStep ? diff : Math.sign(diff) * maxStep;
                 ud.turret.rotation.y = ud.turretYaw;
 
                 const horizDist = Math.max(1.0, Math.hypot(localTarget.x, localTarget.z));
                 const desiredPitch = -Math.atan2(localTarget.y - 0.65, horizDist) + siegePitchOffset;
                 const clampedPitch = THREE.MathUtils.clamp(desiredPitch, -0.65, 0.35);
-                ud.cannonPivot.rotation.x = THREE.MathUtils.lerp(ud.cannonPivot.rotation.x, clampedPitch, dt * 8);
+                ud.cannonPivot.rotation.x = THREE.MathUtils.lerp(ud.cannonPivot.rotation.x, clampedPitch, Math.min(1, effDt * 8));
             } else {
-                ud.turretYaw = THREE.MathUtils.lerp(ud.turretYaw, 0, dt * 3);
+                ud.turretYaw = THREE.MathUtils.lerp(ud.turretYaw, 0, Math.min(1, effDt * 3));
                 ud.turret.rotation.y = ud.turretYaw;
-                ud.cannonPivot.rotation.x = THREE.MathUtils.lerp(ud.cannonPivot.rotation.x, siegePitchOffset, dt * 5);
+                ud.cannonPivot.rotation.x = THREE.MathUtils.lerp(ud.cannonPivot.rotation.x, siegePitchOffset, Math.min(1, effDt * 5));
             }
 
             const baseBarrelZ = ud.vType === 'siege_tank' ? 0.16 : 0.14;
@@ -7407,26 +8896,25 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 ud.turret.rotation.x = 0;
             }
         }
+        if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
         return;
     }
 
     if (ud.isBug) {
-        // ENEMY BEHEMOTH SHOOT ANIMATION WHILE MARCHING
         if (ud.variant === 'behemoth' && ud.dorsalCannons && ud.dorsalCannons.length > 0) {
             const rec = ud.attackAnim * 0.28;
-            ud.dorsalCannons.forEach(c => {
+            for (let ci = 0; ci < ud.dorsalCannons.length; ci++) {
+                const c = ud.dorsalCannons[ci];
                 c.position.z = c.userData.baseZ - rec;
                 c.rotation.x = c.userData.baseRotX - rec * 0.45;
-            });
+            }
         }
-        // --- FLYING MUTALISK SKY-LEVIATHAN ANIMATION (Dual-Jointed Wing Camber, 5-Segment Prehensile Tail Whip & Breathing Bio-Heart) ---
         if (ud.variant === 'mutalisk') {
-            ud.phase += dt * (isMoving ? 14.5 : 9.8);
+            ud.phase += effDt * (isMoving ? 14.5 : 9.8);
             const sinP = Math.sin(ud.phase);
             const cosP = Math.cos(ud.phase);
             const flapAmp = isMoving ? 0.62 : 0.44;
             const innerFlap = sinP * flapAmp;
-            // Outer wing phalanges lag behind humerus by ~55 degrees for authentic dragon/bat figure-8 downstroke camber & upstroke fold!
             const outerFlap = Math.sin(ud.phase - 0.95) * (isMoving ? 0.74 : 0.52);
             const sweep = cosP * 0.20;
 
@@ -7438,22 +8926,22 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
                 ud.wingR.rotation.y = -sweep;
                 ud.wingR.rotation.x = cosP * 0.14;
             }
-            if (ud.outerWingL && ud.outerWingR) {
+            if (lodTier <= 1 && ud.outerWingL && ud.outerWingR) {
                 ud.outerWingL.rotation.z = -outerFlap;
                 ud.outerWingL.rotation.y = Math.sin(ud.phase - 0.6) * 0.18;
                 ud.outerWingR.rotation.z = outerFlap;
                 ud.outerWingR.rotation.y = -Math.sin(ud.phase - 0.6) * 0.18;
             }
-            // 5-Segment Prehensile Glaive-Wurm Tail: sinusoidal traveling wave + violent forward scorpion-whip when spitting!
-            if (ud.tailSegments && ud.tailSegments.length > 0) {
+            if (lodTier === 0 && ud.tailSegments && ud.tailSegments.length > 0) {
                 const whipStrike = Math.sin(ud.attackAnim * Math.PI);
-                ud.tailSegments.forEach(seg => {
+                for (let ti = 0; ti < ud.tailSegments.length; ti++) {
+                    const seg = ud.tailSegments[ti];
                     const wavePitch = Math.sin(ud.phase - seg.idx * 0.65) * (0.14 + seg.idx * 0.04);
                     const waveYaw = Math.cos(ud.phase * 0.55 - seg.idx * 0.5) * (0.08 + seg.idx * 0.03);
                     const attackBend = whipStrike * (0.28 + seg.idx * 0.14);
                     seg.pivot.rotation.x = seg.basePitch + wavePitch + attackBend;
                     seg.pivot.rotation.y = waveYaw;
-                });
+                }
             } else if (ud.tailGroup) {
                 ud.tailGroup.rotation.x = Math.sin(ud.phase - 1.1) * 0.28 + ud.attackAnim * 0.65;
                 ud.tailGroup.rotation.y = Math.cos(ud.phase * 0.6) * 0.22;
@@ -7461,15 +8949,15 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
             if (ud.abdomen) {
                 ud.abdomen.scale.setScalar(1.0 + Math.sin(ud.phase * 0.9) * 0.08 + ud.attackAnim * 0.14);
             }
-            if (ud.bioHeart) {
+            if (lodTier === 0 && ud.bioHeart) {
                 ud.bioHeart.scale.setScalar(1.0 + Math.sin(ud.phase * 1.8) * 0.15 + ud.attackAnim * 0.25);
             }
-            if (ud.mandL && ud.mandR) {
+            if (lodTier <= 1 && ud.mandL && ud.mandR) {
                 const snap = Math.sin(ud.phase * 1.4) * 0.18 + ud.attackAnim * 0.62;
                 ud.mandL.rotation.y = 0.28 - snap;
                 ud.mandR.rotation.y = -0.28 + snap;
             }
-            if (ud.scytheL && ud.scytheR) {
+            if (lodTier <= 1 && ud.scytheL && ud.scytheR) {
                 const clawFlex = Math.sin(ud.phase - 0.5) * 0.22 + ud.attackAnim * 0.55;
                 ud.scytheL.rotation.x = clawFlex;
                 ud.scytheR.rotation.x = clawFlex;
@@ -7477,111 +8965,129 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
             ud.bodyGroup.position.y = sinP * -0.15;
             ud.bodyGroup.rotation.x = (isMoving ? 0.18 : 0.05) + cosP * 0.06 + ud.attackAnim * 0.34;
             ud.bodyGroup.rotation.z = Math.sin(ud.phase * 0.5) * 0.05;
+            if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
             return;
         }
 
-        ud.phase += dt * (isMoving ? 15.5 : 3.6);
-        const unitScale = mesh.scale.x || 1.0;
-        const unitYaw = mesh.rotation.y || 0;
-        const cosY = Math.cos(unitYaw), sinY = Math.sin(unitYaw);
-        const fwdX = sinY, fwdZ = cosY;
-        const rightX = cosY, rightZ = -sinY;
-
-        ud.legs.forEach(l => {
-            const L1 = l.L1 || 0.33;
-            const L2 = l.L2 || 0.46;
-
-            const localRestX = l.side * 0.58 * unitScale;
-            const localRestZ = (l.zOff * 1.42) * unitScale;
-            const idealWorldX = mesh.position.x + rightX * localRestX + fwdX * localRestZ;
-            const idealWorldZ = mesh.position.z + rightZ * localRestX + fwdZ * localRestZ;
-            const groundY = mesh.position.y;
-
-            if (!l.footWorldPos) {
-                l.footWorldPos = new THREE.Vector3(idealWorldX, groundY, idealWorldZ);
-                l.stepStartPos = l.footWorldPos.clone();
-                l.stepTargetPos = l.footWorldPos.clone();
-                l.stepProgress = 1.0;
-            }
-
-            const gaitWave = Math.sin(ud.phase + (l.tripodGroup ? Math.PI : 0) + l.idx * 0.55);
-            const distFromIdeal = Math.hypot(l.footWorldPos.x - idealWorldX, l.footWorldPos.z - idealWorldZ);
-            const stepThreshold = (isMoving ? 0.24 : 0.08) * unitScale;
-
-            if (l.stepProgress >= 1.0 && distFromIdeal > stepThreshold && (gaitWave > 0 || distFromIdeal > stepThreshold * 1.85)) {
-                l.stepStartPos.copy(l.footWorldPos);
-                const leadDist = (isMoving ? 0.22 : 0.0) * unitScale;
-                const targetX = idealWorldX + fwdX * leadDist;
-                const targetZ = idealWorldZ + fwdZ * leadDist;
-                const targetY = (typeof getSurfaceHeightWithBridges === 'function')
-                    ? getSurfaceHeightWithBridges(targetX, targetZ)
-                    : groundY;
-                l.stepTargetPos.set(targetX, targetY, targetZ);
-                l.stepProgress = 0.0;
-            }
-
-            if (l.stepProgress < 1.0) {
-                l.stepProgress = Math.min(1.0, l.stepProgress + dt * (isMoving ? 9.5 : 5.0));
-                const s = l.stepProgress * l.stepProgress * (3.0 - 2.0 * l.stepProgress);
-                l.footWorldPos.lerpVectors(l.stepStartPos, l.stepTargetPos, s);
-                const stepArcHeight = Math.sin(l.stepProgress * Math.PI) * (isMoving ? 0.22 : 0.05) * unitScale;
-                l.footWorldPos.y += stepArcHeight;
-            } else if (!isMoving) {
-                l.footWorldPos.x += (idealWorldX - l.footWorldPos.x) * Math.min(1, dt * 4.0);
-                l.footWorldPos.z += (idealWorldZ - l.footWorldPos.z) * Math.min(1, dt * 4.0);
-                l.footWorldPos.y = groundY;
-            }
-
-            const dxWorld = (l.footWorldPos.x - mesh.position.x) / unitScale;
-            const dyWorld = (l.footWorldPos.y - mesh.position.y) / unitScale;
-            const dzWorld = (l.footWorldPos.z - mesh.position.z) / unitScale;
-
-            const localX = dxWorld * rightX + dzWorld * rightZ;
-            const localZ = dxWorld * fwdX + dzWorld * fwdZ;
-            const localY = dyWorld;
-
-            const hipX = l.side * 0.25;
-            const hipY = 0.36;
-            const hipZ = l.zOff;
-
-            const relX = localX - hipX;
-            const relY = localY - hipY;
-            const relZ = localZ - hipZ;
-
-            const horizReach = Math.max(0.08, Math.hypot(relX, relZ));
-            const yawAngle = Math.atan2(relZ, Math.abs(relX)) * -l.side;
-            l.pivot.rotation.y = THREE.MathUtils.clamp(yawAngle, -0.78, 0.78);
-
-            const reachDist = THREE.MathUtils.clamp(Math.hypot(horizReach, relY), 0.14, (L1 + L2) * 0.96);
-            const targetElevation = Math.atan2(relY, horizReach);
-
-            const cosHipInterior = THREE.MathUtils.clamp(
-                (L1 * L1 + reachDist * reachDist - L2 * L2) / (2.0 * L1 * reachDist),
-                -0.98, 0.98
-            );
-            const hipInteriorAngle = Math.acos(cosHipInterior);
-
-            const cosKneeInterior = THREE.MathUtils.clamp(
-                (L1 * L1 + L2 * L2 - reachDist * reachDist) / (2.0 * L1 * L2),
-                -0.98, 0.98
-            );
-            const kneeInteriorAngle = Math.acos(cosKneeInterior);
-
-            const solvedFemurLift = (targetElevation + hipInteriorAngle) - 0.32;
-            const solvedKneeFlex = (Math.PI - kneeInteriorAngle) - 1.15;
-
-            if (l.femurPivot && l.kneePivot) {
-                l.femurPivot.rotation.z = THREE.MathUtils.clamp(solvedFemurLift, -0.55, 0.72) * l.side;
-                l.kneePivot.rotation.z = THREE.MathUtils.clamp(-solvedKneeFlex, -0.85, 0.65) * l.side;
+        ud.phase += effDt * (isMoving ? 15.5 : 3.6);
+        const legs = ud.legs;
+        if (legs && legs.length > 0) {
+            if (lodTier >= 1) {
+                // Fast Tripod Sinusoidal Gait for Normal/Distant Zerg Units (Eliminates 6x world-space foot vectors + 6x acos/atan2 IK per bug!)
+                for (let li = 0; li < legs.length; li++) {
+                    const l = legs[li];
+                    const wave = Math.sin(ud.phase + (l.tripodGroup ? Math.PI : 0) + l.idx * 0.55);
+                    const lift = isMoving ? Math.max(0, wave) * 0.38 : 0.04;
+                    const swing = isMoving ? wave * 0.32 : 0;
+                    l.pivot.rotation.y = swing * -l.side;
+                    if (l.femurPivot && l.kneePivot) {
+                        l.femurPivot.rotation.z = (0.12 + lift) * l.side;
+                        l.kneePivot.rotation.z = (-0.25 - lift * 0.65) * l.side;
+                    } else {
+                        l.pivot.rotation.z = (0.10 + lift) * l.side;
+                    }
+                }
             } else {
-                l.pivot.rotation.z = THREE.MathUtils.clamp(solvedFemurLift, -0.45, 0.65) * l.side;
+                // Close LOD 0: Full World-Space Foot-Planting & 2-Bone Arachnid IK
+                const unitScale = mesh.scale.x || 1.0;
+                const unitYaw = mesh.rotation.y || 0;
+                const cosY = Math.cos(unitYaw), sinY = Math.sin(unitYaw);
+                const fwdX = sinY, fwdZ = cosY;
+                const rightX = cosY, rightZ = -sinY;
+
+                for (let li = 0; li < legs.length; li++) {
+                    const l = legs[li];
+                    const L1 = l.L1 || 0.33;
+                    const L2 = l.L2 || 0.46;
+
+                    const localRestX = l.side * 0.58 * unitScale;
+                    const localRestZ = (l.zOff * 1.42) * unitScale;
+                    const idealWorldX = mesh.position.x + rightX * localRestX + fwdX * localRestZ;
+                    const idealWorldZ = mesh.position.z + rightZ * localRestX + fwdZ * localRestZ;
+                    const groundY = mesh.position.y;
+
+                    if (!l.footWorldPos) {
+                        l.footWorldPos = new THREE.Vector3(idealWorldX, groundY, idealWorldZ);
+                        l.stepStartPos = l.footWorldPos.clone();
+                        l.stepTargetPos = l.footWorldPos.clone();
+                        l.stepProgress = 1.0;
+                    }
+
+                    const gaitWave = Math.sin(ud.phase + (l.tripodGroup ? Math.PI : 0) + l.idx * 0.55);
+                    const distFromIdeal = Math.hypot(l.footWorldPos.x - idealWorldX, l.footWorldPos.z - idealWorldZ);
+                    const stepThreshold = (isMoving ? 0.24 : 0.08) * unitScale;
+
+                    if (l.stepProgress >= 1.0 && distFromIdeal > stepThreshold && (gaitWave > 0 || distFromIdeal > stepThreshold * 1.85)) {
+                        l.stepStartPos.copy(l.footWorldPos);
+                        const leadDist = (isMoving ? 0.22 : 0.0) * unitScale;
+                        const targetX = idealWorldX + fwdX * leadDist;
+                        const targetZ = idealWorldZ + fwdZ * leadDist;
+                        l.stepTargetPos.set(targetX, groundY, targetZ);
+                        l.stepProgress = 0.0;
+                    }
+
+                    if (l.stepProgress < 1.0) {
+                        l.stepProgress = Math.min(1.0, l.stepProgress + effDt * (isMoving ? 9.5 : 5.0));
+                        const s = l.stepProgress * l.stepProgress * (3.0 - 2.0 * l.stepProgress);
+                        l.footWorldPos.lerpVectors(l.stepStartPos, l.stepTargetPos, s);
+                        const stepArcHeight = Math.sin(l.stepProgress * Math.PI) * (isMoving ? 0.22 : 0.05) * unitScale;
+                        l.footWorldPos.y += stepArcHeight;
+                    } else if (!isMoving) {
+                        l.footWorldPos.x += (idealWorldX - l.footWorldPos.x) * Math.min(1, effDt * 4.0);
+                        l.footWorldPos.z += (idealWorldZ - l.footWorldPos.z) * Math.min(1, effDt * 4.0);
+                        l.footWorldPos.y = groundY;
+                    }
+
+                    const dxWorld = (l.footWorldPos.x - mesh.position.x) / unitScale;
+                    const dyWorld = (l.footWorldPos.y - mesh.position.y) / unitScale;
+                    const dzWorld = (l.footWorldPos.z - mesh.position.z) / unitScale;
+
+                    const localX = dxWorld * rightX + dzWorld * rightZ;
+                    const localZ = dxWorld * fwdX + dzWorld * fwdZ;
+                    const localY = dyWorld;
+
+                    const relX = localX - l.side * 0.25;
+                    const relY = localY - 0.36;
+                    const relZ = localZ - l.zOff;
+
+                    const horizReach = Math.max(0.08, Math.hypot(relX, relZ));
+                    const yawAngle = Math.atan2(relZ, Math.abs(relX)) * -l.side;
+                    l.pivot.rotation.y = THREE.MathUtils.clamp(yawAngle, -0.78, 0.78);
+
+                    const reachDist = THREE.MathUtils.clamp(Math.hypot(horizReach, relY), 0.14, (L1 + L2) * 0.96);
+                    const targetElevation = Math.atan2(relY, horizReach);
+
+                    const cosHipInterior = THREE.MathUtils.clamp(
+                        (L1 * L1 + reachDist * reachDist - L2 * L2) / (2.0 * L1 * reachDist),
+                        -0.98, 0.98
+                    );
+                    const hipInteriorAngle = Math.acos(cosHipInterior);
+
+                    const cosKneeInterior = THREE.MathUtils.clamp(
+                        (L1 * L1 + L2 * L2 - reachDist * reachDist) / (2.0 * L1 * L2),
+                        -0.98, 0.98
+                    );
+                    const kneeInteriorAngle = Math.acos(cosKneeInterior);
+
+                    const solvedFemurLift = (targetElevation + hipInteriorAngle) - 0.32;
+                    const solvedKneeFlex = (Math.PI - kneeInteriorAngle) - 1.15;
+
+                    if (l.femurPivot && l.kneePivot) {
+                        l.femurPivot.rotation.z = THREE.MathUtils.clamp(solvedFemurLift, -0.55, 0.72) * l.side;
+                        l.kneePivot.rotation.z = THREE.MathUtils.clamp(-solvedKneeFlex, -0.85, 0.65) * l.side;
+                    } else {
+                        l.pivot.rotation.z = THREE.MathUtils.clamp(solvedFemurLift, -0.45, 0.65) * l.side;
+                    }
+                }
             }
-        });
+        }
         const pulse = 1 + Math.sin(ud.phase * 0.8) * (ud.variant === 'burster' ? 0.16 : 0.07);
-        ud.abdomen.scale.setScalar(pulse);
-        const snap = Math.sin(ud.phase * 1.5) * 0.2 + ud.attackAnim * 0.65;
-        ud.mandL.rotation.y = -snap;
-        ud.mandR.rotation.y = snap;
+        if (ud.abdomen) ud.abdomen.scale.setScalar(pulse);
+        if (lodTier <= 1 && ud.mandL && ud.mandR) {
+            const snap = Math.sin(ud.phase * 1.5) * 0.2 + ud.attackAnim * 0.65;
+            ud.mandL.rotation.y = -snap;
+            ud.mandR.rotation.y = snap;
+        }
         if (ud.scytheL && ud.scytheR) {
             const slash = Math.sin(ud.attackAnim * Math.PI) * 0.85 + Math.sin(ud.phase) * (isMoving ? 0.22 : 0.05);
             ud.scytheL.rotation.x = slash;
@@ -7601,313 +9107,322 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
         ud.bodyGroup.position.y = Math.abs(Math.sin(ud.phase)) * (isMoving ? 0.075 : 0.02);
         ud.bodyGroup.rotation.z = isMoving ? Math.sin(ud.phase * 0.5) * 0.06 : 0;
         ud.bodyGroup.rotation.x = isMoving ? 0.06 + Math.cos(ud.phase) * 0.03 : 0;
-    } else if (ud.isSolaris) {
-        ud.phase += dt * (isMoving ? 13.0 : 3.4);
+        if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
+        return;
+    }
+
+    if (ud.isSolaris) {
+        ud.phase += effDt * (isMoving ? 13.0 : 3.4);
         if (ud.role === 'stalker') {
-            if (ud.coreCrystal) ud.coreCrystal.rotation.y += dt * 2.8;
+            if (ud.coreCrystal) ud.coreCrystal.rotation.y += effDt * 2.8;
             if (ud.stalkerLegs) {
-                ud.stalkerLegs.forEach(l => {
+                for (let li = 0; li < ud.stalkerLegs.length; li++) {
+                    const l = ud.stalkerLegs[li];
                     const wave = Math.sin(ud.phase + l.idx * Math.PI * 0.5);
                     l.pivot.rotation.x = isMoving ? wave * 0.42 : 0;
                     l.pivot.rotation.z = isMoving ? Math.max(0, -wave) * 0.24 * l.side : 0;
-                });
+                }
             }
             if (ud.bodyGroup) {
                 ud.bodyGroup.position.y = 0.56 + Math.sin(ud.phase * 1.2) * 0.04;
                 ud.bodyGroup.position.z = -ud.attackAnim * 0.16;
             }
+            if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
             return;
         }
         if (ud.role === 'archon') {
             if (ud.coreSphere) {
-                ud.coreSphere.rotation.y += dt * 2.5;
-                ud.coreSphere.rotation.x += dt * 1.4;
+                ud.coreSphere.rotation.y += effDt * 2.5;
+                ud.coreSphere.rotation.x += effDt * 1.4;
                 const pulse = 1.0 + Math.sin(ud.phase * 1.6) * 0.12 + ud.attackAnim * 0.28;
                 ud.coreSphere.scale.setScalar(pulse);
             }
             if (ud.ringOuter) {
-                ud.ringOuter.rotation.z += dt * 3.2;
+                ud.ringOuter.rotation.z += effDt * 3.2;
                 ud.ringOuter.rotation.x = Math.sin(ud.phase * 0.7) * 0.65;
             }
             if (ud.ringInner) {
-                ud.ringInner.rotation.y -= dt * 4.1;
+                ud.ringInner.rotation.y -= effDt * 4.1;
                 ud.ringInner.rotation.z = Math.cos(ud.phase * 0.9) * 0.65;
             }
             if (ud.bodyGroup) {
                 ud.bodyGroup.position.y = 1.08 + Math.sin(ud.phase * 0.9) * 0.12;
             }
+            if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
             return;
         }
-        // Chrono-Zealot multi-joint stride animation
-        if (ud.solarHalo) ud.solarHalo.rotation.z += dt * 2.6;
+        if (ud.solarHalo) ud.solarHalo.rotation.z += effDt * 2.6;
+        const lerp10 = Math.min(1, effDt * 10);
         if (isMoving && ud.legL && ud.legR) {
             const cL = ud.phase;
             const cR = ud.phase + Math.PI;
-            const sL = Math.sin(cL) * 0.74;
+            const sL = Math.sin(cL) * 0.68;
             const lL = Math.max(0, Math.cos(cL));
-            const sR = Math.sin(cR) * 0.74;
+            const sR = Math.sin(cR) * 0.68;
             const lR = Math.max(0, Math.cos(cR));
-            ud.legL.hip.rotation.x = sL - lL * 0.32;
-            ud.legL.hip.rotation.z = Math.sin(cL) * 0.05;
-            if (ud.legL.knee) ud.legL.knee.rotation.x = lL * 1.18 + Math.max(0, -sL * 0.38);
-            ud.legR.hip.rotation.x = sR - lR * 0.32;
-            ud.legR.hip.rotation.z = Math.sin(cR) * 0.05;
-            if (ud.legR.knee) ud.legR.knee.rotation.x = lR * 1.18 + Math.max(0, -sR * 0.38);
-            ud.upperBody.position.y = 0.52 + Math.abs(Math.sin(ud.phase)) * 0.065;
-            ud.upperBody.rotation.z = Math.cos(ud.phase) * 0.055;
-            ud.upperBody.rotation.x = 0.12;
+            const hipDrop = -Math.cos(ud.phase * 2.0) * 0.018;
+            const pelvicYaw = Math.cos(ud.phase) * 0.10;
+            const pelvicRoll = Math.sin(ud.phase) * 0.045;
+            if (ud.pelvisGroup) {
+                ud.pelvisGroup.position.set(-Math.sin(ud.phase) * 0.018, 0.42 + hipDrop, 0);
+                ud.pelvisGroup.rotation.set(0.05, pelvicYaw, pelvicRoll);
+            }
+            ud.legL.hip.rotation.x = sL - lL * 0.28;
+            ud.legL.hip.rotation.z = -pelvicRoll * 0.6 + Math.sin(cL) * 0.035;
+            if (ud.legL.knee) ud.legL.knee.rotation.x = lL * 1.08 + Math.max(0, -sL * 0.34);
+            if (ud.legL.ankle) ud.legL.ankle.rotation.x = -(ud.legL.hip.rotation.x + ud.legL.knee.rotation.x) * 0.55;
+
+            ud.legR.hip.rotation.x = sR - lR * 0.28;
+            ud.legR.hip.rotation.z = -pelvicRoll * 0.6 + Math.sin(cR) * 0.035;
+            if (ud.legR.knee) ud.legR.knee.rotation.x = lR * 1.08 + Math.max(0, -sR * 0.34);
+            if (ud.legR.ankle) ud.legR.ankle.rotation.x = -(ud.legR.hip.rotation.x + ud.legR.knee.rotation.x) * 0.55;
+
+            ud.upperBody.position.y = 0.48 + hipDrop + Math.abs(Math.sin(ud.phase)) * 0.025;
+            ud.upperBody.rotation.z = -pelvicRoll * 0.65;
+            ud.upperBody.rotation.x = 0.11;
         } else if (ud.legL && ud.legR) {
-            ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x, 0, dt * 10);
-            ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x, 0, dt * 10);
-            if (ud.legL.knee) ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x, 0, dt * 10);
-            if (ud.legR.knee) ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x, 0, dt * 10);
-            ud.upperBody.rotation.z = THREE.MathUtils.lerp(ud.upperBody.rotation.z || 0, 0, dt * 10);
-            ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, 0, dt * 10);
+            if (ud.pelvisGroup) {
+                ud.pelvisGroup.position.y = THREE.MathUtils.lerp(ud.pelvisGroup.position.y || 0.42, 0.42, lerp10);
+                ud.pelvisGroup.rotation.x = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.x || 0, 0, lerp10);
+                ud.pelvisGroup.rotation.y = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.y || 0, 0, lerp10);
+                ud.pelvisGroup.rotation.z = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.z || 0, 0, lerp10);
+            }
+            ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x, -0.06, lerp10);
+            ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x, 0.06, lerp10);
+            if (ud.legL.knee) ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x, 0.12, lerp10);
+            if (ud.legR.knee) ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x, 0.12, lerp10);
+            if (ud.legL.ankle) ud.legL.ankle.rotation.x = THREE.MathUtils.lerp(ud.legL.ankle.rotation.x || 0, -0.06, lerp10);
+            if (ud.legR.ankle) ud.legR.ankle.rotation.x = THREE.MathUtils.lerp(ud.legR.ankle.rotation.x || 0, -0.06, lerp10);
+            ud.upperBody.position.y = THREE.MathUtils.lerp(ud.upperBody.position.y || 0.48, 0.48 + Math.sin(ud.phase) * 0.01, lerp10);
+            ud.upperBody.rotation.z = THREE.MathUtils.lerp(ud.upperBody.rotation.z || 0, 0, lerp10);
+            ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, 0.03, lerp10);
         }
         const slash = Math.sin(ud.attackAnim * Math.PI);
         if (ud.shoulderR && ud.shoulderL) {
-            const armStride = isMoving ? Math.sin(ud.phase) * 0.32 : 0;
-            ud.shoulderR.rotation.x = -0.55 + armStride - slash * 1.15;
-            ud.shoulderL.rotation.x = -0.55 - armStride - Math.sin(ud.attackAnim * Math.PI * 0.8) * 0.95;
+            const armStride = isMoving ? Math.sin(ud.phase) * 0.30 : Math.sin(ud.phase * 0.5) * 0.04;
+            ud.shoulderR.rotation.x = -0.48 + armStride - slash * 1.12;
+            ud.shoulderR.rotation.z = -0.14 - slash * 0.22;
+            ud.shoulderL.rotation.x = -0.48 - armStride - Math.sin(ud.attackAnim * Math.PI * 0.8) * 0.92;
+            ud.shoulderL.rotation.z = 0.14 + slash * 0.18;
+            if (ud.elbowR) ud.elbowR.rotation.x = -0.35 + slash * 0.45;
+            if (ud.elbowL) ud.elbowL.rotation.x = -0.35 + slash * 0.35;
             ud.upperBody.rotation.y = (isMoving ? -Math.sin(ud.phase) * 0.12 : 0) + slash * 0.45;
         }
-    } else {
-        // ============================================================================
-        // REALISTIC TERRAN BIPEDAL 2-BONE LEG IK, 3-AXIS IK HIPS, DUAL-ARM GUN IK
-        // ATTACHMENT & ANATOMICAL HEAD TARGET TRACKING
-        // ============================================================================
-        const isHeavyExo = ud.role === 'marauder' || ud.role === 'firebat' || ud.role === 'hero';
-        const walkFreq = isHeavyExo ? 9.4 : (ud.role === 'reaper' || ud.role === 'grunt' ? 12.8 : 11.2);
-        ud.phase += dt * (isMoving ? walkFreq : 2.4);
+        if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
+        return;
+    }
 
-        if (ud.heroCoreRing) ud.heroCoreRing.rotation.z += dt * 4.5;
-        if (ud.heroWings) ud.heroWings.position.y = 0.36 + Math.sin(ud.phase * 0.8) * 0.025;
-        if (ud.heroWeapon && ud.heroWeapon.userData && ud.heroWeapon.userData.fusionDrum) {
-            ud.heroWeapon.userData.fusionDrum.rotation.x += dt * (ud.attackAnim > 0.05 ? 24 : 3.5);
+    // ============================================================================
+    // REALISTIC TERRAN BIPEDAL 2-BONE LEG IK, 3-AXIS IK HIPS, DUAL-ARM GUN IK
+    // ============================================================================
+    const isHeavyExo = ud.role === 'marauder' || ud.role === 'firebat' || ud.role === 'hero';
+    const walkFreq = isHeavyExo ? 9.4 : (ud.role === 'reaper' || ud.role === 'grunt' ? 12.8 : 11.2);
+    ud.phase += effDt * (isMoving ? walkFreq : 2.4);
+
+    if (ud.heroCoreRing) ud.heroCoreRing.rotation.z += effDt * 4.5;
+    if (ud.heroWings) ud.heroWings.position.y = 0.27 + Math.sin(ud.phase * 0.8) * 0.02;
+    if (ud.heroWeapon && ud.heroWeapon.userData && ud.heroWeapon.userData.fusionDrum) {
+        ud.heroWeapon.userData.fusionDrum.rotation.x += effDt * (ud.attackAnim > 0.05 ? 24 : 3.5);
+    }
+
+    let hasAimTarget = false;
+    let aimYaw = 0;
+    let aimPitch = 0;
+    if (aimTargetPos) {
+        const localAim = mesh.worldToLocal(_animLocalAimScratch.copy(aimTargetPos));
+        const horizDist = Math.hypot(localAim.x, localAim.z);
+        if (horizDist > 0.05) {
+            hasAimTarget = true;
+            aimYaw = THREE.MathUtils.clamp(Math.atan2(localAim.x, Math.max(0.25, localAim.z)), -1.15, 1.15);
+            aimPitch = THREE.MathUtils.clamp(-Math.atan2(localAim.y - 0.72, horizDist), -0.65, 0.65);
+        }
+    }
+
+    const headNode = ud.headGroup || ud.head;
+    const lerp10 = Math.min(1, effDt * 10);
+    const lerp12 = Math.min(1, effDt * 12);
+    const lerp14 = Math.min(1, effDt * 14);
+
+    if (ud.role === 'reaper') {
+        const hoverBob = Math.sin(ud.phase * 1.25) * 0.055;
+        const hoverSway = Math.cos(ud.phase * 0.85) * 0.030;
+        const flightPitch = isMoving ? 0.30 : (hasAimTarget ? 0.14 : 0.08);
+
+        if (ud.pelvisGroup) {
+            ud.pelvisGroup.position.set(hoverSway * 0.35, 0.44 + hoverBob, 0);
+            ud.pelvisGroup.rotation.set(flightPitch * 0.65, Math.sin(ud.phase * 0.6) * 0.06, -hoverSway * 0.8);
         }
 
-        // Compute Local Enemy Aim Vector (Azimuth & Elevation) for Realistic Aiming & Head Look-At
-        let hasAimTarget = false;
-        let aimYaw = 0;
-        let aimPitch = 0;
-        if (aimTargetPos) {
-            const localAim = mesh.worldToLocal(aimTargetPos.clone());
-            const horizDist = Math.hypot(localAim.x, localAim.z);
-            if (horizDist > 0.05) {
-                hasAimTarget = true;
-                aimYaw = THREE.MathUtils.clamp(Math.atan2(localAim.x, Math.max(0.25, localAim.z)), -1.15, 1.15);
-                aimPitch = THREE.MathUtils.clamp(-Math.atan2(localAim.y - 0.72, horizDist), -0.65, 0.65);
-            }
-        }
+        const legSwayL = Math.sin(ud.phase * 1.1) * 0.10;
+        const legSwayR = Math.cos(ud.phase * 1.1) * 0.10;
+        ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x || 0, -0.34 + (isMoving ? 0.22 : 0) + legSwayL, lerp10);
+        ud.legL.hip.rotation.z = -0.06;
+        ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x || 0, 0.76 + legSwayL * 0.5, lerp10);
+        if (ud.legL.ankle) ud.legL.ankle.rotation.x = 0.36;
 
-        // Analytical 2-Bone Humanoid Leg IK Solver (Thigh L1=0.20, Shin L2=0.20) with Heel-Strike & Toe-Off Ankle
-        function solveHumanoidLegIK(footZ, footY, gaitPhase) {
-            const L1 = 0.20, L2 = 0.20;
-            const d = THREE.MathUtils.clamp(Math.hypot(footZ, footY), 0.12, 0.398);
-            const basePitch = Math.atan2(footZ, -footY);
-            const cosHip = THREE.MathUtils.clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -0.99, 0.99);
-            const cosKnee = THREE.MathUtils.clamp((L1 * L1 + L2 * L2 - d * d) / (2 * L1 * L2), -0.99, 0.99);
-            const hipAngle = -(basePitch + Math.acos(cosHip));
-            const kneeAngle = Math.PI - Math.acos(cosKnee);
-            // Heel-strike dorsiflexion on forward contact (sin > 0) + plantarflexion push on toe-off (sin < 0)
-            const heelToeWave = Math.sin(gaitPhase) * 0.24 - Math.max(0, Math.cos(gaitPhase)) * 0.18;
-            const ankleAngle = -(hipAngle + kneeAngle) * 0.65 - heelToeWave;
-            return { hipAngle, kneeAngle, ankleAngle };
-        }
+        ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x || 0, -0.12 + (isMoving ? 0.28 : 0) + legSwayR, lerp10);
+        ud.legR.hip.rotation.z = 0.06;
+        ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x || 0, 0.50 + legSwayR * 0.5, lerp10);
+        if (ud.legR.ankle) ud.legR.ankle.rotation.x = 0.32;
 
-        const headNode = ud.headGroup || ud.head;
+        ud.upperBody.position.y = 0.50 + hoverBob;
+        ud.upperBody.position.x = hoverSway * 0.35;
+        ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, flightPitch - ud.attackAnim * 0.10, lerp12);
+        ud.upperBody.rotation.z = -hoverSway * 0.75;
 
-        if (ud.role === 'reaper') {
-            // ============================================================================
-            // AIRBORNE JUMP-JET REAPER FLIGHT POSE & DYNAMIC TWIN THRUSTER PARTICLE TRAILS
-            // Reapers fly/hover on twin jump-jets instead of walking on the ground!
-            // ============================================================================
-            const hoverBob = Math.sin(ud.phase * 1.25) * 0.065;
-            const hoverSway = Math.cos(ud.phase * 0.85) * 0.035;
-            const flightPitch = isMoving ? 0.32 : (hasAimTarget ? 0.14 : 0.08);
-
-            if (ud.pelvisGroup) {
-                ud.pelvisGroup.position.set(hoverSway * 0.4, 0.42 + hoverBob, 0);
-                ud.pelvisGroup.rotation.set(flightPitch * 0.65, Math.sin(ud.phase * 0.6) * 0.06, -hoverSway * 0.8);
-            }
-
-            // Airborne Jump-Jet Leg Tuck (One knee slightly raised, boots angled downward in thruster flight stance)
-            const legSwayL = Math.sin(ud.phase * 1.1) * 0.10;
-            const legSwayR = Math.cos(ud.phase * 1.1) * 0.10;
-            ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x || 0, -0.34 + (isMoving ? 0.22 : 0) + legSwayL, dt * 10);
-            ud.legL.hip.rotation.z = -0.08;
-            ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x || 0, 0.78 + legSwayL * 0.5, dt * 10);
-            if (ud.legL.ankle) ud.legL.ankle.rotation.x = 0.38;
-
-            ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x || 0, -0.12 + (isMoving ? 0.28 : 0) + legSwayR, dt * 10);
-            ud.legR.hip.rotation.z = 0.08;
-            ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x || 0, 0.52 + legSwayR * 0.5, dt * 10);
-            if (ud.legR.ankle) ud.legR.ankle.rotation.x = 0.34;
-
-            ud.upperBody.position.y = 0.52 + hoverBob;
-            ud.upperBody.position.x = hoverSway * 0.35;
-            ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, flightPitch - ud.attackAnim * 0.10, dt * 12);
-            ud.upperBody.rotation.z = -hoverSway * 0.75;
-
-            // Emit continuous 3D jump-jet thrust particles from both canted turbine nozzles
-            if (ud.reaperNozzles && ud.reaperNozzles.length > 0) {
-                ud.reaperJetTimer = (ud.reaperJetTimer || 0) - dt;
-                if (ud.reaperJetTimer <= 0) {
-                    ud.reaperJetTimer = isMoving ? 0.026 : 0.045;
-                    for (let ni = 0; ni < ud.reaperNozzles.length; ni++) {
-                        const rn = ud.reaperNozzles[ni];
-                        if (rn && rn.node) {
-                            emitThrusterExhaustParticles(rn.node, rn.dir, 'amber', isMoving ? 0.78 : 0.62, isMoving);
-                        }
+        if (lodTier <= 1 && ud.reaperNozzles && ud.reaperNozzles.length > 0) {
+            ud.reaperJetTimer = (ud.reaperJetTimer || 0) - effDt;
+            if (ud.reaperJetTimer <= 0) {
+                ud.reaperJetTimer = (isMoving ? 0.032 : 0.055) * thrusterIntervalMult;
+                for (let ni = 0; ni < ud.reaperNozzles.length; ni++) {
+                    const rn = ud.reaperNozzles[ni];
+                    if (rn && rn.node) {
+                        emitThrusterExhaustParticles(rn.node, rn.dir, 'amber', isMoving ? 0.78 : 0.62, isMoving);
                     }
                 }
             }
-        } else if (isMoving) {
-            const cycleL = ud.phase;
-            const cycleR = ud.phase + Math.PI;
-            const strideLen = isHeavyExo ? 0.19 : 0.22;
-            const stepHeight = isHeavyExo ? 0.11 : 0.135;
+        }
+    } else if (isMoving) {
+        const cycleL = ud.phase;
+        const cycleR = ud.phase + Math.PI;
+        const strideLen = isHeavyExo ? 0.18 : 0.21;
+        const stepHeight = isHeavyExo ? 0.105 : 0.125;
 
-            // Foot trajectory in pelvis-local space (elliptical swing arc + stance ground contact with mid-stance compression)
-            const swingL = Math.max(0, Math.cos(cycleL));
-            const stanceL = Math.max(0, -Math.cos(cycleL));
-            const footZL = Math.sin(cycleL) * strideLen;
-            const footYL = -0.385 + swingL * stepHeight + stanceL * 0.024;
+        const swingL = Math.max(0, Math.cos(cycleL));
+        const stanceL = Math.max(0, -Math.cos(cycleL));
+        const footZL = Math.sin(cycleL) * strideLen;
+        const footYL = -0.385 + swingL * stepHeight + stanceL * 0.022;
 
-            const swingR = Math.max(0, Math.cos(cycleR));
-            const stanceR = Math.max(0, -Math.cos(cycleR));
-            const footZR = Math.sin(cycleR) * strideLen;
-            const footYR = -0.385 + swingR * stepHeight + stanceR * 0.024;
+        const swingR = Math.max(0, Math.cos(cycleR));
+        const stanceR = Math.max(0, -Math.cos(cycleR));
+        const footZR = Math.sin(cycleR) * strideLen;
+        const footYR = -0.385 + swingR * stepHeight + stanceR * 0.022;
 
-            const ikL = solveHumanoidLegIK(footZL, footYL, cycleL);
-            const ikR = solveHumanoidLegIK(footZR, footYR, cycleR);
+        const ikL = _solveHumanoidLegIK(footZL, footYL, cycleL, _ikScratchA);
+        const ikR = _solveHumanoidLegIK(footZR, footYR, cycleR, _ikScratchB);
 
-            // 1. 3-Axis IK Hips (Pelvis Group): Vertical gait drop, lateral weight-shift over planted foot, pelvic roll & counter-yaw twist!
-            const hipDrop = -Math.cos(ud.phase * 2.0) * (isHeavyExo ? 0.026 : 0.022);
-            const hipLateralShift = -Math.sin(ud.phase) * (isHeavyExo ? 0.030 : 0.024);
-            const pelvicRoll = Math.sin(ud.phase) * (isHeavyExo ? 0.075 : 0.062);
-            const pelvicYaw = Math.cos(ud.phase) * (isHeavyExo ? 0.11 : 0.14);
-            const pelvicPitch = 0.05 + Math.sin(ud.phase * 2.0) * 0.028;
+        const hipDrop = -Math.cos(ud.phase * 2.0) * (isHeavyExo ? 0.022 : 0.018);
+        const hipLateralShift = -Math.sin(ud.phase) * (isHeavyExo ? 0.024 : 0.018);
+        const pelvicRoll = Math.sin(ud.phase) * (isHeavyExo ? 0.065 : 0.052);
+        const pelvicYaw = Math.cos(ud.phase) * (isHeavyExo ? 0.10 : 0.12);
+        const pelvicPitch = 0.04 + Math.sin(ud.phase * 2.0) * 0.024;
 
-            if (ud.pelvisGroup) {
-                ud.pelvisGroup.position.set(hipLateralShift, 0.40 + hipDrop, 0);
-                ud.pelvisGroup.rotation.set(pelvicPitch, pelvicYaw, pelvicRoll);
-            }
-
-            ud.legL.hip.rotation.x = ikL.hipAngle - pelvicPitch;
-            ud.legL.hip.rotation.z = -pelvicRoll * 0.75 + Math.sin(cycleL) * 0.032;
-            ud.legL.knee.rotation.x = ikL.kneeAngle;
-            if (ud.legL.ankle) ud.legL.ankle.rotation.x = ikL.ankleAngle;
-
-            ud.legR.hip.rotation.x = ikR.hipAngle - pelvicPitch;
-            ud.legR.hip.rotation.z = -pelvicRoll * 0.75 + Math.sin(cycleR) * 0.032;
-            ud.legR.knee.rotation.x = ikR.kneeAngle;
-            if (ud.legR.ankle) ud.legR.ankle.rotation.x = ikR.ankleAngle;
-
-            // 2. Upper Body Tactical March & Counter-Balance Posture
-            const combatLean = hasAimTarget
-                ? THREE.MathUtils.clamp(0.11 + aimPitch * 0.38, -0.22, 0.38)
-                : ((ud.role === 'grunt' || ud.role === 'reaper') ? 0.16 : 0.11);
-            ud.upperBody.position.y = 0.50 + hipDrop + Math.abs(Math.sin(ud.phase)) * 0.018;
-            ud.upperBody.position.x = hipLateralShift * 0.55;
-            ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, combatLean - ud.attackAnim * 0.08, Math.min(1, dt * 12));
-            ud.upperBody.rotation.z = -pelvicRoll * 0.65;
-        } else {
-            // Slope-Adaptive Planted IK Stance + Ready-Aim Weight Shift
-            // Optimization: sample terrain slope at most every 0.25s when idle instead of allocating 2 Vector3s every frame!
-            ud.idleSlopeTimer = (ud.idleSlopeTimer || 0) - dt;
-            if (ud.cachedHDiff === undefined || ud.idleSlopeTimer <= 0) {
-                ud.idleSlopeTimer = 0.25;
-                const cosY = Math.cos(mesh.rotation.y || 0);
-                const sinY = Math.sin(mesh.rotation.y || 0);
-                const lx = mesh.position.x - 0.14 * cosY;
-                const lz = mesh.position.z + 0.14 * sinY;
-                const rx = mesh.position.x + 0.14 * cosY;
-                const rz = mesh.position.z - 0.14 * sinY;
-                ud.cachedHDiff = THREE.MathUtils.clamp(getTerrainHeight(lx, lz) - getTerrainHeight(rx, rz), -0.22, 0.22);
-            }
-            const hDiff = ud.cachedHDiff || 0;
-
-            const ikStanceL = solveHumanoidLegIK(0.03, -0.39 + Math.max(0, hDiff * 0.45), 0);
-            const ikStanceR = solveHumanoidLegIK(-0.03, -0.39 + Math.max(0, -hDiff * 0.45), Math.PI);
-            const idleBreath = Math.sin(ud.phase) * 0.012;
-
-            if (ud.pelvisGroup) {
-                ud.pelvisGroup.position.x = THREE.MathUtils.lerp(ud.pelvisGroup.position.x || 0, hasAimTarget ? -0.015 : 0, dt * 10);
-                ud.pelvisGroup.position.y = THREE.MathUtils.lerp(ud.pelvisGroup.position.y || 0.40, 0.395 + idleBreath * 0.5, dt * 10);
-                ud.pelvisGroup.rotation.x = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.x || 0, hasAimTarget ? 0.04 : 0, dt * 10);
-                ud.pelvisGroup.rotation.y = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.y || 0, hasAimTarget ? -0.16 : 0, dt * 10);
-                ud.pelvisGroup.rotation.z = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.z || 0, hDiff * 0.35, dt * 10);
-            }
-
-            ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x, ikStanceL.hipAngle, dt * 10);
-            ud.legL.hip.rotation.z = THREE.MathUtils.lerp(ud.legL.hip.rotation.z || 0, -0.03, dt * 10);
-            ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x, ikStanceL.kneeAngle, dt * 10);
-            if (ud.legL.ankle) ud.legL.ankle.rotation.x = THREE.MathUtils.lerp(ud.legL.ankle.rotation.x || 0, ikStanceL.ankleAngle, dt * 10);
-
-            ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x, ikStanceR.hipAngle, dt * 10);
-            ud.legR.hip.rotation.z = THREE.MathUtils.lerp(ud.legR.hip.rotation.z || 0, 0.03, dt * 10);
-            ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x, ikStanceR.kneeAngle, dt * 10);
-            if (ud.legR.ankle) ud.legR.ankle.rotation.x = THREE.MathUtils.lerp(ud.legR.ankle.rotation.x || 0, ikStanceR.ankleAngle, dt * 10);
-
-            const targetBodyPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch * 0.35 + 0.04, -0.25, 0.32) - ud.attackAnim * 0.09 : 0.02;
-            ud.upperBody.position.y = 0.495 + idleBreath;
-            ud.upperBody.position.x = THREE.MathUtils.lerp(ud.upperBody.position.x || 0, 0, dt * 10);
-            ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, targetBodyPitch, dt * 10);
-            ud.upperBody.rotation.z = THREE.MathUtils.lerp(ud.upperBody.rotation.z || 0, 0, dt * 10);
+        if (ud.pelvisGroup) {
+            ud.pelvisGroup.position.set(hipLateralShift, 0.42 + hipDrop, 0);
+            ud.pelvisGroup.rotation.set(pelvicPitch, pelvicYaw, pelvicRoll);
         }
 
-        // 3. Arm & Weapon Aiming Kinematics + Dual-Arm Rifle Foregrip IK Attachment
-        const isTwoHandRifle = (ud.role === 'marine' || ud.role === 'ranger' || ud.role === 'plasma' || ud.role === 'sniper' || ud.role === 'rocketman' || ud.role === 'hero' || !ud.role);
-        const gaitSway = isMoving ? Math.sin(ud.phase) * 0.085 : Math.sin(ud.phase) * 0.015;
-        const torsoCounterTwist = isMoving ? -Math.cos(ud.phase) * 0.11 : 0;
+        ud.legL.hip.rotation.x = ikL.hipAngle - pelvicPitch;
+        ud.legL.hip.rotation.z = -pelvicRoll * 0.70 + Math.sin(cycleL) * 0.028;
+        ud.legL.knee.rotation.x = ikL.kneeAngle;
+        if (ud.legL.ankle) ud.legL.ankle.rotation.x = ikL.ankleAngle;
 
-        if (ud.role === 'grunt') {
-            const slash = Math.sin(ud.attackAnim * Math.PI);
-            const armCounterSwing = isMoving ? Math.sin(ud.phase) * 0.34 : 0;
-            const targetTorsoYaw = (hasAimTarget ? aimYaw * 0.45 : torsoCounterTwist) + slash * 0.55;
-            ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, targetTorsoYaw, Math.min(1, dt * 14));
-            ud.shoulderR.rotation.x = -0.48 - slash * 0.95 + armCounterSwing + (hasAimTarget ? aimPitch * 0.5 : 0);
-            ud.elbowR.rotation.x = -0.88 + slash * 1.35 - Math.max(0, armCounterSwing) * 0.25;
-            if (ud.shoulderL) {
-                ud.shoulderL.rotation.set(-0.52 - armCounterSwing * 0.65, 0.35, 0);
-                ud.elbowL.rotation.set(-0.90, 0, 0);
+        ud.legR.hip.rotation.x = ikR.hipAngle - pelvicPitch;
+        ud.legR.hip.rotation.z = -pelvicRoll * 0.70 + Math.sin(cycleR) * 0.028;
+        ud.legR.knee.rotation.x = ikR.kneeAngle;
+        if (ud.legR.ankle) ud.legR.ankle.rotation.x = ikR.ankleAngle;
+
+        const combatLean = hasAimTarget
+            ? THREE.MathUtils.clamp(0.10 + aimPitch * 0.36, -0.20, 0.34)
+            : ((ud.role === 'grunt' || ud.role === 'reaper') ? 0.14 : 0.09);
+        ud.upperBody.position.y = 0.48 + hipDrop + Math.abs(Math.sin(ud.phase)) * 0.015;
+        ud.upperBody.position.x = hipLateralShift * 0.55;
+        ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, combatLean - ud.attackAnim * 0.08, lerp12);
+        ud.upperBody.rotation.z = -pelvicRoll * 0.60;
+    } else {
+        let hDiff = ud.cachedHDiff || 0;
+        if (lodTier === 0) {
+            ud.idleSlopeTimer = (ud.idleSlopeTimer || 0) - effDt;
+            if (ud.cachedHDiff === undefined || ud.idleSlopeTimer <= 0) {
+                ud.idleSlopeTimer = 0.45;
+                const cosY = Math.cos(mesh.rotation.y || 0);
+                const sinY = Math.sin(mesh.rotation.y || 0);
+                const lx = mesh.position.x - 0.12 * cosY;
+                const lz = mesh.position.z + 0.12 * sinY;
+                const rx = mesh.position.x + 0.12 * cosY;
+                const rz = mesh.position.z - 0.12 * sinY;
+                ud.cachedHDiff = THREE.MathUtils.clamp(getTerrainHeight(lx, lz) - getTerrainHeight(rx, rz), -0.20, 0.20);
+                hDiff = ud.cachedHDiff;
             }
-        } else if (isTwoHandRifle) {
-            // Bladed tactical shooting stance: torso turns slightly (-0.16 rad) while aiming toward enemy azimuth & elevation!
-            const aimStanceWeight = (hasAimTarget || ud.attackAnim > 0.01) ? 1.0 : 0.45;
-            const desiredTorsoYaw = hasAimTarget
-                ? THREE.MathUtils.clamp(aimYaw * 0.58 - 0.14, -0.78, 0.78)
-                : (torsoCounterTwist - 0.10);
-            ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, desiredTorsoYaw, Math.min(1, dt * 14));
+        }
 
-            const residualYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw - ud.upperBody.rotation.y, -0.55, 0.55) : 0;
-            const weaponPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch - ud.upperBody.rotation.x, -0.55, 0.55) : 0;
-            const recoilKick = ud.attackAnim * (ud.role === 'hero' ? 0.28 : (ud.role === 'sniper' || ud.role === 'rocketman' ? 0.26 : 0.19));
+        const ikStanceL = _solveHumanoidLegIK(0.025, -0.39 + Math.max(0, hDiff * 0.42), 0, _ikScratchA);
+        const ikStanceR = _solveHumanoidLegIK(-0.025, -0.39 + Math.max(0, -hDiff * 0.42), Math.PI, _ikScratchB);
+        const idleBreath = Math.sin(ud.phase) * 0.010;
 
-            // Right Arm (Trigger & Shoulder-Stock Arm): raises rifle to shoulder eye-line when aiming, absorbs recoil kick
-            const rShoulderPitch = THREE.MathUtils.lerp(-0.56, -0.74, aimStanceWeight) + weaponPitch * 0.72 - recoilKick + gaitSway * 0.65;
-            const rShoulderYaw = -0.14 + residualYaw * 0.65;
-            const rElbowPitch = THREE.MathUtils.lerp(-1.02, -0.84, aimStanceWeight) + weaponPitch * 0.28 + recoilKick * 0.55;
+        if (ud.pelvisGroup) {
+            ud.pelvisGroup.position.x = THREE.MathUtils.lerp(ud.pelvisGroup.position.x || 0, hasAimTarget ? -0.012 : 0, lerp10);
+            ud.pelvisGroup.position.y = THREE.MathUtils.lerp(ud.pelvisGroup.position.y || 0.42, 0.415 + idleBreath * 0.5, lerp10);
+            ud.pelvisGroup.rotation.x = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.x || 0, hasAimTarget ? 0.035 : 0, lerp10);
+            ud.pelvisGroup.rotation.y = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.y || 0, hasAimTarget ? -0.14 : 0, lerp10);
+            ud.pelvisGroup.rotation.z = THREE.MathUtils.lerp(ud.pelvisGroup.rotation.z || 0, hDiff * 0.32, lerp10);
+        }
 
-            ud.shoulderR.rotation.set(rShoulderPitch, rShoulderYaw, -0.05);
-            ud.elbowR.rotation.set(rElbowPitch, 0.08, 0);
+        ud.legL.hip.rotation.x = THREE.MathUtils.lerp(ud.legL.hip.rotation.x, ikStanceL.hipAngle, lerp10);
+        ud.legL.hip.rotation.z = THREE.MathUtils.lerp(ud.legL.hip.rotation.z || 0, -0.025, lerp10);
+        ud.legL.knee.rotation.x = THREE.MathUtils.lerp(ud.legL.knee.rotation.x, ikStanceL.kneeAngle, lerp10);
+        if (ud.legL.ankle) ud.legL.ankle.rotation.x = THREE.MathUtils.lerp(ud.legL.ankle.rotation.x || 0, ikStanceL.ankleAngle, lerp10);
 
-            // Left Support Arm IK: Solves shoulderL & elbowL so the left hand stays physically locked onto the weapon's foregrip/barrel shroud!
-            // Compute where the rifle foregrip sits in upperBody coordinates given shoulderR + elbowR rotations
-            const foregripForwardZ = 0.36 - recoilKick * 0.14;
-            const foregripY = 0.12 - Math.sin(rShoulderPitch + rElbowPitch * 0.55) * 0.24 - weaponPitch * 0.22;
-            const foregripX = 0.08 + Math.sin(rShoulderYaw) * 0.28;
+        ud.legR.hip.rotation.x = THREE.MathUtils.lerp(ud.legR.hip.rotation.x, ikStanceR.hipAngle, lerp10);
+        ud.legR.hip.rotation.z = THREE.MathUtils.lerp(ud.legR.hip.rotation.z || 0, 0.025, lerp10);
+        ud.legR.knee.rotation.x = THREE.MathUtils.lerp(ud.legR.knee.rotation.x, ikStanceR.kneeAngle, lerp10);
+        if (ud.legR.ankle) ud.legR.ankle.rotation.x = THREE.MathUtils.lerp(ud.legR.ankle.rotation.x || 0, ikStanceR.ankleAngle, lerp10);
 
-            // Vector from Left Shoulder (-0.31, 0.36, 0) to Rifle Foregrip (foregripX, foregripY, foregripForwardZ)
-            const dxL = foregripX - (-0.31);
-            const dyL = foregripY - 0.36;
-            const dzL = Math.max(0.18, foregripForwardZ);
+        const targetBodyPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch * 0.34 + 0.04, -0.22, 0.30) - ud.attackAnim * 0.08 : 0.02;
+        ud.upperBody.position.y = 0.478 + idleBreath;
+        ud.upperBody.position.x = THREE.MathUtils.lerp(ud.upperBody.position.x || 0, 0, lerp10);
+        ud.upperBody.rotation.x = THREE.MathUtils.lerp(ud.upperBody.rotation.x || 0, targetBodyPitch, lerp10);
+        ud.upperBody.rotation.z = THREE.MathUtils.lerp(ud.upperBody.rotation.z || 0, 0, lerp10);
+    }
+
+    const isTwoHandRifle = (ud.role === 'marine' || ud.role === 'ranger' || ud.role === 'plasma' || ud.role === 'sniper' || ud.role === 'rocketman' || ud.role === 'hero' || !ud.role);
+    const gaitSway = isMoving ? Math.sin(ud.phase) * 0.075 : Math.sin(ud.phase) * 0.012;
+    const torsoCounterTwist = isMoving ? -Math.cos(ud.phase) * 0.10 : 0;
+
+    if (ud.role === 'grunt') {
+        const slash = Math.sin(ud.attackAnim * Math.PI);
+        const armCounterSwing = isMoving ? Math.sin(ud.phase) * 0.32 : 0;
+        const targetTorsoYaw = (hasAimTarget ? aimYaw * 0.45 : torsoCounterTwist) + slash * 0.55;
+        ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, targetTorsoYaw, lerp14);
+        ud.shoulderR.rotation.x = -0.48 - slash * 0.95 + armCounterSwing + (hasAimTarget ? aimPitch * 0.5 : 0);
+        ud.elbowR.rotation.x = -0.88 + slash * 1.35 - Math.max(0, armCounterSwing) * 0.25;
+        if (ud.shoulderL) {
+            ud.shoulderL.rotation.set(-0.52 - armCounterSwing * 0.65, 0.35, 0);
+            ud.elbowL.rotation.set(-0.90, 0, 0);
+        }
+    } else if (isTwoHandRifle) {
+        const aimStanceWeight = (hasAimTarget || ud.attackAnim > 0.01) ? 1.0 : 0.45;
+        const desiredTorsoYaw = hasAimTarget
+            ? THREE.MathUtils.clamp(aimYaw * 0.58 - 0.14, -0.78, 0.78)
+            : (torsoCounterTwist - 0.10);
+        ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, desiredTorsoYaw, lerp14);
+
+        const residualYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw - ud.upperBody.rotation.y, -0.55, 0.55) : 0;
+        const weaponPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch - ud.upperBody.rotation.x, -0.55, 0.55) : 0;
+        const recoilKick = ud.attackAnim * (ud.role === 'hero' ? 0.26 : (ud.role === 'sniper' || ud.role === 'rocketman' ? 0.24 : 0.18));
+
+        const rShoulderPitch = THREE.MathUtils.lerp(-0.54, -0.72, aimStanceWeight) + weaponPitch * 0.72 - recoilKick + gaitSway * 0.65;
+        const rShoulderYaw = -0.12 + residualYaw * 0.65;
+        const rElbowPitch = THREE.MathUtils.lerp(-1.00, -0.82, aimStanceWeight) + weaponPitch * 0.28 + recoilKick * 0.55;
+
+        ud.shoulderR.rotation.set(rShoulderPitch, rShoulderYaw, -0.04);
+        ud.elbowR.rotation.set(rElbowPitch, 0.08, 0);
+
+        if (lodTier === 0) {
+            // Close LOD 0: Full 2-Bone Left Support Arm Foregrip IK
+            const shLX = ud.shoulderL ? ud.shoulderL.position.x : -0.185;
+            const shLY = ud.shoulderL ? ud.shoulderL.position.y : 0.30;
+            const foregripForwardZ = 0.32 - recoilKick * 0.12;
+            const foregripY = (shLY - 0.19) - Math.sin(rShoulderPitch + rElbowPitch * 0.55) * 0.21 - weaponPitch * 0.20;
+            const foregripX = 0.05 + Math.sin(rShoulderYaw) * 0.24;
+
+            const dxL = foregripX - shLX;
+            const dyL = foregripY - shLY;
+            const dzL = Math.max(0.16, foregripForwardZ);
             const reachPlanar = Math.hypot(dxL, dzL);
-            const reachTotal = THREE.MathUtils.clamp(Math.hypot(reachPlanar, dyL), 0.18, 0.435);
+            const reachTotal = THREE.MathUtils.clamp(Math.hypot(reachPlanar, dyL), 0.16, 0.395);
 
-            // 2-Bone Arm IK (UpperArm L1=0.22, Forearm L2=0.23)
-            const L1 = 0.22, L2 = 0.23;
+            const L1 = 0.20, L2 = 0.21;
             const cosElbowL = THREE.MathUtils.clamp((L1 * L1 + L2 * L2 - reachTotal * reachTotal) / (2 * L1 * L2), -0.98, 0.98);
             const cosShoulderL = THREE.MathUtils.clamp((L1 * L1 + reachTotal * reachTotal - L2 * L2) / (2 * L1 * reachTotal), -0.98, 0.98);
 
@@ -7918,54 +9433,55 @@ function updateUnitAnimation(mesh, dt, isMoving, aimTargetPos = null) {
 
             ud.shoulderL.rotation.set(
                 THREE.MathUtils.clamp(solvedShoulderPitchL, -1.35, -0.35),
-                THREE.MathUtils.clamp(solvedShoulderYawL, 0.38, 0.95),
-                0.12
+                THREE.MathUtils.clamp(solvedShoulderYawL, 0.34, 0.92),
+                0.10
             );
             ud.elbowL.rotation.set(
                 THREE.MathUtils.clamp(solvedElbowFlexL, -1.45, -0.45),
-                0.24,
+                0.22,
                 0
             );
-        } else {
-            // Dual-Gauntlet / Dual-Weapon Units (Firebat, Marauder, Reaper, Medic): Independent Dual-Arm Target Tracking
-            const kick = ud.attackAnim * 0.24;
-            const desiredTorsoYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw * 0.65, -0.82, 0.82) : torsoCounterTwist;
-            ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, desiredTorsoYaw, Math.min(1, dt * 14));
-            const resYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw - ud.upperBody.rotation.y, -0.45, 0.45) : 0;
-            const elevPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch * 0.75, -0.50, 0.50) : 0;
-
-            ud.shoulderR.rotation.set(-0.64 + elevPitch - kick + gaitSway, -0.10 + resYaw, 0);
-            ud.elbowR.rotation.set(-0.90 + kick * 0.45, 0, 0);
-            ud.shoulderL.rotation.set(-0.64 + elevPitch - kick * 0.85 - gaitSway, 0.10 + resYaw, 0);
-            ud.elbowL.rotation.set(-0.90 + kick * 0.45, 0, 0);
+        } else if (ud.shoulderL && ud.elbowL) {
+            // Normal/Distant LOD: Direct Coupled Left Foregrip Pose (Zero acos/atan2 trig calls)
+            ud.shoulderL.rotation.set(rShoulderPitch * 0.92 - 0.12, 0.58 + residualYaw * 0.45, 0.10);
+            ud.elbowL.rotation.set(rElbowPitch * 0.95 - 0.08, 0.22, 0);
         }
+    } else {
+        const kick = ud.attackAnim * 0.22;
+        const desiredTorsoYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw * 0.65, -0.82, 0.82) : torsoCounterTwist;
+        ud.upperBody.rotation.y = THREE.MathUtils.lerp(ud.upperBody.rotation.y || 0, desiredTorsoYaw, lerp14);
+        const resYaw = hasAimTarget ? THREE.MathUtils.clamp(aimYaw - ud.upperBody.rotation.y, -0.45, 0.45) : 0;
+        const elevPitch = hasAimTarget ? THREE.MathUtils.clamp(aimPitch * 0.75, -0.50, 0.50) : 0;
 
-        // 4. Realistic Anatomical Head & Helmet Visor Target Look-At Tracking
-        if (headNode) {
-            let desiredHeadYaw = 0;
-            let desiredHeadPitch = 0;
-            let desiredHeadRoll = -ud.upperBody.rotation.z * 0.65;
-
-            if (hasAimTarget) {
-                // Compensate for upperBody yaw/pitch so the head looks directly at the enemy target!
-                desiredHeadYaw = THREE.MathUtils.clamp(aimYaw - (ud.upperBody.rotation.y || 0), -0.95, 0.95);
-                desiredHeadPitch = THREE.MathUtils.clamp(aimPitch - (ud.upperBody.rotation.x || 0) * 0.75, -0.52, 0.52);
-                desiredHeadRoll += THREE.MathUtils.clamp(desiredHeadYaw * -0.12, -0.14, 0.14);
-            } else if (isMoving) {
-                desiredHeadYaw = -(ud.upperBody.rotation.y || 0) * 0.55 + Math.sin(ud.phase * 0.5) * 0.08;
-                desiredHeadPitch = -0.06;
-            } else {
-                // Subtle tactical scanning while idle
-                desiredHeadYaw = Math.sin(ud.phase * 0.65) * 0.16;
-                desiredHeadPitch = Math.cos(ud.phase * 0.45) * 0.04;
-            }
-
-            const headLerp = Math.min(1, dt * 14.0);
-            headNode.rotation.y = THREE.MathUtils.lerp(headNode.rotation.y || 0, desiredHeadYaw, headLerp);
-            headNode.rotation.x = THREE.MathUtils.lerp(headNode.rotation.x || 0, desiredHeadPitch, headLerp);
-            headNode.rotation.z = THREE.MathUtils.lerp(headNode.rotation.z || 0, desiredHeadRoll, headLerp);
-        }
+        ud.shoulderR.rotation.set(-0.62 + elevPitch - kick + gaitSway, -0.10 + resYaw, 0);
+        ud.elbowR.rotation.set(-0.88 + kick * 0.45, 0, 0);
+        ud.shoulderL.rotation.set(-0.62 + elevPitch - kick * 0.85 - gaitSway, 0.10 + resYaw, 0);
+        ud.elbowL.rotation.set(-0.88 + kick * 0.45, 0, 0);
     }
+
+    if (headNode && lodTier <= 1) {
+        let desiredHeadYaw = 0;
+        let desiredHeadPitch = 0;
+        let desiredHeadRoll = -ud.upperBody.rotation.z * 0.65;
+
+        if (hasAimTarget) {
+            desiredHeadYaw = THREE.MathUtils.clamp(aimYaw - (ud.upperBody.rotation.y || 0), -0.95, 0.95);
+            desiredHeadPitch = THREE.MathUtils.clamp(aimPitch - (ud.upperBody.rotation.x || 0) * 0.75, -0.52, 0.52);
+            desiredHeadRoll += THREE.MathUtils.clamp(desiredHeadYaw * -0.12, -0.14, 0.14);
+        } else if (isMoving) {
+            desiredHeadYaw = -(ud.upperBody.rotation.y || 0) * 0.55 + Math.sin(ud.phase * 0.5) * 0.08;
+            desiredHeadPitch = -0.06;
+        } else {
+            desiredHeadYaw = Math.sin(ud.phase * 0.65) * 0.16;
+            desiredHeadPitch = Math.cos(ud.phase * 0.45) * 0.04;
+        }
+
+        headNode.rotation.y = THREE.MathUtils.lerp(headNode.rotation.y || 0, desiredHeadYaw, lerp14);
+        headNode.rotation.x = THREE.MathUtils.lerp(headNode.rotation.x || 0, desiredHeadPitch, lerp14);
+        headNode.rotation.z = THREE.MathUtils.lerp(headNode.rotation.z || 0, desiredHeadRoll, lerp14);
+    }
+
+    if (_tAnim0 > 0) window.PERF_PROFILER.addSample('unitAnimation', performance.now() - _tAnim0);
 }
 
 // ============================================================================
@@ -8178,7 +9694,6 @@ function triggerWaterRippleFX(x, z, strength = 1.0, isSplash = false) {
     if (typeof getNearestPondInteraction !== 'function') return;
     if (typeof window.isOnRiverBridge === 'function' && window.isOnRiverBridge(x, z, 0.95)) return;
 
-    // Tight interaction threshold so units/impacts on banks or bridge ramps never trigger false water splashes
     const hit = getNearestPondInteraction(x, z, isSplash ? 0.65 : 0.25);
     if (!hit) return;
 
@@ -8191,10 +9706,8 @@ function triggerWaterRippleFX(x, z, strength = 1.0, isSplash = false) {
         window.pushWaterShaderRipple(rx, rz, clampedStrength * 0.75);
     }
 
-    // Subtle expanding water surface wave ring
-    const ring = new THREE.Mesh(SHARED_FX_GEO.waterRippleRing, SHARED_FX_MAT.waterRipple.clone());
+    const ring = FX_POOL.acquireShockwaveMesh(SHARED_FX_GEO.waterRippleRing, 'water');
     ring.position.set(rx, waterY + 0.025, rz);
-    scene.add(ring);
     shockwaves.push({
         mesh: ring,
         scale: 0.28,
@@ -8202,32 +9715,34 @@ function triggerWaterRippleFX(x, z, strength = 1.0, isSplash = false) {
         alpha: Math.min(0.55, 0.34 * clampedStrength)
     });
 
-    // Ballistic 3D Arcing Water Droplet Projectiles on Splash / Step in Water
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 135;
     const spawnDrops = isSplash || (clampedStrength > 0.45 && Math.random() < 0.55);
-    if (spawnDrops && particles.length < 135) {
+    if (spawnDrops && particles.length < maxP) {
+        const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
         const dropCount = isSplash
-            ? Math.min(9, Math.max(3, Math.floor(4 + clampedStrength * 3.5)))
+            ? Math.max(2, Math.round(Math.min(8, Math.floor(4 + clampedStrength * 3.0)) * rateMult))
             : 2;
         const dropGeo = SHARED_FX_GEO.waterDropProj || SHARED_FX_GEO.bloodDrop;
         const dropMat = SHARED_FX_MAT.waterDropMat || MAT.cyanGlow;
 
         for (let i = 0; i < dropCount; i++) {
+            if (particles.length >= maxP) break;
             const ang = (i / dropCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.55;
             const horizSpeed = (isSplash ? 1.6 : 0.85) + Math.random() * (isSplash ? 2.4 : 0.95) * clampedStrength;
             const upSpeed = (isSplash ? 2.6 : 1.35) + Math.random() * (isSplash ? 2.5 : 0.95) * clampedStrength;
             const vx = Math.cos(ang) * horizSpeed;
             const vz = Math.sin(ang) * horizSpeed;
 
-            const drop = new THREE.Mesh(dropGeo, dropMat);
+            const drop = FX_POOL.acquireParticleMesh(dropGeo, dropMat);
             const s = (isSplash ? 0.65 : 0.48) + Math.random() * 0.35;
             drop.scale.set(s, s, s * 1.45);
             drop.position.set(rx + Math.cos(ang) * 0.14, waterY + 0.08, rz + Math.sin(ang) * 0.14);
             drop.lookAt(drop.position.x + vx, drop.position.y + upSpeed, drop.position.z + vz);
-            scene.add(drop);
 
             particles.push({
                 mesh: drop,
-                vel: new THREE.Vector3(vx, upSpeed, vz),
+                vel: FX_POOL.acquireVec3(vx, upSpeed, vz),
                 gravity: 13.5,
                 life: 0.36 + Math.random() * 0.22,
                 isWaterDrop: true,
@@ -8238,17 +9753,20 @@ function triggerWaterRippleFX(x, z, strength = 1.0, isSplash = false) {
 }
 
 function ejectBrassCasing(pos) {
-    if (shellCasings.length >= 45) {
+    if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 5.0)) return;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxCasings = perf ? perf.maxShellCasings : 40;
+    if (shellCasings.length >= maxCasings) {
         const old = shellCasings.shift();
-        scene.remove(old.mesh);
+        FX_POOL.releaseCasingEntry(old);
     }
-    const casing = new THREE.Mesh(SHARED_FX_GEO.casing, MAT.copper);
+    const casing = FX_POOL.acquireCasingMesh(SHARED_FX_GEO.casing, MAT.copper);
     casing.position.copy(pos);
-    scene.add(casing);
     shellCasings.push({
         mesh: casing,
-        vel: new THREE.Vector3((Math.random() - 0.5) * 3.5, 2.5 + Math.random() * 2, (Math.random() - 0.5) * 3.5),
-        rotVel: new THREE.Vector3(Math.random()*15, Math.random()*15, Math.random()*15),
+        vel: FX_POOL.acquireVec3((Math.random() - 0.5) * 3.5, 2.5 + Math.random() * 2, (Math.random() - 0.5) * 3.5),
+        rotVel: FX_POOL.acquireVec3(Math.random() * 15, Math.random() * 15, Math.random() * 15),
         life: 1.0
     });
 }
@@ -8725,39 +10243,40 @@ function updateCrashingHelicopters(dt) {
         if (ch.smokeTimer <= 0) {
             ch.smokeTimer = 0.045;
             const stumpWorld = ch.tailFire
-                ? ch.tailFire.getWorldPosition(new THREE.Vector3())
-                : mesh.position.clone();
-            if (smokeClouds.length < 62) {
-                const sm = new THREE.Mesh(
+                ? ch.tailFire.getWorldPosition(_emitterScratchVec)
+                : mesh.position;
+            const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+            const maxSm = perf ? perf.maxSmokeClouds : 48;
+            const maxP = perf ? perf.maxParticles : 140;
+            if (smokeClouds.length < maxSm) {
+                const sm = FX_POOL.acquireSmokeMesh(
                     SHARED_FX_GEO.smoke,
                     Math.random() > 0.35 ? SHARED_FX_MAT.smokeDark : SHARED_FX_MAT.smokeFire
                 );
                 sm.scale.setScalar(0.85 + Math.random() * 0.35);
                 sm.position.copy(stumpWorld);
-                scene.add(sm);
                 smokeClouds.push({
                     mesh: sm,
-                    vel: new THREE.Vector3((Math.random() - 0.5) * 1.5, 1.8 + Math.random(), (Math.random() - 0.5) * 1.5),
+                    vel: FX_POOL.acquireVec3((Math.random() - 0.5) * 1.5, 1.8 + Math.random(), (Math.random() - 0.5) * 1.5),
                     life: 0.65
                 });
             }
-            if (particles.length < 140) {
-                const sp = new THREE.Mesh(SHARED_FX_GEO.spark, MAT.amberGlow);
+            if (particles.length < maxP) {
+                const sp = FX_POOL.acquireParticleMesh(SHARED_FX_GEO.spark, MAT.amberGlow);
                 sp.position.copy(stumpWorld);
-                scene.add(sp);
                 particles.push({
                     mesh: sp,
-                    vel: new THREE.Vector3((Math.random() - 0.5) * 6, 2 + Math.random() * 3, (Math.random() - 0.5) * 6),
+                    vel: FX_POOL.acquireVec3((Math.random() - 0.5) * 6, 2 + Math.random() * 3, (Math.random() - 0.5) * 6),
                     gravity: 15,
                     life: 0.28
                 });
             }
         }
 
-        // Check ground impact -> Massive Bomb Explosion & Crater (No floating crash text label!)
+        // Check ground impact -> Massive Bomb Explosion & Crater
         const groundY = getTerrainHeight(mesh.position.x, mesh.position.z);
         if (mesh.position.y <= groundY + 0.35 || ch.age > 3.2) {
-            const impactPos = new THREE.Vector3(mesh.position.x, Math.max(groundY, mesh.position.y), mesh.position.z);
+            const impactPos = _emitterScratchVec.set(mesh.position.x, Math.max(groundY, mesh.position.y), mesh.position.z);
             detonateArtilleryBomb(impactPos, true);
             spawnVehicleWreckageExplosion(impactPos, 'heli');
             scene.remove(mesh);
@@ -8770,15 +10289,16 @@ function updateCrashingHelicopters(dt) {
 let _muzzleFlashFlameGeo = null;
 function triggerTankMuzzleFlash(muzzlePos, targetPos = null, isSiegeArtillery = false) {
     triggerMuzzleFlash(muzzlePos);
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(muzzlePos.x, muzzlePos.y || 0, muzzlePos.z, 8.0)) return;
 
-    let dir = new THREE.Vector3(0, 0, 1);
+    const dir = _emitterScratchVec.set(0, 0, 1);
     if (targetPos) {
         dir.subVectors(targetPos, muzzlePos);
         dir.y = 0;
         if (dir.lengthSq() > 0.001) dir.normalize();
         else dir.set(0, 0, 1);
     }
-    const right = new THREE.Vector3(-dir.z, 0, dir.x);
+    const right = _emitterRightVec.set(-dir.z, 0, dir.x);
     const scaleMult = isSiegeArtillery ? 1.52 : 1.08;
 
     ensureThrusterParticleAssets();
@@ -8786,37 +10306,43 @@ function triggerTankMuzzleFlash(muzzlePos, targetPos = null, isSiegeArtillery = 
         _muzzleFlashFlameGeo = createProceduralViscoelasticGooGeo(0.08, 0.075, 0.22, 1);
     }
 
-    // 1. Forward Supersonic Mach-Cone Fireball Plume (White-Hot Core -> Golden-Amber -> Expanding Smoke)
-    const coreCount = particles.length > 90 ? 10 : (isSiegeArtillery ? 20 : 14);
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 175;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+
+    // 1. Forward Supersonic Mach-Cone Fireball Plume
+    const baseCore = particles.length > 90 ? 8 : (isSiegeArtillery ? 16 : 12);
+    const coreCount = Math.max(4, Math.round(baseCore * rateMult));
     for (let i = 0; i < coreCount; i++) {
-        if (particles.length >= 175) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            if (old && old.mesh) scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
-        const isWhiteCore = i < 5;
-        const isAmberJet = i < 11;
+        const isWhiteCore = i < 4;
+        const isAmberJet = i < 9;
         const pMat = isWhiteCore
             ? _thrusterMats.coreWhite
             : (isAmberJet ? (isSiegeArtillery && i % 2 === 0 ? _thrusterMats.cyanHot : _thrusterMats.amberHot) : _thrusterMats.amberFlame);
-        const pMesh = new THREE.Mesh(isWhiteCore ? _thrusterMicroGeo : _muzzleFlashFlameGeo, pMat);
+        const pMesh = FX_POOL.acquireParticleMesh(isWhiteCore ? _thrusterMicroGeo : _muzzleFlashFlameGeo, pMat);
         const s = (isWhiteCore ? 1.45 : (0.85 + Math.random() * 0.65)) * scaleMult;
         pMesh.scale.set(s * 0.72, s * 0.72, s * (isWhiteCore ? 2.65 : 1.95));
 
         const forwardOffset = 0.05 + (i / coreCount) * 0.42 * scaleMult;
-        pMesh.position.copy(muzzlePos).addScaledVector(dir, forwardOffset);
-        pMesh.position.x += (Math.random() - 0.5) * 0.09;
-        pMesh.position.y += (Math.random() - 0.5) * 0.09;
-        pMesh.position.z += (Math.random() - 0.5) * 0.09;
+        pMesh.position.set(
+            muzzlePos.x + dir.x * forwardOffset + (Math.random() - 0.5) * 0.09,
+            muzzlePos.y + dir.y * forwardOffset + (Math.random() - 0.5) * 0.09,
+            muzzlePos.z + dir.z * forwardOffset + (Math.random() - 0.5) * 0.09
+        );
 
         const fwdSpeed = (isWhiteCore ? (18.0 + Math.random() * 7.0) : (9.5 + Math.random() * 8.5)) * scaleMult;
         const spread = isWhiteCore ? 0.95 : 2.65;
-        const vel = dir.clone().multiplyScalar(fwdSpeed);
-        vel.x += (Math.random() - 0.5) * spread;
-        vel.y += (Math.random() - 0.35) * spread;
-        vel.z += (Math.random() - 0.5) * spread;
+        const vel = FX_POOL.acquireVec3(
+            dir.x * fwdSpeed + (Math.random() - 0.5) * spread,
+            dir.y * fwdSpeed + (Math.random() - 0.35) * spread,
+            dir.z * fwdSpeed + (Math.random() - 0.5) * spread
+        );
 
         pMesh.lookAt(pMesh.position.x + vel.x, pMesh.position.y + vel.y, pMesh.position.z + vel.z);
-        scene.add(pMesh);
 
         const maxLife = (isWhiteCore ? 0.075 : 0.14) + Math.random() * 0.06;
         particles.push({
@@ -8830,22 +10356,28 @@ function triggerTankMuzzleFlash(muzzlePos, targetPos = null, isSiegeArtillery = 
         });
     }
 
-    // 2. Twin-Baffle Muzzle-Brake Lateral Overpressure Vent Plumes (Port & Starboard)
-    const baffleCount = particles.length > 105 ? 6 : 10;
+    // 2. Twin-Baffle Muzzle-Brake Lateral Overpressure Vent Plumes
+    const baffleCount = Math.max(2, Math.round((particles.length > 105 ? 4 : 8) * rateMult));
     for (let b = 0; b < baffleCount; b++) {
-        if (particles.length >= 175) break;
+        if (particles.length >= maxP) break;
         const sideSign = (b % 2 === 0) ? 1 : -1;
         const gMat = (b < 4) ? _thrusterMats.amberHot : _thrusterMats.amberFlame;
-        const gMesh = new THREE.Mesh(_muzzleFlashFlameGeo, gMat);
+        const gMesh = FX_POOL.acquireParticleMesh(_muzzleFlashFlameGeo, gMat);
         const gs = (0.72 + Math.random() * 0.48) * scaleMult;
         gMesh.scale.set(gs * 0.75, gs * 0.75, gs * 1.85);
-        gMesh.position.copy(muzzlePos).addScaledVector(right, sideSign * 0.18).addScaledVector(dir, -0.05);
-        scene.add(gMesh);
+        gMesh.position.set(
+            muzzlePos.x + right.x * (sideSign * 0.18) - dir.x * 0.05,
+            muzzlePos.y,
+            muzzlePos.z + right.z * (sideSign * 0.18) - dir.z * 0.05
+        );
 
         const latSpeed = (6.8 + Math.random() * 5.2) * scaleMult;
-        const gVel = right.clone().multiplyScalar(sideSign * latSpeed)
-            .addScaledVector(dir, (Math.random() - 0.25) * 2.4);
-        gVel.y += 0.35 + Math.random() * 1.1;
+        const fwdDrift = (Math.random() - 0.25) * 2.4;
+        const gVel = FX_POOL.acquireVec3(
+            right.x * sideSign * latSpeed + dir.x * fwdDrift,
+            0.35 + Math.random() * 1.1,
+            right.z * sideSign * latSpeed + dir.z * fwdDrift
+        );
         gMesh.lookAt(gMesh.position.x + gVel.x, gMesh.position.y + gVel.y, gMesh.position.z + gVel.z);
 
         const maxLife = 0.11 + Math.random() * 0.07;
@@ -8860,27 +10392,23 @@ function triggerTankMuzzleFlash(muzzlePos, targetPos = null, isSiegeArtillery = 
         });
     }
 
-    // 3. Expanding Volumetric Bore Smoke Ring & Incandescent Ballistic Embers
-    if (typeof spawnSimulatedSmokePuff === 'function') {
-        const smokePos = muzzlePos.clone().addScaledVector(dir, 0.35 * scaleMult);
-        spawnSimulatedSmokePuff(smokePos, new THREE.Vector3(dir.x * 2.6, 0.9, dir.z * 2.6), 0.38 * scaleMult, 0.55);
-    }
-
-    const spkCount = particles.length > 100 ? 6 : (isSiegeArtillery ? 12 : 8);
+    // 3. Incandescent Ballistic Embers
+    const spkCount = Math.max(3, Math.round((particles.length > 100 ? 5 : (isSiegeArtillery ? 10 : 6)) * rateMult));
     for (let s = 0; s < spkCount; s++) {
-        if (particles.length >= 180) break;
-        const sp = new THREE.Mesh(
+        if (particles.length >= maxP) break;
+        const sp = FX_POOL.acquireParticleMesh(
             SHARED_FX_GEO.weldSpark,
             (isSiegeArtillery && s % 2 === 0) ? _thrusterMats.cyanHot : _thrusterMats.amberHot
         );
         const spScale = (0.75 + Math.random() * 0.45) * scaleMult;
         sp.scale.set(spScale * 0.55, spScale * 0.55, spScale * 2.15);
         sp.position.copy(muzzlePos);
-        scene.add(sp);
-        const vel = dir.clone().multiplyScalar((12.5 + Math.random() * 9.5) * scaleMult);
-        vel.x += (Math.random() - 0.5) * 4.2;
-        vel.y += 1.5 + Math.random() * 3.0;
-        vel.z += (Math.random() - 0.5) * 4.2;
+        const spd = (12.5 + Math.random() * 9.5) * scaleMult;
+        const vel = FX_POOL.acquireVec3(
+            dir.x * spd + (Math.random() - 0.5) * 4.2,
+            1.5 + Math.random() * 3.0,
+            dir.z * spd + (Math.random() - 0.5) * 4.2
+        );
         particles.push({
             mesh: sp,
             vel,
@@ -8985,37 +10513,39 @@ function spawnGoreExplosion(pos, isBig = false, isVolatile = false, isBug = true
         if (window.SFX) window.SFX.playExplosion(false);
     }
 
-    const sacCount = isBig ? 10 : 5;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 8.0)) return;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 145;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+    const sacCount = Math.max(2, Math.round((isBig ? 10 : 5) * rateMult));
     for (let i = 0; i < sacCount; i++) {
-        if (particles.length >= 145) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
         const isSac = i % 3 === 0;
         const mat = isVolatile
             ? (i % 2 === 0 ? MAT.volatileGlow : MAT.xenoIchorGreen)
             : (i % 3 === 0 ? MAT.xenoIchorGreen : (i % 3 === 1 ? MAT.xenoIchorViolet : MAT.chitinArmor));
         const geo = isSac ? SHARED_FX_GEO.xenoSac : SHARED_FX_GEO.goreChunk;
-        const chunk = new THREE.Mesh(geo, mat);
+        const chunk = FX_POOL.acquireParticleMesh(geo, mat);
         chunk.scale.set(
             0.55 + Math.random() * 0.55,
             isSac ? (0.85 + Math.random() * 0.4) : (0.45 + Math.random() * 0.4),
             0.55 + Math.random() * 0.55
         );
-        chunk.position.copy(pos).add(new THREE.Vector3((Math.random() - 0.5) * 0.3, 0.35, (Math.random() - 0.5) * 0.3));
-        scene.add(chunk);
+        chunk.position.set(pos.x + (Math.random() - 0.5) * 0.3, pos.y + 0.35, pos.z + (Math.random() - 0.5) * 0.3);
 
         const ang = Math.random() * Math.PI * 2;
         const spd = (isBig ? 4.8 : 3.2) + Math.random() * 3.5;
         particles.push({
             mesh: chunk,
-            vel: new THREE.Vector3(Math.cos(ang) * spd, 2.2 + Math.random() * 4.2, Math.sin(ang) * spd),
+            vel: FX_POOL.acquireVec3(Math.cos(ang) * spd, 2.2 + Math.random() * 4.2, Math.sin(ang) * spd),
             gravity: 16.0,
             life: 0.45 + Math.random() * 0.25
         });
     }
 
-    // Subtle 3D viscoelastic goo splash on ground
     const hy = getTerrainHeight(pos.x, pos.z);
     if (hy > -1.0) {
         const decal = spawnDynamicLiquidGoreDecal(
@@ -9029,10 +10559,9 @@ function spawnGoreExplosion(pos, isBig = false, isVolatile = false, isBug = true
 }
 
 // --- ORGANIC 3D VISCOELASTIC GOO & ACID DROPLET SPLASH FX FOR ENEMY PROJECTILES ---
-// Replaces flat white expanding square block decals/shockwaves on enemy projectile impacts
-// with 3D viscoelastic slime/goo globules, splashing bio-jelly droplets, and organic ground puddles!
 function spawnEnemyGooSplashFX(pos, wType = 'spitter') {
     if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 8.0)) return;
     const hy = getTerrainHeight(pos.x, pos.z);
     const baseY = Math.max(hy + 0.08, pos.y);
     const isHeavy = (wType === 'behemoth' || wType === 'gorgon');
@@ -9048,12 +10577,15 @@ function spawnEnemyGooSplashFX(pos, wType = 'spitter') {
         ? (jellyMats ? jellyMats.violetOuter : MAT.hiveVeinGlow)
         : (jellyMats ? jellyMats.acidOuter : MAT.xenoIchorGreen);
 
-    // 1. Burst 10–18 3D Viscoelastic Goo Globules & Stretched Slime Droplets in parabolic arcs
-    const dropCount = particles.length > 90 ? 7 : (isHeavy ? 16 : 10);
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 165;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+    const baseCount = particles.length > 90 ? 6 : (isHeavy ? 14 : 9);
+    const dropCount = Math.max(3, Math.round(baseCount * rateMult));
     for (let i = 0; i < dropCount; i++) {
-        if (particles.length >= 165) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            if (old && old.mesh) scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
         const variantIdx = (i % 4) + 1;
         const gooGeo = createProceduralViscoelasticGooGeo(
@@ -9062,7 +10594,7 @@ function spawnEnemyGooSplashFX(pos, wType = 'spitter') {
             isHeavy ? 0.22 : 0.16,
             variantIdx
         );
-        const droplet = new THREE.Mesh(gooGeo, (i % 3 === 0) ? secondaryMat : primaryMat);
+        const droplet = FX_POOL.acquireParticleMesh(gooGeo, (i % 3 === 0) ? secondaryMat : primaryMat);
         const s = (isHeavy ? 0.85 : 0.62) + Math.random() * 0.55;
         droplet.scale.set(s * 0.85, s * 0.85, s * 1.45);
         droplet.position.set(
@@ -9070,12 +10602,11 @@ function spawnEnemyGooSplashFX(pos, wType = 'spitter') {
             baseY + 0.18 + Math.random() * 0.25,
             pos.z + (Math.random() - 0.5) * 0.35
         );
-        scene.add(droplet);
 
         const ang = (i / dropCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.45;
         const horizSpd = (isHeavy ? 3.4 : 2.2) + Math.random() * (isHeavy ? 4.2 : 2.8);
         const upSpd = (isHeavy ? 3.2 : 2.1) + Math.random() * (isHeavy ? 3.6 : 2.4);
-        const vel = new THREE.Vector3(Math.cos(ang) * horizSpd, upSpd, Math.sin(ang) * horizSpd);
+        const vel = FX_POOL.acquireVec3(Math.cos(ang) * horizSpd, upSpd, Math.sin(ang) * horizSpd);
         droplet.lookAt(droplet.position.x + vel.x, droplet.position.y + vel.y, droplet.position.z + vel.z);
 
         particles.push({
@@ -9089,7 +10620,6 @@ function spawnEnemyGooSplashFX(pos, wType = 'spitter') {
         });
     }
 
-    // 2. Organic 3D Viscoelastic Slime Puddle on Ground (Zero flat planes!)
     if (hy > -1.0) {
         const puddle = spawnDynamicLiquidGoreDecal(
             pos,
@@ -9343,6 +10873,7 @@ function updateBombCraters(dt) {
 // 3D Particle System Radial Blast Wave & Psionic/Energy Burst Engine (ZERO flat PlaneGeometry squares!)
 function spawnParticleBlastWaveFX(pos, colorHex = 0x38bdf8, radiusScale = 1.0, particleCount = 14) {
     if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 9.0)) return;
     const hy = getTerrainHeight(pos.x, pos.z);
     const baseY = Math.max(hy + 0.14, pos.y + 0.12);
     const isGoldOrAmber = (colorHex === 0xf5b932 || colorHex === 0xffaa00 || colorHex === 0xffb700);
@@ -9359,15 +10890,19 @@ function spawnParticleBlastWaveFX(pos, colorHex = 0x38bdf8, radiusScale = 1.0, p
         ? (MAT.solarisPrismGlow || MAT.cyanGlow)
         : (isCrimson ? MAT.amberGlow : MAT.cyanGlow);
 
-    const count = particles.length > 105 ? Math.max(6, Math.floor(particleCount * 0.55)) : particleCount;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 175;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+    const rawCount = particles.length > 95 ? Math.max(4, Math.floor(particleCount * 0.5)) : particleCount;
+    const count = Math.max(3, Math.round(rawCount * rateMult));
     for (let i = 0; i < count; i++) {
-        if (particles.length >= 175) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            if (old && old.mesh) scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
         const isStreak = (i % 2 === 0);
         const geo = isStreak ? SHARED_FX_GEO.weldSpark : SHARED_FX_GEO.bloodDrop;
-        const pMesh = new THREE.Mesh(geo, (i % 3 === 0) ? secondaryMat : primaryMat);
+        const pMesh = FX_POOL.acquireParticleMesh(geo, (i % 3 === 0) ? secondaryMat : primaryMat);
         const s = (0.62 + Math.random() * 0.52) * Math.sqrt(radiusScale);
         if (isStreak) {
             pMesh.scale.set(s * 0.65, s * 0.65, s * 2.15);
@@ -9385,9 +10920,8 @@ function spawnParticleBlastWaveFX(pos, colorHex = 0x38bdf8, radiusScale = 1.0, p
 
         const horizSpd = (4.8 + Math.random() * 6.4) * radiusScale;
         const upSpd = (1.2 + Math.random() * 3.4) * Math.sqrt(radiusScale);
-        const vel = new THREE.Vector3(Math.cos(ang) * horizSpd, upSpd, Math.sin(ang) * horizSpd);
+        const vel = FX_POOL.acquireVec3(Math.cos(ang) * horizSpd, upSpd, Math.sin(ang) * horizSpd);
         pMesh.lookAt(pMesh.position.x + vel.x, pMesh.position.y + vel.y, pMesh.position.z + vel.z);
-        scene.add(pMesh);
 
         particles.push({
             mesh: pMesh,
@@ -9403,30 +10937,33 @@ window.spawnParticleBlastWaveFX = spawnParticleBlastWaveFX;
 
 function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.5, hueMode = 0.0, plumeCount = 8, sparkCount = 12) {
     if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 12.0)) return;
     const hy = getTerrainHeight(pos.x, pos.z);
     const baseY = Math.max(hy, pos.y);
 
-    // 1. 3D Radial Particle Pressure Burst (Replaces flat square shockRing PlaneGeometry!)
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxSm = perf ? perf.maxSmokeClouds : 48;
+    const maxP = perf ? perf.maxParticles : 165;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+
+    // 1. 3D Radial Particle Pressure Burst
     const burstColor = hueMode > 1.5 ? 0x84cc16 : (hueMode > 0.5 ? 0x38bdf8 : 0xffaa00);
     spawnParticleBlastWaveFX(pos, burstColor, radiusScale * 0.92, Math.min(14, Math.max(6, sparkCount)));
 
-    // 2. Multi-Layered Turbulent Combustion Plumes (Adaptive count during heavy multi-unit firefights)
-    const effectivePlumes = smokeClouds.length > 26 ? Math.min(3, plumeCount) : Math.min(6, plumeCount);
+    // 2. Multi-Layered Turbulent Combustion Plumes
+    const basePlumes = smokeClouds.length > 22 ? Math.min(3, plumeCount) : Math.min(6, plumeCount);
+    const effectivePlumes = Math.max(2, Math.round(basePlumes * rateMult));
     for (let i = 0; i < effectivePlumes; i++) {
-        if (smokeClouds.length >= 48) {
+        if (smokeClouds.length >= maxSm) {
             const old = smokeClouds.shift();
-            if (old && old.mesh) {
-                scene.remove(old.mesh);
-                if (old.ownsMaterial && old.mesh.material) old.mesh.material.dispose();
-            }
+            FX_POOL.releaseSmokeEntry(old);
         }
         const layerFrac = i / Math.max(1, effectivePlumes - 1);
         const isCoreFlash = i < 2;
         const isUpperCrown = i >= Math.floor(effectivePlumes * 0.55);
 
         const plumeMat = isCoreFlash ? SHARED_FX_MAT.smokeFire : SHARED_FX_MAT.smokeDark;
-
-        const plumeMesh = new THREE.Mesh(SHARED_FX_GEO.smoke, plumeMat);
+        const plumeMesh = FX_POOL.acquireSmokeMesh(SHARED_FX_GEO.smoke, plumeMat);
         const ang = (i / effectivePlumes) * Math.PI * 2 + (Math.random() - 0.5) * 0.45;
         const radialDist = isCoreFlash
             ? (Math.random() * 0.22 * radiusScale)
@@ -9439,7 +10976,6 @@ function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.
             baseY + (isCoreFlash ? 0.42 : (isUpperCrown ? 0.78 + layerFrac * 0.55 : 0.28 + layerFrac * 0.35)) * radiusScale,
             pos.z + Math.sin(ang) * radialDist
         );
-        scene.add(plumeMesh);
 
         const horizSpeed = (isCoreFlash ? 0.8 : (isUpperCrown ? 2.4 : 3.2)) * radiusScale * (0.75 + Math.random() * 0.5);
         const vertSpeed = (isCoreFlash ? 1.8 : (isUpperCrown ? 3.8 : 1.6)) * radiusScale * (0.8 + Math.random() * 0.45);
@@ -9449,7 +10985,7 @@ function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.
 
         smokeClouds.push({
             mesh: plumeMesh,
-            vel: new THREE.Vector3(
+            vel: FX_POOL.acquireVec3(
                 Math.cos(ang) * horizSpeed,
                 vertSpeed,
                 Math.sin(ang) * horizSpeed
@@ -9465,17 +11001,18 @@ function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.
     }
 
     // 3. Ballistic Incandescent Spark Streaks & Molten Shrapnel Embers
-    const effectiveSparks = particles.length > 55 ? Math.min(4, sparkCount) : Math.min(8, sparkCount);
+    const baseSparks = particles.length > 55 ? Math.min(4, sparkCount) : Math.min(8, sparkCount);
+    const effectiveSparks = Math.max(2, Math.round(baseSparks * rateMult));
     for (let i = 0; i < effectiveSparks; i++) {
-        if (particles.length >= 96) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            if (old && old.mesh) scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
         const isStreak = i % 3 !== 0;
         const sparkMat = hueMode > 0.5
             ? (i % 2 === 0 ? MAT.cyanGlow : MAT.solarisPrismGlow)
             : (i % 3 === 0 ? MAT.volatileGlow : (i % 3 === 1 ? MAT.amberGlow : MAT.charredSteel));
-        const p = new THREE.Mesh(
+        const p = FX_POOL.acquireParticleMesh(
             isStreak ? SHARED_FX_GEO.weldSpark : SHARED_FX_GEO.shrapnel,
             sparkMat
         );
@@ -9490,13 +11027,12 @@ function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.
             baseY + 0.32 * radiusScale,
             pos.z + (Math.random() - 0.5) * 0.45 * radiusScale
         );
-        scene.add(p);
 
         const ejectAng = (i / effectiveSparks) * Math.PI * 2 + (Math.random() - 0.5) * 0.42;
         const ejectSpd = (6.2 + Math.random() * 10.5) * Math.sqrt(radiusScale);
         particles.push({
             mesh: p,
-            vel: new THREE.Vector3(
+            vel: FX_POOL.acquireVec3(
                 Math.cos(ejectAng) * ejectSpd,
                 (4.2 + Math.random() * 8.5) * Math.sqrt(radiusScale),
                 Math.sin(ejectAng) * ejectSpd
@@ -9512,7 +11048,7 @@ function spawnSimulatedVolumetricExplosion(pos, radiusScale = 1.0, peakTemp = 1.
 window.spawnSimulatedVolumetricExplosion = spawnSimulatedVolumetricExplosion;
 
 function detonateArtilleryBomb(pos, leaveCrater = true) {
-    triggerMuzzleFlash(pos.clone().add(new THREE.Vector3(0, 1.35, 0)));
+    triggerMuzzleFlash(_emitterScratchVec.set(pos.x, pos.y + 1.35, pos.z));
     screenShake = Math.max(screenShake, 0.48);
     if (window.triggerHitstop) window.triggerHitstop(0.04);
     if (window.SFX) window.SFX.playExplosion(true);
@@ -9528,23 +11064,28 @@ function detonateArtilleryBomb(pos, leaveCrater = true) {
 
 // Firebat Twin Perdition Flamethrower Cone Stream FX (Turbulent Fluid Combustion Stream)
 function triggerFirebatFlameStreamFX(muzzlePos, targetPos) {
-    const dir = new THREE.Vector3().subVectors(targetPos, muzzlePos);
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(muzzlePos.x, muzzlePos.y || 0, muzzlePos.z, 8.0)) return;
+    const dir = _emitterScratchVec.subVectors(targetPos, muzzlePos);
     const dist = Math.max(0.8, Math.min(5.2, dir.length()));
     dir.normalize();
-    const count = smokeClouds.length > 26 ? 2 : 3;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxSm = perf ? perf.maxSmokeClouds : 46;
+    const count = (smokeClouds.length > 22 || (perf && perf.tierIndex >= 2)) ? 1 : 2;
     for (let i = 0; i < count; i++) {
-        if (smokeClouds.length >= 46) break;
+        if (smokeClouds.length >= maxSm) break;
         const frac = (i + 1) / count;
         const plumeMat = i < 2 ? SHARED_FX_MAT.smokeFire : SHARED_FX_MAT.smokeDark;
-        const flameOrb = new THREE.Mesh(SHARED_FX_GEO.smoke, plumeMat);
+        const flameOrb = FX_POOL.acquireSmokeMesh(SHARED_FX_GEO.smoke, plumeMat);
         flameOrb.scale.setScalar(0.36 + frac * 0.62);
-        flameOrb.position.copy(muzzlePos).addScaledVector(dir, dist * frac * 0.85);
-        flameOrb.position.y += 0.15;
-        scene.add(flameOrb);
+        flameOrb.position.set(
+            muzzlePos.x + dir.x * (dist * frac * 0.85),
+            muzzlePos.y + dir.y * (dist * frac * 0.85) + 0.15,
+            muzzlePos.z + dir.z * (dist * frac * 0.85)
+        );
         const maxLife = 0.28 + Math.random() * 0.14;
         smokeClouds.push({
             mesh: flameOrb,
-            vel: new THREE.Vector3(
+            vel: FX_POOL.acquireVec3(
                 dir.x * 3.2 + (Math.random() - 0.5) * 1.1,
                 1.1 + Math.random() * 1.3,
                 dir.z * 3.2 + (Math.random() - 0.5) * 1.1
@@ -9563,13 +11104,18 @@ function triggerFirebatFlameStreamFX(muzzlePos, targetPos) {
 // Ballistic Impact Spark Burst Helper (Used by Marauder Concussive Shells & Ordnance Impacts)
 function triggerSparks(pos, count = 6) {
     if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 7.0)) return;
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 165;
+    const rateMult = perf ? perf.particleSpawnRateMult : 1.0;
+    const effCount = Math.max(2, Math.round(count * rateMult));
     const hy = getTerrainHeight(pos.x, pos.z);
-    for (let i = 0; i < count; i++) {
-        if (particles.length >= 165) {
+    for (let i = 0; i < effCount; i++) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            if (old && old.mesh) scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
-        const sp = new THREE.Mesh(
+        const sp = FX_POOL.acquireParticleMesh(
             i % 2 === 0 ? SHARED_FX_GEO.weldSpark : SHARED_FX_GEO.spark,
             i % 3 === 0 ? MAT.volatileGlow : MAT.amberGlow
         );
@@ -9580,12 +11126,11 @@ function triggerSparks(pos, count = 6) {
             Math.max(hy + 0.18, pos.y + 0.25),
             pos.z + (Math.random() - 0.5) * 0.35
         );
-        scene.add(sp);
-        const ang = (i / Math.max(1, count)) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+        const ang = (i / Math.max(1, effCount)) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
         const spd = 4.2 + Math.random() * 5.8;
         particles.push({
             mesh: sp,
-            vel: new THREE.Vector3(Math.cos(ang) * spd, 2.6 + Math.random() * 4.2, Math.sin(ang) * spd),
+            vel: FX_POOL.acquireVec3(Math.cos(ang) * spd, 2.6 + Math.random() * 4.2, Math.sin(ang) * spd),
             gravity: 17.5,
             drag: 1.5,
             isBallisticSpark: true,
@@ -9603,38 +11148,40 @@ function detonateMarauderConcussiveShell(pos) {
 
 // HQ Emergency Repair Overload Shockwave Bomb (Instant-kills surrounding enemies to prevent spawn-camping)
 function detonateHQOverloadBlast(pos) {
-    triggerMuzzleFlash(pos.clone().add(new THREE.Vector3(0, 2.2, 0)));
+    triggerMuzzleFlash(_emitterScratchVec.set(pos.x, pos.y + 2.2, pos.z));
     screenShake = Math.max(screenShake, 0.85);
     if (window.triggerHitstop) window.triggerHitstop(0.08);
     if (window.SFX) window.SFX.playExplosion(true);
     triggerWaterRippleFX(pos.x, pos.z, 2.2, true);
 
-    // Primary 3D EMP Particle Burst + Simulated Plasma-Thermal Combustion Plumes & EMP Sparks (Zero flat square planes!)
     spawnParticleBlastWaveFX(pos, 0x38bdf8, 1.85, 22);
     spawnSimulatedVolumetricExplosion(pos, 1.45, 1.65, 1.0, 14, 26);
 }
 
 // Distinct Structural Nano-Weld Spark FX (Used by Fixing Drone on damaged buildings)
 function spawnNanoWeldSparkFX(pos) {
+    if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 7.0)) return;
     const hy = getTerrainHeight(pos.x, pos.z);
     spawnParticleBlastWaveFX(pos, 0x38bdf8, 0.55, 8);
 
-    // Flying Cyan & Amber Arc-Welding Sparks
-    for (let i = 0; i < 6; i++) {
-        if (particles.length >= 140) {
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 140;
+    const count = Math.max(2, Math.round(6 * (perf ? perf.particleSpawnRateMult : 1.0)));
+    for (let i = 0; i < count; i++) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
-        const spark = new THREE.Mesh(SHARED_FX_GEO.weldSpark, i % 2 === 0 ? MAT.cyanGlow : MAT.amberGlow);
+        const spark = FX_POOL.acquireParticleMesh(SHARED_FX_GEO.weldSpark, i % 2 === 0 ? MAT.cyanGlow : MAT.amberGlow);
         spark.position.set(
             pos.x + (Math.random() - 0.5) * 1.4,
             Math.max(hy + 0.3, pos.y + 0.5 + Math.random() * 0.8),
             pos.z + (Math.random() - 0.5) * 1.4
         );
-        scene.add(spark);
         particles.push({
             mesh: spark,
-            vel: new THREE.Vector3((Math.random() - 0.5) * 5.5, 2.5 + Math.random() * 3.5, (Math.random() - 0.5) * 5.5),
+            vel: FX_POOL.acquireVec3((Math.random() - 0.5) * 5.5, 2.5 + Math.random() * 3.5, (Math.random() - 0.5) * 5.5),
             gravity: 16,
             life: 0.32 + Math.random() * 0.2
         });
@@ -9644,22 +11191,24 @@ function spawnNanoWeldSparkFX(pos) {
 // Distinct Caduceus Biological Cellular Regeneration FX (Used by Combat Medic on injured infantry)
 const medicNaniteGeo = createSculptedFacetedCrystalGeo(0.05, 0);
 function spawnMedicBioPulseFX(pos) {
-    // Rising 3D Emerald Bio-Nanite Particle Burst (Zero flat square planes!)
+    if (!pos) return;
+    if (typeof window.isWorldPosInViewport === 'function' && !window.isWorldPosInViewport(pos.x, pos.y || 0, pos.z, 7.0)) return;
     spawnParticleBlastWaveFX(pos, 0x00ff88, 0.52, 8);
 
-    // Rising Restorative Nano-Sparkles (negative gravity so they float upward around the healed soldier)
-    for (let i = 0; i < 5; i++) {
-        if (particles.length >= 140) {
+    const perf = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const maxP = perf ? perf.maxParticles : 140;
+    const count = Math.max(2, Math.round(5 * (perf ? perf.particleSpawnRateMult : 1.0)));
+    for (let i = 0; i < count; i++) {
+        if (particles.length >= maxP) {
             const old = particles.shift();
-            scene.remove(old.mesh);
+            FX_POOL.releaseParticleEntry(old);
         }
-        const a = (i / 5) * Math.PI * 2 + Math.random();
-        const orb = new THREE.Mesh(medicNaniteGeo, i % 2 === 0 ? MAT.healGlow : MAT.cyanGlow);
+        const a = (i / count) * Math.PI * 2 + Math.random();
+        const orb = FX_POOL.acquireParticleMesh(medicNaniteGeo, i % 2 === 0 ? MAT.healGlow : MAT.cyanGlow);
         orb.position.set(pos.x + Math.cos(a) * 0.42, pos.y + 0.35, pos.z + Math.sin(a) * 0.42);
-        scene.add(orb);
         particles.push({
             mesh: orb,
-            vel: new THREE.Vector3((Math.random() - 0.5) * 0.5, 2.0 + Math.random() * 1.4, (Math.random() - 0.5) * 0.5),
+            vel: FX_POOL.acquireVec3((Math.random() - 0.5) * 0.5, 2.0 + Math.random() * 1.4, (Math.random() - 0.5) * 0.5),
             gravity: -1.8,
             life: 0.52 + Math.random() * 0.25
         });
@@ -9667,7 +11216,6 @@ function spawnMedicBioPulseFX(pos) {
 }
 
 // 3D Forcefield Energy Shield Dome Mesh for Turret 'shield' Generator
-// Crystal-clear see-through interior so buildings & units inside are 100% visible, with 3D hit ripple animation!
 function createTurretShieldDomeMesh(radius = 9.5) {
     const group = new THREE.Group();
     const domeGeo = createSculptedArmorDomeGeo(radius, 40, 24, 0, Math.PI * 2, 0, Math.PI * 0.52);
@@ -9692,7 +11240,6 @@ function createTurretShieldDomeMesh(radius = 9.5) {
     baseRing.position.y = 0.14;
     group.add(dome, wire, baseRing);
     group.userData = { dome, wire, baseRing, radius, isShieldDome: true };
-    // Disable raycasting on the shield dome so it NEVER blocks clicking/tapping buildings inside or behind the shield!
     group.traverse(c => { c.raycast = () => {}; });
     return group;
 }
@@ -9700,12 +11247,12 @@ function createTurretShieldDomeMesh(radius = 9.5) {
 // Triggers a 3D concentric energy ripple across the Force Shield Dome when hit by enemy fire!
 function triggerShieldHitRippleFX(hitWorldPos, domeCenterPos = null, domeRadius = 9.5) {
     if (!hitWorldPos) return;
-    let impactPos = hitWorldPos.clone();
+    let impactPos = _emitterScratchVec.copy(hitWorldPos);
     if (domeCenterPos) {
-        const dir = impactPos.clone().sub(domeCenterPos);
+        const dir = _emitterRightVec.copy(impactPos).sub(domeCenterPos);
         if (dir.lengthSq() > 0.01) {
             dir.normalize();
-            impactPos = domeCenterPos.clone().addScaledVector(dir, domeRadius * 0.96);
+            impactPos.copy(domeCenterPos).addScaledVector(dir, domeRadius * 0.96);
             impactPos.y = Math.max(domeCenterPos.y + 0.8, impactPos.y);
         }
     }
@@ -9713,21 +11260,11 @@ function triggerShieldHitRippleFX(hitWorldPos, domeCenterPos = null, domeRadius 
         window.pushShieldHitRipple(impactPos.x, impactPos.y, impactPos.z, 1.35);
     }
 
-    // Spawn a tangent 3D expanding energy ripple ring on the shield dome surface
-    const rippleMat = new THREE.MeshBasicMaterial({
-        color: 0x7dd3fc,
-        side: THREE.DoubleSide,
-        transparent: true,
-        opacity: 0.92,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false
-    });
-    const rippleMesh = new THREE.Mesh(SHARED_FX_GEO.waterRippleRing, rippleMat);
+    const rippleMesh = FX_POOL.acquireShockwaveMesh(SHARED_FX_GEO.waterRippleRing, 'cyan');
     rippleMesh.position.copy(impactPos);
     if (domeCenterPos) {
         rippleMesh.lookAt(domeCenterPos);
     }
-    scene.add(rippleMesh);
     shockwaves.push({ mesh: rippleMesh, scale: 0.35, speed: 6.2, alpha: 0.95, isOriented: true });
 }
 

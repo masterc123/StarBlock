@@ -186,6 +186,7 @@ window.getBaseZoneRampMetrics = getBaseZoneRampMetrics;
 const RIVER_HALF_WIDTH = 3.35;
 const RIVER_WATER_Y = -0.20;
 const RIVER_BRIDGES = [];
+window.RIVER_BRIDGES = RIVER_BRIDGES;
 
 const BRIDGES = [];
 window.BRIDGES = BRIDGES;
@@ -198,6 +199,11 @@ const DYNAMIC_CRATERS = [];
 const DYNAMIC_RAVINES = [];
 const DYNAMIC_BOMB_CRATERS = [];
 const FLATTENED_BUILDING_PADS = [];
+
+// O(1) Spatial Road Lookup & Longitudinal Elevation Caches (261x261 at 1.0m grid resolution)
+const ROAD_FACTOR_CACHE = new Float32Array(HEIGHT_CACHE_DIM * HEIGHT_CACHE_DIM);
+const ROAD_ELEVATION_CACHE = new Float32Array(HEIGHT_CACHE_DIM * HEIGHT_CACHE_DIM);
+let _roadSpatialCacheReady = false;
 
 // Evaluates the organic, non-circular radius of a dynamic oasis pond at a given world angle
 function getDynamicPondRadiusAtAngle(pd, ang) {
@@ -227,6 +233,22 @@ function getRiverTangentSlopeAtS(s) {
         - Math.sin(s * RIVER_FREQ_2 + MAP_SEED * 0.15) * RIVER_FREQ_2 * RIVER_AMP_2;
 }
 
+// Computes natural variable river half-width at coordinate s:
+// Widens organically in floodplain meanders (up to ~4.45m) and narrows cleanly to RIVER_HALF_WIDTH (3.35m) at bridge crossings!
+function getRiverHalfWidthAtS(s) {
+    let bridgePinch = 1.0;
+    for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+        const dS = Math.abs(s - RIVER_BRIDGES[i].sCoord);
+        if (dS < 11.0) {
+            const t = dS / 11.0;
+            bridgePinch = Math.min(bridgePinch, t * t * (3.0 - 2.0 * t));
+        }
+    }
+    const meanderSwell = 0.42 + 0.36 * Math.sin(s * 0.052 + MAP_SEED * 0.41) + 0.22 * Math.cos(s * 0.105 - MAP_SEED * 0.23);
+    return RIVER_HALF_WIDTH + Math.max(0.0, meanderSwell) * bridgePinch;
+}
+window.getRiverHalfWidthAtS = getRiverHalfWidthAtS;
+
 let RIVER_ANGLE = Math.PI * 0.25;
 let RIVER_COS = 0.70710678;
 let RIVER_SIN = 0.70710678;
@@ -236,7 +258,8 @@ function getRiverCoords(x, z) {
     const s = x * RIVER_COS - z * RIVER_SIN;
     const u = x * RIVER_SIN + z * RIVER_COS;
     const centerU = getRiverCenterUAtS(s);
-    return { s, u, centerU, dist: Math.abs(u - centerU), signedDist: u - centerU };
+    const halfWidth = getRiverHalfWidthAtS(s);
+    return { s, u, centerU, halfWidth, dist: Math.abs(u - centerU), signedDist: u - centerU };
 }
 
 function riverCoordsToWorld(s, u) {
@@ -246,6 +269,34 @@ function riverCoordsToWorld(s, u) {
     };
 }
 
+// Unified Orthonormal Bridge Coordinate Frame (Shared by 3D bridge mesh, approach ramps, roads, height queries & unit collisions!)
+function getBridgeLocalCoords(rb, x, z) {
+    if (!rb || rb.centerX === undefined) {
+        const rc = getRiverCoords(x, z);
+        const bCenterU = getRiverCenterUAtS(rb ? rb.sCoord : 0);
+        return { localS: rc.s - (rb ? rb.sCoord : 0), localU: rc.u - bCenterU };
+    }
+    const dx = x - rb.centerX;
+    const dz = z - rb.centerZ;
+    return {
+        localS: dx * rb.cosYaw - dz * rb.sinYaw,
+        localU: dx * rb.sinYaw + dz * rb.cosYaw
+    };
+}
+
+function bridgeLocalToWorld(rb, localS, localU) {
+    if (!rb || rb.centerX === undefined) {
+        const s0 = rb ? rb.sCoord : 0;
+        return riverCoordsToWorld(s0 + localS, getRiverCenterUAtS(s0) + localU);
+    }
+    return {
+        x: rb.centerX + localS * rb.cosYaw + localU * rb.sinYaw,
+        z: rb.centerZ - localS * rb.sinYaw + localU * rb.cosYaw
+    };
+}
+window.getBridgeLocalCoords = getBridgeLocalCoords;
+window.bridgeLocalToWorld = bridgeLocalToWorld;
+
 function getRiverDist(x, z) {
     if (!HAS_VALLEY_RIVER) return 999.0;
     return getRiverCoords(x, z).dist;
@@ -254,7 +305,8 @@ function getRiverDist(x, z) {
 function isPointInValleyRiver(x, z, extraRadius = 0.5) {
     if (!HAS_VALLEY_RIVER) return false;
     if (isOnRiverBridge(x, z)) return false;
-    return getRiverDist(x, z) <= RIVER_HALF_WIDTH + extraRadius;
+    const rc = getRiverCoords(x, z);
+    return rc.dist <= (rc.halfWidth || RIVER_HALF_WIDTH) + extraRadius;
 }
 window.isPointInValleyRiver = isPointInValleyRiver;
 
@@ -289,14 +341,15 @@ function getRavineSignedDist(x, z) {
 }
 
 function getRiverBridgeFactor(x, z) {
-    const rc = getRiverCoords(x, z);
     let bestFactor = 0.0;
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        const dU = Math.abs(rc.u - bCenterU);
-        if (dU > RIVER_HALF_WIDTH + 3.6) continue;
-        const dS = Math.abs(rc.s - br.sCoord);
+        if (br.destroyed) continue;
+        const bc = getBridgeLocalCoords(br, x, z);
+        const dU = Math.abs(bc.localU);
+        const reachU = (br.rampReachU || (RIVER_HALF_WIDTH + 3.65));
+        if (dU > reachU) continue;
+        const dS = Math.abs(bc.localS);
         const deckHalfW = br.halfWidth - 0.15;
         if (dS <= deckHalfW) {
             bestFactor = Math.max(bestFactor, 1.0);
@@ -308,14 +361,15 @@ function getRiverBridgeFactor(x, z) {
 }
 
 function isOnRiverBridge(x, z, unitRad = 0.0) {
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        const dU = Math.abs(rc.u - bCenterU);
-        if (dU <= RIVER_HALF_WIDTH + 3.6) {
+        if (br.destroyed) continue;
+        const bc = getBridgeLocalCoords(br, x, z);
+        const dU = Math.abs(bc.localU);
+        const reachU = (br.rampReachU || (RIVER_HALF_WIDTH + 3.65));
+        if (dU <= reachU) {
             const safeHalfW = br.halfWidth - 0.45 - Math.min(0.28, unitRad * 0.35);
-            if (Math.abs(rc.s - br.sCoord) <= safeHalfW) {
+            if (Math.abs(bc.localS) <= safeHalfW) {
                 return true;
             }
         }
@@ -325,12 +379,12 @@ function isOnRiverBridge(x, z, unitRad = 0.0) {
 window.isOnRiverBridge = isOnRiverBridge;
 
 function isPointInBridgeApproachCorridor(x, z, extraWidth = 3.2, inlandReach = 12.5) {
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        if (Math.abs(rc.u - bCenterU) <= RIVER_HALF_WIDTH + inlandReach &&
-            Math.abs(rc.s - br.sCoord) <= br.halfWidth + extraWidth) {
+        const bc = getBridgeLocalCoords(br, x, z);
+        const effRiverHalfW = br.riverHalfW || RIVER_HALF_WIDTH;
+        if (Math.abs(bc.localU) <= effRiverHalfW + inlandReach &&
+            Math.abs(bc.localS) <= br.halfWidth + extraWidth) {
             return true;
         }
     }
@@ -346,33 +400,34 @@ function rebuildBridgeNavAndExclusionZones() {
     RIVER_BRIDGES.forEach((rb, bIdx) => {
         const s0 = rb.sCoord;
         const centerU = getRiverCenterUAtS(s0);
-        // Side guardrails run along the deck span
-        const railSpanHalfU = RIVER_HALF_WIDTH + 0.95;
+        const effRiverHalfW = rb.riverHalfW || RIVER_HALF_WIDTH;
+        const railSpanHalfU = rb.flatHalfSpan || (effRiverHalfW + 1.05);
         const railOffsetS = rb.halfWidth * 0.98;
+        const rampToeDist = rb.rampReachU || (effRiverHalfW + 3.65);
 
-        // 1. Building Collision Exclusion Zone (OBB around bridge deck + compact approach ramp plazas)
-        const southRampToe = riverCoordsToWorld(s0, centerU + (RIVER_HALF_WIDTH + 3.1));
-        const northRampToe = riverCoordsToWorld(s0, centerU - (RIVER_HALF_WIDTH + 3.1));
+        // 1. Building Collision Exclusion Zone (OBB around bridge deck + approach ramp plazas)
+        const southRampToe = bridgeLocalToWorld(rb, 0, rampToeDist);
+        const northRampToe = bridgeLocalToWorld(rb, 0, -rampToeDist);
         BRIDGE_BUILDING_EXCLUSION_ZONES.push({
             bridgeIdx: bIdx,
             sCoord: s0,
             centerU,
             deckHalfS: rb.halfWidth + 0.65,
-            spanHalfU: RIVER_HALF_WIDTH + 3.5,
+            spanHalfU: rampToeDist + 0.4,
             southPlaza: { x: southRampToe.x, z: southRampToe.z, r: 3.6 },
             northPlaza: { x: northRampToe.x, z: northRampToe.z, r: 3.6 }
         });
 
         // 2. Non-Walkable 'No-Go' Zones strictly along the outer Bridge Side Guardrails
         [-1, 1].forEach(sideSign => {
-            const barrierS = s0 + sideSign * railOffsetS;
+            const localRailS = sideSign * railOffsetS;
             for (let uStep = -railSpanHalfU; uStep <= railSpanHalfU; uStep += 1.05) {
-                const wPt = riverCoordsToWorld(barrierS, centerU + uStep);
+                const wPt = bridgeLocalToWorld(rb, localRailS, uStep);
                 BRIDGE_BARRIER_NO_GO_ZONES.push({
                     x: wPt.x,
                     z: wPt.z,
                     r: 0.26,
-                    sCoord: barrierS,
+                    sCoord: s0 + localRailS,
                     sideSign,
                     bridgeIdx: bIdx
                 });
@@ -385,12 +440,12 @@ window.BRIDGE_BUILDING_EXCLUSION_ZONES = BRIDGE_BUILDING_EXCLUSION_ZONES;
 
 // Checks if a point over the bridge deck or ramp shoulder clips into the side guardrails
 function isPointInBridgeBarrierNoGoZone(x, z, unitRad = 0.0) {
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        if (Math.abs(rc.u - bCenterU) > RIVER_HALF_WIDTH + 1.15) continue;
-        const dS = Math.abs(rc.s - br.sCoord);
+        const bc = getBridgeLocalCoords(br, x, z);
+        const spanHalfU = (br.flatHalfSpan || (RIVER_HALF_WIDTH + 1.05)) + 0.20;
+        if (Math.abs(bc.localU) > spanHalfU) continue;
+        const dS = Math.abs(bc.localS);
         const innerWalkwayLimit = br.halfWidth - 0.45 - Math.min(0.28, unitRad * 0.35);
         const outerBarrierLimit = br.halfWidth + 0.55 + Math.min(0.28, unitRad * 0.35);
         if (dS > innerWalkwayLimit && dS < outerBarrierLimit) {
@@ -402,9 +457,10 @@ function isPointInBridgeBarrierNoGoZone(x, z, unitRad = 0.0) {
 window.isPointInBridgeBarrierNoGoZone = isPointInBridgeBarrierNoGoZone;
 
 function generateProceduralTopographyParameters(customSeed) {
-    // Always compute a brand-new procedural seed that ignores previous cached state and never repeats the prior seed!
+    // Honor any explicitly provided numeric customSeed deterministically (critical for seed replay & multiplayer sync!).
+    // Only generate a new non-repeating random seed when customSeed is omitted/undefined.
     const prevSeed = MAP_SEED;
-    if (typeof customSeed === 'number' && Number.isFinite(customSeed) && Math.floor(customSeed) !== prevSeed) {
+    if (typeof customSeed === 'number' && Number.isFinite(customSeed)) {
         MAP_SEED = Math.max(1, Math.floor(customSeed));
     } else {
         let candidate = Math.floor(100000 + Math.random() * 899999);
@@ -417,12 +473,12 @@ function generateProceduralTopographyParameters(customSeed) {
 
     // Select a distinct procedural map archetype from the seed so layouts never look identical!
     const archetypes = [
-        'open_badlands',
-        'canyon_crossfire',
         'river_bridges',
+        'canyon_crossfire',
+        'open_badlands',
+        'fortified_plateau',
         'crater_basin',
-        'tectonic_ravines',
-        'fortified_plateau'
+        'tectonic_ravines'
     ];
     const archIdx = Math.floor(seededRandom() * archetypes.length);
     MAP_ARCHETYPE = archetypes[archIdx];
@@ -432,21 +488,29 @@ function generateProceduralTopographyParameters(customSeed) {
     RAVINE_CURVE_AMP = 3.5 + seededRandom() * 4.2;
     RAVINE_CURVE_FREQ = 0.036 + seededRandom() * 0.030;
     RAVINE_PHASE = seededRandom() * Math.PI * 2;
-    RIVER_BASE_OFFSET_U = -6.0 + (seededRandom() - 0.5) * 8.5;
-    RIVER_WAVE_AMP = 3.2 + seededRandom() * 2.8;
-    RIVER_FREQ_1 = 0.040 + seededRandom() * 0.025;
-    RIVER_FREQ_2 = 0.085 + seededRandom() * 0.042;
-    RIVER_AMP_2 = 1.15 + seededRandom() * 1.25;
+    RIVER_BASE_OFFSET_U = -5.0 + (seededRandom() - 0.5) * 7.5;
+    RIVER_WAVE_AMP = 2.8 + seededRandom() * 2.4;
+    RIVER_FREQ_1 = 0.038 + seededRandom() * 0.022;
+    RIVER_FREQ_2 = 0.080 + seededRandom() * 0.036;
+    RIVER_AMP_2 = 0.95 + seededRandom() * 1.05;
     HILL_FREQ_1 = 0.026 + seededRandom() * 0.026;
     HILL_FREQ_2 = 0.014 + seededRandom() * 0.018;
     const isRugged = (MAP_ARCHETYPE === 'canyon_crossfire' || MAP_ARCHETYPE === 'tectonic_ravines');
     HILL_AMP_1 = (isRugged ? 0.54 : 0.34) + seededRandom() * 0.34;
     HILL_AMP_2 = (isRugged ? 0.38 : 0.24) + seededRandom() * 0.26;
 
-    // Dynamically configure river & bridge placement from the procedural seed (optional per seed!)
+    // Dynamically configure river & bridge placement from the procedural seed
     RIVER_BRIDGES.length = 0;
     BRIDGES.length = 0;
-    HAS_VALLEY_RIVER = (MAP_ARCHETYPE === 'river_bridges');
+    const waterCfg = (window.WORLD_GEN_CONFIG && typeof window.WORLD_GEN_CONFIG.waterLevel === 'number')
+        ? window.WORLD_GEN_CONFIG.waterLevel
+        : 1.0;
+    HAS_VALLEY_RIVER = waterCfg > 0.15 && (
+        MAP_ARCHETYPE === 'river_bridges' ||
+        MAP_ARCHETYPE === 'canyon_crossfire' ||
+        MAP_ARCHETYPE === 'open_badlands' ||
+        MAP_ARCHETYPE === 'fortified_plateau'
+    );
     HAS_RAVINE_BRIDGES = false;
 
     // Dynamically pick one of 8 distinct cardinal/diagonal sectors for Player Start so every regenerated map has a genuinely new layout!
@@ -468,28 +532,89 @@ function generateProceduralTopographyParameters(customSeed) {
         THREE.MathUtils.clamp(Math.round(Math.sin(enemySectorAng) * enemyDist), -84, 84)
     );
 
-    // Align the dynamic river axis perpendicular to the Player-to-Enemy axis so bridges cross between them!
-    RIVER_ANGLE = playerSectorAng + (seededRandom() - 0.5) * 0.22;
+    // Align the dynamic river axis so the river flows perpendicular to the Player-to-Enemy battle axis!
+    // In riverCoordsToWorld(s, u): +s flows along (RIVER_COS, -RIVER_SIN), and +u (across river) points along (RIVER_SIN, RIVER_COS).
+    // Setting RIVER_ANGLE = Math.atan2(battleAxisX, battleAxisZ) aligns the across-river +u axis with the Player-to-Enemy vector!
+    const battleAxisAng = Math.atan2(PLAYER_START_POS.x - ENEMY_BASE_POS.x, PLAYER_START_POS.z - ENEMY_BASE_POS.z);
+    RIVER_ANGLE = battleAxisAng + (seededRandom() - 0.5) * 0.20;
     RIVER_COS = Math.cos(RIVER_ANGLE);
     RIVER_SIN = Math.sin(RIVER_ANGLE);
 
     if (HAS_VALLEY_RIVER) {
         BRIDGE_COUNT = 2 + (seededRandom() > 0.45 ? 1 : 0);
         const spanSpread = BRIDGE_COUNT === 3 ? [-28.0, 0.0, 28.0] : [-20.0, 20.0];
+        const bridgeArchetypes = ['truss_bridge', 'concrete_causeway', 'industrial_girder'];
+
         for (let b = 0; b < BRIDGE_COUNT; b++) {
-            const sPos = spanSpread[b] + (seededRandom() - 0.5) * 9.5;
-            const bHalfW = 4.6 + seededRandom() * 0.8;
-            RIVER_BRIDGES.push({ sCoord: sPos, halfWidth: bHalfW });
+            let sPos = spanSpread[b] + (seededRandom() - 0.5) * 8.5;
+            // Refine sPos slightly toward a gentle river tangent section so bridges sit at natural geological crossings
+            let bestS = sPos;
+            let bestSlope = Math.abs(getRiverTangentSlopeAtS(sPos));
+            for (let step = -3.0; step <= 3.0; step += 0.75) {
+                const candS = sPos + step;
+                const candSlope = Math.abs(getRiverTangentSlopeAtS(candS));
+                if (candSlope < bestSlope) {
+                    bestSlope = candSlope;
+                    bestS = candS;
+                }
+            }
+            sPos = bestS;
+
+            const bHalfW = 4.6 + seededRandom() * 0.7;
             const cU = getRiverCenterUAtS(sPos);
             const cW = riverCoordsToWorld(sPos, cU);
-            const sW = riverCoordsToWorld(sPos, cU + RIVER_HALF_WIDTH + 3.2);
-            const nW = riverCoordsToWorld(sPos, cU - (RIVER_HALF_WIDTH + 3.2));
+            const tangentSlope = getRiverTangentSlopeAtS(sPos);
+            const localSkew = Math.atan(tangentSlope);
+            const bridgeYaw = RIVER_ANGLE - localSkew;
+            const cosYaw = Math.cos(bridgeYaw);
+            const sinYaw = Math.sin(bridgeYaw);
+
+            const effRiverHalfW = RIVER_HALF_WIDTH * Math.sqrt(1.0 + tangentSlope * tangentSlope);
+            const flatHalfSpan = effRiverHalfW + 1.05;
+            const rampReachU = effRiverHalfW + 3.65;
+            const arch = bridgeArchetypes[(b + Math.floor(seededRandom() * 3)) % bridgeArchetypes.length];
+
+            const rbObj = {
+                id: `bridge_${b + 1}`,
+                index: b,
+                sCoord: sPos,
+                centerU: cU,
+                centerX: cW.x,
+                centerZ: cW.z,
+                yaw: bridgeYaw,
+                cosYaw,
+                sinYaw,
+                tangentSlope,
+                halfWidth: bHalfW,
+                riverHalfW: effRiverHalfW,
+                flatHalfSpan,
+                rampReachU,
+                archetype: arch,
+                hp: 1200,
+                maxHp: 1200,
+                destroyed: false
+            };
+            RIVER_BRIDGES.push(rbObj);
+
+            const sW = bridgeLocalToWorld(rbObj, 0, rampReachU);
+            const nW = bridgeLocalToWorld(rbObj, 0, -rampReachU);
+            const southEntryVec = new THREE.Vector3(sW.x, 0, sW.z);
+            southEntryVec.dirX = sinYaw;
+            southEntryVec.dirZ = cosYaw;
+            const northEntryVec = new THREE.Vector3(nW.x, 0, nW.z);
+            northEntryVec.dirX = -sinYaw;
+            northEntryVec.dirZ = -cosYaw;
+
             BRIDGES.push({
+                id: rbObj.id,
                 sCoord: sPos,
                 halfWidth: bHalfW,
+                yaw: bridgeYaw,
+                archetype: arch,
                 center: new THREE.Vector3(cW.x, 0, cW.z),
-                southEntry: new THREE.Vector3(sW.x, 0, sW.z),
-                northEntry: new THREE.Vector3(nW.x, 0, nW.z)
+                southEntry: southEntryVec,
+                northEntry: northEntryVec,
+                bridgeRef: rbObj
             });
         }
     } else {
@@ -1006,23 +1131,6 @@ function computeRawTerrainHeight(x, z) {
         h += smoothEscarpment * 9.5 + (edgeDist - 104) * 0.45 * (0.65 + 0.35 * Math.sin(x * 0.14 + MAP_SEED) * Math.cos(z * 0.14));
     }
 
-    // Valley River Channel (Only active if HAS_VALLEY_RIVER is enabled)
-    if (HAS_VALLEY_RIVER) {
-        const rc = getRiverCoords(x, z);
-        const riverDist = rc.dist;
-        if (riverDist < RIVER_HALF_WIDTH + 3.0) {
-            if (riverDist <= RIVER_HALF_WIDTH) {
-                const bedProfile = Math.cos((riverDist / RIVER_HALF_WIDTH) * (Math.PI * 0.5));
-                const rawBedY = -0.32 - bedProfile * 0.56;
-                h = Math.min(h, rawBedY);
-            } else {
-                const bankT = (riverDist - RIVER_HALF_WIDTH) / 3.0;
-                const smoothBank = 0.5 - 0.5 * Math.cos(bankT * Math.PI);
-                h = THREE.MathUtils.lerp(-0.08, Math.max(0.14, h), smoothBank);
-            }
-        }
-    }
-
     // 1. Dynamic Carved Valleys (Tactical sunken valley floor with flanked ridge shoulders)
     for (let i = 0; i < DYNAMIC_VALLEYS.length; i++) {
         const vl = DYNAMIC_VALLEYS[i];
@@ -1109,13 +1217,50 @@ function computeRawTerrainHeight(x, z) {
         }
     }
 
-    // Smooth Roadbed Grading Pass: Carves & levels terrain along all supply roads so roads NEVER ride over big unnatural bumps!
+    // Smooth Roadbed Grading Pass: Carves & levels terrain along each road's longitudinal elevation profile!
     if (typeof _roadGradingActive !== 'undefined' && _roadGradingActive && typeof getSupplyRoadFactor === 'function') {
         const rf = getSupplyRoadFactor(x, z);
         if (rf > 0.02 && (!HAS_BASE_PLATEAU_RAMP || rm.dist >= BASE_PLATEAU_RIM_OUTER + 1.5)) {
-            const smoothRoadTargetH = THREE.MathUtils.clamp(h * 0.22 + 0.24, 0.12, 0.92);
-            const gradeBlend = THREE.MathUtils.smoothstep(rf, 0.02, 0.65);
-            h = THREE.MathUtils.lerp(h, smoothRoadTargetH, gradeBlend * 0.92);
+            const smoothRoadTargetH = (typeof getRoadTargetElevationAt === 'function' && _roadSpatialCacheReady)
+                ? getRoadTargetElevationAt(x, z, h)
+                : THREE.MathUtils.clamp(h * 0.22 + 0.24, 0.12, 0.92);
+            const gradeBlend = THREE.MathUtils.smoothstep(rf, 0.02, 0.68);
+            h = THREE.MathUtils.lerp(h, smoothRoadTargetH, gradeBlend * 0.94);
+        }
+    }
+
+    // Valley River Channel & Variable-Width Riverbed Carving (Evaluated AFTER macro landforms & road grading so riverbed is never raised above water!)
+    if (HAS_VALLEY_RIVER) {
+        const rc = getRiverCoords(x, z);
+        const riverDist = rc.dist;
+        const localHalfW = rc.halfWidth || RIVER_HALF_WIDTH;
+        const bankWidth = 3.25;
+        if (riverDist < localHalfW + bankWidth) {
+            if (riverDist <= localHalfW) {
+                const bedProfile = Math.cos((riverDist / localHalfW) * (Math.PI * 0.5));
+                const rawBedY = -0.36 - Math.pow(bedProfile, 1.15) * 0.62;
+                h = Math.min(h, rawBedY);
+            } else {
+                const bankT = (riverDist - localHalfW) / bankWidth;
+                const smoothBank = bankT * bankT * (3.0 - 2.0 * bankT);
+                h = THREE.MathUtils.lerp(-0.10, Math.max(0.16, h), smoothBank);
+            }
+        }
+        // Grade bridge approach abutments on the riverbanks so road-to-bridge ramp transitions are 100% flush
+        for (let bIdx = 0; bIdx < RIVER_BRIDGES.length; bIdx++) {
+            const rb = RIVER_BRIDGES[bIdx];
+            const bc = getBridgeLocalCoords(rb, x, z);
+            const dU = Math.abs(bc.localU);
+            const dS = Math.abs(bc.localS);
+            const effHalfW = rb.riverHalfW || RIVER_HALF_WIDTH;
+            if (dU > effHalfW + 0.35 && dU < effHalfW + 5.2 && dS < rb.halfWidth + 2.0) {
+                const uBlend = 1.0 - Math.abs((dU - (effHalfW + 2.6)) / 2.6);
+                const sBlend = dS <= rb.halfWidth ? 1.0 : Math.max(0.0, 1.0 - (dS - rb.halfWidth) / 2.0);
+                const abutWeight = THREE.MathUtils.clamp(uBlend * sBlend, 0.0, 1.0);
+                if (abutWeight > 0.01) {
+                    h = THREE.MathUtils.lerp(h, 0.24, abutWeight * 0.78);
+                }
+            }
         }
     }
 
@@ -1235,20 +1380,22 @@ function computeRawTerrainHeight(x, z) {
 // Returns terrain height including the 3D Engineered River Bridge decks for unit movement & placement
 function getSurfaceHeightWithBridges(x, z) {
     const rawH = getTerrainHeight(x, z);
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        const dU = Math.abs(rc.u - bCenterU);
-        if (dU <= RIVER_HALF_WIDTH + 4.8) {
-            const dS = Math.abs(rc.s - br.sCoord);
+        if (br.destroyed) continue;
+        const bc = getBridgeLocalCoords(br, x, z);
+        const dU = Math.abs(bc.localU);
+        const flatHalfSpan = br.flatHalfSpan || (RIVER_HALF_WIDTH + 1.05);
+        const rampReachU = br.rampReachU || (RIVER_HALF_WIDTH + 3.65);
+        if (dU <= rampReachU + 1.15) {
+            const dS = Math.abs(bc.localS);
             if (dS <= br.halfWidth + 1.1) {
                 let deckY = rawH;
-                const flatHalfSpan = RIVER_HALF_WIDTH + 0.95;
                 if (dU <= flatHalfSpan) {
                     deckY = 0.35;
                 } else {
-                    const rampT = THREE.MathUtils.clamp((dU - flatHalfSpan) / 3.6, 0.0, 1.0);
+                    const rampLen = Math.max(0.5, (rampReachU + 1.15) - flatHalfSpan);
+                    const rampT = THREE.MathUtils.clamp((dU - flatHalfSpan) / rampLen, 0.0, 1.0);
                     const smoothRamp = rampT * rampT * (3.0 - 2.0 * rampT);
                     deckY = THREE.MathUtils.lerp(0.35, Math.max(0.16, rawH), smoothRamp);
                 }
@@ -1264,14 +1411,14 @@ function getSurfaceHeightWithBridges(x, z) {
 }
 
 // Strict Collision Exclusion Zones for Buildings around Bridge Walkways, Ramps & Immediate Approach Plazas
-// Uses exact OBB deck bounds + compact 3.2m ramp toe clearance so it protects bridges without blocking the player's base!
+// Uses exact OBB deck bounds in the unified bridge local coordinate frame + compact ramp toe clearance!
 function isSpotUnderOrBlockingBridge(x, z, radius = 1.8, isBarrierWall = false) {
-    if (typeof getRiverCoords !== 'function') return false;
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < BRIDGE_BUILDING_EXCLUSION_ZONES.length; i++) {
         const ez = BRIDGE_BUILDING_EXCLUSION_ZONES[i];
-        const dS = Math.abs(rc.s - ez.sCoord);
-        const dU = Math.abs(rc.u - ez.centerU);
+        const rb = RIVER_BRIDGES[ez.bridgeIdx];
+        const bc = rb ? getBridgeLocalCoords(rb, x, z) : { localS: 999, localU: 999 };
+        const dS = Math.abs(bc.localS);
+        const dU = Math.abs(bc.localU);
 
         // 1. Never allow placing any structure or barrier directly on the bridge deck span over the river
         const deckPad = isBarrierWall ? 0.35 : (radius + 0.55);
@@ -1327,6 +1474,28 @@ function syncBaseAndCameraToTerrain() {
 }
 syncBaseAndCameraToTerrain();
 
+const _normalScratchVec = new THREE.Vector3();
+const _alignNormalScratch = new THREE.Vector3();
+const _targetQuatScratch = new THREE.Quaternion();
+const _stepReturnScratch = new THREE.Vector3();
+
+function getTerrainNormalInto(x, z, outVec) {
+    const eps = 0.4;
+    const hL = getTerrainHeight(x - eps, z);
+    const hR = getTerrainHeight(x + eps, z);
+    const hD = getTerrainHeight(x, z - eps);
+    const hU = getTerrainHeight(x, z + eps);
+    return outVec.set(hL - hR, 2 * eps, hD - hU).normalize();
+}
+
+function getTerrainNormalY(x, z) {
+    const eps = 0.4;
+    const dx = getTerrainHeight(x - eps, z) - getTerrainHeight(x + eps, z);
+    const dz = getTerrainHeight(x, z - eps) - getTerrainHeight(x, z + eps);
+    const twoEps = 2 * eps;
+    return twoEps / Math.hypot(dx, twoEps, dz);
+}
+
 function getTerrainNormal(x, z) {
     const eps = 0.4;
     const hL = getTerrainHeight(x - eps, z);
@@ -1336,32 +1505,92 @@ function getTerrainNormal(x, z) {
     return new THREE.Vector3(hL - hR, 2 * eps, hD - hU).normalize();
 }
 
-function isWalkableGround(x, z, unitRad = 0.0) {
-    if (!Number.isFinite(x) || !Number.isFinite(z)) return false;
-    // Out-of-bounds map perimeter barrier check (hard boundary at ±105.5m inside the outer cliff wall)
-    if (Math.abs(x) > 105.5 - unitRad || Math.abs(z) > 105.5 - unitRad) return false;
+// ============================================================================
+// SPATIAL HASH INDEX FOR HARD BARRIERS & STRUCTURE BLOCKERS (32x32 CELLS, 8m)
+// Eliminates O(Obstacles) scans inside isWalkableGround, isPointWalkableForUnitSize,
+// computeSafeGroundStep, and findClearSpawnPoint!
+// ============================================================================
+const SGRID_HALF = 128.0;
+const SGRID_CELL = 8.0;
+const SGRID_DIM = 32; // 32x32 = 1024 cells covering [-128..+128]
+const SGRID_TOTAL = SGRID_DIM * SGRID_DIM;
 
-    // 0. Hard Impassable Barrier Check (Battlefield Barriers, Out-of-Bounds Perimeter Pillars & Player-Built Blast Barriers):
-    const barrierPad = Math.max(0.18, unitRad * 0.65);
-    for (let i = 0; i < obstacles.length; i++) {
+const _barrierGridBuckets = new Array(SGRID_TOTAL);
+const _structGridBuckets = new Array(SGRID_TOTAL);
+for (let i = 0; i < SGRID_TOTAL; i++) {
+    _barrierGridBuckets[i] = [];
+    _structGridBuckets[i] = [];
+}
+let _barrierGridLastMs = -9999;
+let _barrierGridLastObCount = -1;
+let _barrierGridLastBldCount = -1;
+
+function _toSGridCoord(v) {
+    const c = Math.floor((v + SGRID_HALF) / SGRID_CELL);
+    return c < 0 ? 0 : (c >= SGRID_DIM ? SGRID_DIM - 1 : c);
+}
+
+function _insertCircleIntoSGrid(buckets, item, x, z, radius) {
+    const minCx = _toSGridCoord(x - radius);
+    const maxCx = _toSGridCoord(x + radius);
+    const minCz = _toSGridCoord(z - radius);
+    const maxCz = _toSGridCoord(z + radius);
+    for (let cz = minCz; cz <= maxCz; cz++) {
+        const rowOff = cz * SGRID_DIM;
+        for (let cx = minCx; cx <= maxCx; cx++) {
+            buckets[rowOff + cx].push(item);
+        }
+    }
+}
+
+function _ensureBarrierSpatialGrid() {
+    const nowMs = performance.now();
+    const obLen = obstacles.length;
+    const bldLen = (window.buildings && Array.isArray(window.buildings)) ? window.buildings.length : 0;
+    if (obLen === _barrierGridLastObCount && bldLen === _barrierGridLastBldCount && (nowMs - _barrierGridLastMs) < 240) {
+        return;
+    }
+    _barrierGridLastMs = nowMs;
+    _barrierGridLastObCount = obLen;
+    _barrierGridLastBldCount = bldLen;
+
+    for (let i = 0; i < SGRID_TOTAL; i++) {
+        _barrierGridBuckets[i].length = 0;
+    }
+    for (let i = 0; i < obLen; i++) {
         const ob = obstacles[i];
         if (ob && (ob.isBarrier || ob.type === 'battlefield_barriers' || ob.type === 'map_boundary_barrier' || ob.type === 'trench_wall')) {
-            const dx = x - ob.x;
-            const dz = z - ob.z;
-            const minR = (ob.r || 1.15) + barrierPad;
-            if (dx * dx + dz * dz < minR * minR) return false;
+            const r = ob.r || 1.15;
+            _insertCircleIntoSGrid(_barrierGridBuckets, { x: ob.x, z: ob.z, r }, ob.x, ob.z, r + 1.5);
         }
     }
     if (window.buildings && Array.isArray(window.buildings)) {
         for (let i = 0; i < window.buildings.length; i++) {
             const b = window.buildings[i];
             if (b && b.hp > 0 && b.type === 'barrier' && b.pos) {
-                const dx = x - b.pos.x;
-                const dz = z - b.pos.z;
-                const minR = (b.footprintRadius || 1.25) + barrierPad;
-                if (dx * dx + dz * dz < minR * minR) return false;
+                const r = b.footprintRadius || 1.25;
+                _insertCircleIntoSGrid(_barrierGridBuckets, { x: b.pos.x, z: b.pos.z, r }, b.pos.x, b.pos.z, r + 1.5);
             }
         }
+    }
+}
+
+function isWalkableGround(x, z, unitRad = 0.0) {
+    if (!Number.isFinite(x) || !Number.isFinite(z)) return false;
+    // Out-of-bounds map perimeter barrier check (hard boundary at ±105.5m inside the outer cliff wall)
+    if (Math.abs(x) > 105.5 - unitRad || Math.abs(z) > 105.5 - unitRad) return false;
+
+    // 0. Hard Impassable Barrier Check via O(1) Spatial Grid Bucket Lookup:
+    _ensureBarrierSpatialGrid();
+    const barrierPad = Math.max(0.18, unitRad * 0.65);
+    const bCellIdx = _toSGridCoord(z) * SGRID_DIM + _toSGridCoord(x);
+    const bBucket = _barrierGridBuckets[bCellIdx];
+    for (let i = 0; i < bBucket.length; i++) {
+        const ob = bBucket[i];
+        const dx = x - ob.x;
+        const dz = z - ob.z;
+        const minR = ob.r + barrierPad;
+        if (dx * dx + dz * dz < minR * minR) return false;
     }
 
     // 0B. Carved Tactical Trench Collision Volume Check:
@@ -1375,7 +1604,6 @@ function isWalkableGround(x, z, unitRad = 0.0) {
         const across = Math.abs(dx * tr.cosR - dz * tr.sinR);
         const absAlong = Math.abs(along);
         if (absAlong <= tr.halfLen + 2.4 && across <= tr.halfWid + 1.25) {
-            // Check if this point is inside a connected/merged secondary trench channel at a junction
             let inMergedChannel = false;
             for (let j = 0; j < DYNAMIC_TRENCHES.length; j++) {
                 if (j === i) continue;
@@ -1389,11 +1617,9 @@ function isWalkableGround(x, z, unitRad = 0.0) {
                 }
             }
             if (inMergedChannel) return true;
-            // Sunken interior floor & sloped end entry ramps are walkable
             if (across <= tr.halfWid * 0.70 || absAlong > tr.halfLen - 0.45) {
                 return true;
             }
-            // Side revetment walls & sandbag parapets block units from walking sideways through trench walls
             if (across > tr.halfWid * 0.70 && across <= tr.halfWid + 1.15 && absAlong <= tr.halfLen - 0.45) {
                 return false;
             }
@@ -1401,10 +1627,14 @@ function isWalkableGround(x, z, unitRad = 0.0) {
     }
 
     // 1. Multi-Faction Base Rim & Merged Multi-Ramp Check ('flat_ramp' & 'under_ramp' zones):
-    // Ramps and the Merged Second Ramp Platform are 100% open & walkable (ZERO barriers on ramps!)
+    // Fast radial bounding reject avoids expensive trigonometric ramp evaluation when far from base zones!
     for (let bIdx = 0; bIdx < BASE_TERRAIN_ZONES.length; bIdx++) {
         const bz = BASE_TERRAIN_ZONES[bIdx];
         if (bz.mode !== 'flat_ramp' && bz.mode !== 'under_ramp') continue;
+        const bdx = x - bz.x;
+        const bdz = z - bz.z;
+        const maxZoneR = (bz.rimOuter || 27.5) + 15.0;
+        if (bdx * bdx + bdz * bdz > maxZoneR * maxZoneR) continue;
         const zm = getBaseZoneRampMetrics(bz, x, z);
         if (zm.inRampAngle || zm.rampBlend > 0.35 || zm.mergedPlatformBlend > 0.35) {
             return true;
@@ -1440,9 +1670,8 @@ function isWalkableGround(x, z, unitRad = 0.0) {
     const h = getTerrainHeight(x, z);
     if (h < -1.65 || h > 16.5) return false;
     if (typeof isPointInWaterPond === 'function' && isPointInWaterPond(x, z, Math.min(0.28, unitRad * 0.35))) return false;
-    const norm = getTerrainNormal(x, z);
-    // Reject steep canyon/mountain/ravine cliff faces (norm.y < 0.48) so ground units route around steep terrain instead of getting wedged!
-    if (norm.y < 0.48) return false;
+    // Zero-allocation normal Y check rejects steep canyon/mountain/ravine cliff faces (norm.y < 0.48)
+    if (getTerrainNormalY(x, z) < 0.48) return false;
     return true;
 }
 
@@ -1466,7 +1695,7 @@ function alignGroundUnitToTerrain(mesh, targetLookX, targetLookZ, dt = 0.016, ac
     }
 
     const onBridge = isOnRiverBridge(x, z);
-    const rawNormal = onBridge ? _upVec : getTerrainNormal(x, z);
+    const rawNormal = onBridge ? _upVec : getTerrainNormalInto(x, z, _alignNormalScratch);
     if (!mesh.userData.smoothNormal) {
         mesh.userData.smoothNormal = rawNormal.clone();
     } else {
@@ -1500,8 +1729,8 @@ function alignGroundUnitToTerrain(mesh, targetLookX, targetLookZ, dt = 0.016, ac
     _forwardVec.crossVectors(_rightVec, normal).normalize();
 
     _rotMatrix.makeBasis(_rightVec, normal, _forwardVec);
-    const targetQuat = new THREE.Quaternion().setFromRotationMatrix(_rotMatrix);
-    mesh.quaternion.slerp(targetQuat, Math.min(1, dt * (isTank ? 6.0 : 12.0)));
+    _targetQuatScratch.setFromRotationMatrix(_rotMatrix);
+    mesh.quaternion.slerp(_targetQuatScratch, Math.min(1, dt * (isTank ? 6.0 : 12.0)));
 }
 
 function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
@@ -1509,12 +1738,17 @@ function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
     for (let bIdx = 0; bIdx < BASE_TERRAIN_ZONES.length; bIdx++) {
         const bz = BASE_TERRAIN_ZONES[bIdx];
         if (bz.mode !== 'flat_ramp' && bz.mode !== 'under_ramp') continue;
-        const currRM = getBaseZoneRampMetrics(bz, currPos.x, currPos.z);
-        const destRM = getBaseZoneRampMetrics(bz, destPos.x, destPos.z);
-        const currInside = currRM.dist < bz.radius - 0.5;
-        const destInside = destRM.dist < bz.radius - 0.5;
+        const cDx = currPos.x - bz.x, cDz = currPos.z - bz.z;
+        const dDx = destPos.x - bz.x, dDz = destPos.z - bz.z;
+        const cDistSq = cDx * cDx + cDz * cDz;
+        const dDistSq = dDx * dDx + dDz * dDz;
+        const innerR = bz.radius - 0.5;
+        const innerRSq = innerR * innerR;
+        const currInside = cDistSq < innerRSq;
+        const destInside = dDistSq < innerRSq;
 
         if (currInside !== destInside) {
+            const currRM = getBaseZoneRampMetrics(bz, currPos.x, currPos.z);
             const openingAngles = currRM.openingAngles || [Math.atan2(bz.rampDirZ, bz.rampDirX)];
             const primaryAng = openingAngles[0];
             let bestOpAng = primaryAng;
@@ -1571,11 +1805,14 @@ function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
         }
     }
 
-    // 2. When a River with Bridges is present, route ground units cleanly across the nearest/assigned Bridge!
-    // FIXED: Correct near-bank entry vs far-bank exit polarity (southEntry has signedDist > 0, northEntry has signedDist < 0)
-    // and guide units all the way across the deck past the far ramp toe so they NEVER stall or oscillate on the bridge!
+    // 2. When a River with Bridges is present, route ground units cleanly across the assigned Bridge with Traffic Control!
     if (!HAS_VALLEY_RIVER || BRIDGES.length === 0) {
         return destPos;
+    }
+
+    if (window.BRIDGE_TRAFFIC_MANAGER) {
+        const trafficWp = window.BRIDGE_TRAFFIC_MANAGER.getNavigationTarget(actor, currPos, destPos);
+        if (trafficWp) return trafficWp;
     }
 
     const currRC = getRiverCoords(currPos.x, currPos.z);
@@ -1608,8 +1845,6 @@ function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
         const bestBr = BRIDGES[bestIdx];
         const bCenterU = getRiverCenterUAtS(bestBr.sCoord);
 
-        // Recall: u > bCenterU (signedDist > 0) is the SOUTH entry side; u < bCenterU (signedDist < 0) is the NORTH entry side!
-        // Therefore, if destination is on signedDist > 0 (destSideSign > 0), our NEAR entry is northEntry (-) and FAR exit is southEntry (+)!
         const nearEntryPt = destSideSign > 0 ? bestBr.northEntry : bestBr.southEntry;
         const farExitPt   = destSideSign > 0 ? bestBr.southEntry : bestBr.northEntry;
         const farClearWorld = riverCoordsToWorld(
@@ -1618,15 +1853,12 @@ function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
         );
         const dS = Math.abs(currRC.s - bestBr.sCoord);
 
-        // Stage A: Still on the starting bank and outside the bridge lane -> steer to nearEntryPt first!
         if (currRC.signedDist * destSideSign < -(RIVER_HALF_WIDTH + 1.8) && dS > bestBr.halfWidth * 0.62) {
             return new THREE.Vector3(nearEntryPt.x, getSurfaceHeightWithBridges(nearEntryPt.x, nearEntryPt.z), nearEntryPt.z);
         }
-        // Stage B: Aligned with the bridge approach on the near bank -> steer to bridge center!
         if (currRC.signedDist * destSideSign < -0.6) {
             return new THREE.Vector3(bestBr.center.x, getSurfaceHeightWithBridges(bestBr.center.x, bestBr.center.z), bestBr.center.z);
         }
-        // Stage C: Passed the midpoint onto the far half of the bridge -> steer straight out to farClearWorld!
         if (currRC.signedDist * destSideSign < RIVER_HALF_WIDTH + 3.8) {
             return new THREE.Vector3(farClearWorld.x, getSurfaceHeightWithBridges(farClearWorld.x, farClearWorld.z), farClearWorld.z);
         }
@@ -1640,22 +1872,398 @@ function getGroundNavigationWaypoint(currPos, destPos, actor = null) {
 }
 
 // ============================================================================
+// TACTICAL BRIDGE TRAFFIC CONTROLLER & DEADLOCK RECOVERY SYSTEM
+// Manages bridge reservations, directional convoy flow, heavy-armor priority,
+// safe bank waiting/staging slots, timeout expiration, and deadlock clearing.
+// ============================================================================
+const BRIDGE_TRAFFIC_MANAGER = {
+    bridges: [],
+    lastSyncSeed: null,
+    deadlockRecoveries: 0,
+
+    isHeavyActor(actor) {
+        if (!actor) return false;
+        const t = actor.type || actor.variant || '';
+        return t === 'tank' || t === 'siege_tank' || t === 'behemoth' || t === 'crusher' ||
+               t === 'gorgon' || t === 'archon' || (t === 'valkyrie' && actor.mechMode);
+    },
+
+    syncFromBridges() {
+        if (!HAS_VALLEY_RIVER || !Array.isArray(BRIDGES) || BRIDGES.length === 0) {
+            this.bridges = [];
+            return;
+        }
+        if (this.bridges.length === BRIDGES.length && this.lastSyncSeed === window.ACTIVE_MAP_SEED) {
+            return;
+        }
+        this.lastSyncSeed = window.ACTIVE_MAP_SEED;
+        this.bridges = BRIDGES.map((br, idx) => {
+            const bCenterU = getRiverCenterUAtS(br.sCoord);
+            const width = (br.halfWidth || 3.4) * 2.0;
+            const waitingAreaSouth = [];
+            const waitingAreaNorth = [];
+            // Build 8 ordered staging slots on both banks outside the bridge ramp entrance
+            for (let s = 0; s < 8; s++) {
+                const row = (s >> 1);
+                const side = (s & 1) === 0 ? -1 : 1;
+                const lateralS = br.sCoord + side * (1.85 + (row % 2) * 1.15);
+                const backDist = RIVER_HALF_WIDTH + 6.2 + row * 2.1;
+                const ptSouth = riverCoordsToWorld(lateralS, bCenterU + backDist);
+                const ptNorth = riverCoordsToWorld(lateralS, bCenterU - backDist);
+                waitingAreaSouth.push(new THREE.Vector3(ptSouth.x, getSurfaceHeightWithBridges(ptSouth.x, ptSouth.z), ptSouth.z));
+                waitingAreaNorth.push(new THREE.Vector3(ptNorth.x, getSurfaceHeightWithBridges(ptNorth.x, ptNorth.z), ptNorth.z));
+            }
+            return {
+                id: br.id || `bridge_${idx}`,
+                index: idx,
+                sCoord: br.sCoord,
+                center: br.center.clone(),
+                entranceSouth: br.southEntry.clone(),
+                entranceNorth: br.northEntry.clone(),
+                corridorCenterLine: [br.southEntry.clone(), br.center.clone(), br.northEntry.clone()],
+                width,
+                halfWidth: br.halfWidth || 3.4,
+                maxConcurrentUnits: width >= 6.4 ? 5 : 4,
+                activeDirection: 'idle', // 'idle' | 'south_to_north' | 'north_to_south'
+                occupiedBy: new Map(),   // actor -> { enteredAt, lastU, lastMoveAt, direction, isHeavy, laneOffset }
+                reservationQueue: [],    // [{ actor, direction, requestedAt, isHeavy, priority, waitSlotIdx }]
+                waitingAreaSouth,
+                waitingAreaNorth,
+                lockTimestamp: 0
+            };
+        });
+    },
+
+    chooseBestBridgeIndex(actor, currPos, destPos, avoidBridgeIdx = -1) {
+        this.syncFromBridges();
+        if (this.bridges.length === 0) return 0;
+        let bestIdx = 0;
+        let bestScore = Infinity;
+        for (let i = 0; i < this.bridges.length; i++) {
+            const rb = RIVER_BRIDGES[i];
+            if (rb && rb.destroyed) continue;
+            const bDesc = this.bridges[i];
+            const dStart = Math.hypot(currPos.x - bDesc.center.x, currPos.z - bDesc.center.z);
+            const dGoal = Math.hypot(destPos.x - bDesc.center.x, destPos.z - bDesc.center.z);
+            const queuePenalty = (bDesc.occupiedBy.size * 3.5) + (bDesc.reservationQueue.length * 4.2);
+            const avoidPenalty = (i === avoidBridgeIdx && this.bridges.length > 1) ? 28.0 : 0;
+            const score = dStart + dGoal * 0.55 + queuePenalty + avoidPenalty;
+            if (score < bestScore) {
+                bestScore = score;
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    },
+
+    releaseActor(actor) {
+        if (!actor) return;
+        for (let i = 0; i < this.bridges.length; i++) {
+            const b = this.bridges[i];
+            b.occupiedBy.delete(actor);
+            for (let q = b.reservationQueue.length - 1; q >= 0; q--) {
+                if (b.reservationQueue[q].actor === actor) {
+                    b.reservationQueue.splice(q, 1);
+                }
+            }
+            if (b.occupiedBy.size === 0 && b.reservationQueue.length === 0) {
+                b.activeDirection = 'idle';
+            }
+        }
+        actor._bridgeWaitState = null;
+    },
+
+    update(dt) {
+        this.syncFromBridges();
+        if (this.bridges.length === 0) return;
+        const nowSec = performance.now() * 0.001;
+
+        for (let i = 0; i < this.bridges.length; i++) {
+            const b = this.bridges[i];
+            const br = BRIDGES[i];
+            if (!br) continue;
+
+            // 1. Clean up dead, distant, or stalled occupants
+            for (const [actor, meta] of b.occupiedBy.entries()) {
+                if (!actor || actor.hp <= 0 || !actor.mesh) {
+                    b.occupiedBy.delete(actor);
+                    continue;
+                }
+                const pos = actor.mesh.position;
+                const rc = getRiverCoords(pos.x, pos.z);
+                const dS = Math.abs(rc.s - b.sCoord);
+                const clearedFarBank = (meta.direction === 'south_to_north' && rc.signedDist < -(RIVER_HALF_WIDTH + 4.8)) ||
+                                       (meta.direction === 'north_to_south' && rc.signedDist > (RIVER_HALF_WIDTH + 4.8));
+                const wanderedOff = dS > b.halfWidth + 8.5 && Math.abs(rc.signedDist) > RIVER_HALF_WIDTH + 5.5;
+                const timedOut = (nowSec - meta.enteredAt) > 6.5;
+
+                // Track longitudinal progress across river U axis
+                if (Math.abs(rc.signedDist - meta.lastU) > 0.28) {
+                    meta.lastU = rc.signedDist;
+                    meta.lastMoveAt = nowSec;
+                }
+
+                // Deadlock recovery if a unit stalls on the bridge span for > 1.75s
+                if ((nowSec - meta.lastMoveAt) > 1.75) {
+                    this.deadlockRecoveries++;
+                    meta.lastMoveAt = nowSec;
+                    meta.laneOffset = ((meta.laneOffset || 0) >= 0 ? -1 : 1) * 0.85;
+                    if ((nowSec - meta.enteredAt) > 4.2) {
+                        b.occupiedBy.delete(actor);
+                        continue;
+                    }
+                }
+
+                if (clearedFarBank || wanderedOff || timedOut) {
+                    b.occupiedBy.delete(actor);
+                    actor.bridgeClearedTimer = 0.85;
+                }
+            }
+
+            // 2. Prune invalid or expired queue entries
+            for (let q = b.reservationQueue.length - 1; q >= 0; q--) {
+                const req = b.reservationQueue[q];
+                if (!req.actor || req.actor.hp <= 0 || !req.actor.mesh || (nowSec - req.requestedAt) > 4.5) {
+                    b.reservationQueue.splice(q, 1);
+                }
+            }
+
+            // 3. Promote queued units into active bridge occupancy when direction matches or bridge is clear
+            if (b.occupiedBy.size === 0) {
+                if (b.reservationQueue.length > 0) {
+                    // Sort by heavy priority first, then FIFO timestamp
+                    b.reservationQueue.sort((a, bReq) => (bReq.priority - a.priority) || (a.requestedAt - bReq.requestedAt));
+                    b.activeDirection = b.reservationQueue[0].direction;
+                    b.lockTimestamp = nowSec;
+                } else {
+                    b.activeDirection = 'idle';
+                }
+            }
+
+            if (b.activeDirection !== 'idle' && b.reservationQueue.length > 0) {
+                // Prevent one direction from starving the opposite bank for > 5.0s
+                const dirHoldTime = nowSec - (b.lockTimestamp || nowSec);
+                const hasOppositeWaiting = b.reservationQueue.some(r => r.direction !== b.activeDirection && (nowSec - r.requestedAt) > 2.2);
+                const allowMoreSameDir = !(dirHoldTime > 4.8 && hasOppositeWaiting);
+
+                if (allowMoreSameDir) {
+                    for (let q = 0; q < b.reservationQueue.length; q++) {
+                        if (b.occupiedBy.size >= b.maxConcurrentUnits) break;
+                        const req = b.reservationQueue[q];
+                        if (req.direction !== b.activeDirection) continue;
+                        const rc = getRiverCoords(req.actor.mesh.position.x, req.actor.mesh.position.z);
+                        b.occupiedBy.set(req.actor, {
+                            enteredAt: nowSec,
+                            lastU: rc.signedDist,
+                            lastMoveAt: nowSec,
+                            direction: req.direction,
+                            isHeavy: req.isHeavy,
+                            laneOffset: ((b.occupiedBy.size % 3) - 1) * 0.72
+                        });
+                        req.actor._bridgeWaitState = 'crossing';
+                        b.reservationQueue.splice(q, 1);
+                        q--;
+                    }
+                }
+            }
+        }
+    },
+
+    getNavigationTarget(actor, currPos, destPos) {
+        this.syncFromBridges();
+        if (this.bridges.length === 0) return null;
+
+        const currRC = getRiverCoords(currPos.x, currPos.z);
+        const destRC = getRiverCoords(destPos.x, destPos.z);
+        const destSideSign = destRC.signedDist >= 0 ? 1 : -1;
+        const currSideSign = currRC.signedDist >= 0 ? 1 : -1;
+        const onOppositeSides = (currSideSign !== destSideSign) && Math.abs(destRC.signedDist) > 1.2;
+        const stillOnBridgeOrRamp = Math.abs(currRC.signedDist) < RIVER_HALF_WIDTH + 4.2 &&
+                                    (currRC.signedDist * destSideSign < RIVER_HALF_WIDTH + 4.0);
+
+        if (!onOppositeSides && !stillOnBridgeOrRamp) {
+            if (actor) {
+                if (actor.activeBridgeCrossIdx !== undefined) actor.activeBridgeCrossIdx = undefined;
+                if (actor._bridgeWaitState) this.releaseActor(actor);
+            }
+            return null;
+        }
+
+        let bestIdx = 0;
+        if (actor && actor.activeBridgeCrossIdx !== undefined && this.bridges[actor.activeBridgeCrossIdx]) {
+            bestIdx = actor.activeBridgeCrossIdx;
+        } else if (actor && actor.preferredBridgeIdx !== undefined && this.bridges[actor.preferredBridgeIdx]) {
+            bestIdx = actor.preferredBridgeIdx;
+        } else {
+            bestIdx = this.chooseBestBridgeIndex(actor, currPos, destPos);
+        }
+        if (actor) actor.activeBridgeCrossIdx = bestIdx;
+
+        const b = this.bridges[bestIdx];
+        const bestBr = BRIDGES[bestIdx];
+        if (!b || !bestBr) return null;
+
+        const desiredDir = destSideSign < 0 ? 'south_to_north' : 'north_to_south';
+        const isHeavy = this.isHeavyActor(actor);
+        const nowSec = performance.now() * 0.001;
+
+        // If actor is already physically on the bridge span, grant/maintain occupancy and guide smoothly across
+        const dS = Math.abs(currRC.s - bestBr.sCoord);
+        const physicallyOnSpan = Math.abs(currRC.signedDist) < RIVER_HALF_WIDTH + 2.4 && dS <= bestBr.halfWidth + 1.4;
+
+        if (actor) {
+            if (physicallyOnSpan && !b.occupiedBy.has(actor)) {
+                if (b.activeDirection === 'idle') {
+                    b.activeDirection = desiredDir;
+                    b.lockTimestamp = nowSec;
+                }
+                b.occupiedBy.set(actor, {
+                    enteredAt: nowSec,
+                    lastU: currRC.signedDist,
+                    lastMoveAt: nowSec,
+                    direction: desiredDir,
+                    isHeavy,
+                    laneOffset: (((actor._aiSlotId || 0) % 3) - 1) * 0.68
+                });
+                actor._bridgeWaitState = 'crossing';
+            } else if (!b.occupiedBy.has(actor)) {
+                // Can actor enter immediately?
+                const dirCompatible = (b.activeDirection === 'idle' || b.activeDirection === desiredDir);
+                const hasCapacity = b.occupiedBy.size < b.maxConcurrentUnits;
+                const distToEntry = Math.hypot(
+                    currPos.x - (destSideSign < 0 ? bestBr.southEntry.x : bestBr.northEntry.x),
+                    currPos.z - (destSideSign < 0 ? bestBr.southEntry.z : bestBr.northEntry.z)
+                );
+
+                if (dirCompatible && hasCapacity && distToEntry < 13.5) {
+                    if (b.activeDirection === 'idle') {
+                        b.activeDirection = desiredDir;
+                        b.lockTimestamp = nowSec;
+                    }
+                    b.occupiedBy.set(actor, {
+                        enteredAt: nowSec,
+                        lastU: currRC.signedDist,
+                        lastMoveAt: nowSec,
+                        direction: desiredDir,
+                        isHeavy,
+                        laneOffset: (((actor._aiSlotId || 0) % 3) - 1) * 0.68
+                    });
+                    actor._bridgeWaitState = 'crossing';
+                } else if (distToEntry < 16.0) {
+                    // Enqueue reservation and assign an ordered bank waiting slot
+                    let existingReq = null;
+                    for (let q = 0; q < b.reservationQueue.length; q++) {
+                        if (b.reservationQueue[q].actor === actor) {
+                            existingReq = b.reservationQueue[q];
+                            break;
+                        }
+                    }
+                    if (!existingReq) {
+                        existingReq = {
+                            actor,
+                            direction: desiredDir,
+                            requestedAt: nowSec,
+                            isHeavy,
+                            priority: isHeavy ? 10 : 1,
+                            waitSlotIdx: b.reservationQueue.length % 8
+                        };
+                        b.reservationQueue.push(existingReq);
+                    }
+                    actor._bridgeWaitState = 'waiting';
+                    const waitPool = desiredDir === 'south_to_north' ? b.waitingAreaSouth : b.waitingAreaNorth;
+                    const slotPt = waitPool[existingReq.waitSlotIdx % waitPool.length];
+                    if (slotPt && !physicallyOnSpan) {
+                        return slotPt.clone();
+                    }
+                }
+            }
+        }
+
+        const occMeta = actor ? b.occupiedBy.get(actor) : null;
+        const laneShift = (occMeta && !isHeavy) ? (occMeta.laneOffset || 0) : 0;
+        const bCenterU = getRiverCenterUAtS(bestBr.sCoord);
+        const laneS = bestBr.sCoord + laneShift;
+
+        const nearEntryWorld = riverCoordsToWorld(laneS, bCenterU - destSideSign * (RIVER_HALF_WIDTH + 3.1));
+        const centerWorld = riverCoordsToWorld(laneS, bCenterU);
+        const farClearWorld = riverCoordsToWorld(laneS, bCenterU + destSideSign * (RIVER_HALF_WIDTH + 5.8));
+
+        if (currRC.signedDist * destSideSign < -(RIVER_HALF_WIDTH + 1.8) && dS > bestBr.halfWidth * 0.62) {
+            return new THREE.Vector3(nearEntryWorld.x, getSurfaceHeightWithBridges(nearEntryWorld.x, nearEntryWorld.z), nearEntryWorld.z);
+        }
+        if (currRC.signedDist * destSideSign < -0.5) {
+            return new THREE.Vector3(centerWorld.x, getSurfaceHeightWithBridges(centerWorld.x, centerWorld.z), centerWorld.z);
+        }
+        return new THREE.Vector3(farClearWorld.x, getSurfaceHeightWithBridges(farClearWorld.x, farClearWorld.z), farClearWorld.z);
+    }
+};
+window.BRIDGE_TRAFFIC_MANAGER = BRIDGE_TRAFFIC_MANAGER;
+
+// ============================================================================
 // SIZE-AWARE WALKABLE MESH / NAV-GRID A* PATHFINDING, SELF-CALIBRATING
 // "STUCK BABYSPOT" MEMORY & SMALL-STRUCTURE TANGENTIAL FLOW STEERING
 // ============================================================================
 const NAV_GRID_HALF = 112;
 const NAV_CELL_SIZE = 2.5;
 const NAV_GRID_DIM = Math.floor((NAV_GRID_HALF * 2) / NAV_CELL_SIZE); // 89x89 cells
+const _ASTAR_TOTAL_CELLS = NAV_GRID_DIM * NAV_GRID_DIM;
+const _astarGScore = new Float32Array(_ASTAR_TOTAL_CELLS);
+const _astarFScore = new Float32Array(_ASTAR_TOTAL_CELLS);
+const _astarParent = new Int32Array(_ASTAR_TOTAL_CELLS);
+const _astarClosed = new Uint8Array(_ASTAR_TOTAL_CELLS);
+const _astarHeapNodes = new Int32Array(_ASTAR_TOTAL_CELLS + 1);
+let _astarHeapSize = 0;
 
-// Self-Calibrating Spatial Memory of "Stuck Babyspots":
-// Whenever a ground unit or AI flanker stalls on a tricky terrain/prop pocket, it records a spatial
-// hotspot here so A* pathfinding and local steering automatically recalibrate around that spot!
+// Precomputed static terrain walkability (bit 0 = infantry 0.45m, bit 1 = vehicle 0.95m) & terrain step-cost multiplier per cell
+const _astarStaticWalkable = new Uint8Array(_ASTAR_TOTAL_CELLS);
+const _astarStaticCostMult = new Float32Array(_ASTAR_TOTAL_CELLS);
+let _astarStaticDirty = true;
+
+function invalidateStaticAStarGrid() {
+    _astarStaticDirty = true;
+}
+window.invalidateStaticAStarGrid = invalidateStaticAStarGrid;
+
+function _ensureStaticAStarGridBaked() {
+    if (!_astarStaticDirty) return;
+    _astarStaticDirty = false;
+    for (let gz = 0; gz < NAV_GRID_DIM; gz++) {
+        const wz = -NAV_GRID_HALF + (gz + 0.5) * NAV_CELL_SIZE;
+        for (let gx = 0; gx < NAV_GRID_DIM; gx++) {
+            const wx = -NAV_GRID_HALF + (gx + 0.5) * NAV_CELL_SIZE;
+            const idx = gz * NAV_GRID_DIM + gx;
+            const inPondInf = (typeof isPointInWaterPond === 'function') && isPointInWaterPond(wx, wz, 0.90);
+            const inPondVeh = inPondInf || ((typeof isPointInWaterPond === 'function') && isPointInWaterPond(wx, wz, 1.40));
+            let mask = 0;
+            if (!inPondInf && isWalkableGround(wx, wz, 0.45)) mask |= 1;
+            if (!inPondVeh && isWalkableGround(wx, wz, 0.95)) mask |= 2;
+            _astarStaticWalkable[idx] = mask;
+
+            let mult = 1.0;
+            if (isOnRiverBridge(wx, wz)) {
+                mult = 0.68;
+            } else if (typeof getSupplyRoadFactor === 'function') {
+                const rf = getSupplyRoadFactor(wx, wz);
+                if (rf > 0.12) {
+                    mult = 1.0 - rf * 0.40;
+                } else {
+                    const normY = getTerrainNormalY(wx, wz);
+                    const slopeGrade = Math.max(0, 1.0 - normY);
+                    if (slopeGrade > 0.06) {
+                        mult = 1.0 + slopeGrade * 5.4;
+                    }
+                }
+            }
+            _astarStaticCostMult[idx] = mult;
+        }
+    }
+}
+
 const NAV_STUCK_HOTSPOTS = [];
 window.NAV_STUCK_HOTSPOTS = NAV_STUCK_HOTSPOTS;
 
 function recordNavStuckHotspot(wx, wz, radius = 2.6, weightBoost = 1.8) {
     if (!Number.isFinite(wx) || !Number.isFinite(wz)) return null;
-    // Never record a stuck hotspot on a bridge deck or bridge exit corridor — bridges must remain open thoroughfares!
     if (typeof isOnRiverBridge === 'function' && isOnRiverBridge(wx, wz, 2.4)) return null;
     if (typeof isPointInBridgeApproachCorridor === 'function' && isPointInBridgeApproachCorridor(wx, wz, 3.8, 10.5)) return null;
     const nowSec = performance.now() * 0.001;
@@ -1695,15 +2303,17 @@ function getNavStuckPenalty(wx, wz) {
     for (let i = NAV_STUCK_HOTSPOTS.length - 1; i >= 0; i--) {
         const hs = NAV_STUCK_HOTSPOTS[i];
         const age = Math.max(0, nowSec - (hs.lastSeen || nowSec));
-        // Persistent spots with multiple hits decay much slower so AI remembers babyspots across waves
         const halfLife = hs.hits >= 3 ? 75.0 : 35.0;
         const decay = Math.exp(-age / halfLife);
         if (hs.weight * decay < 0.20) {
             NAV_STUCK_HOTSPOTS.splice(i, 1);
             continue;
         }
-        const d = Math.hypot(wx - hs.x, wz - hs.z);
-        if (d < hs.radius) {
+        const dx = wx - hs.x;
+        const dz = wz - hs.z;
+        const dSq = dx * dx + dz * dz;
+        if (dSq < hs.radius * hs.radius) {
+            const d = Math.sqrt(dSq);
             const falloff = 1.0 - (d / hs.radius);
             totalPenalty += hs.weight * decay * falloff * falloff;
         }
@@ -1716,24 +2326,33 @@ let _cachedBaseBlockers = null;
 let _cachedPinchZones = [];
 let _cachedBaseBlockersMs = -9999;
 
+function invalidateStructureBlockersCache() {
+    _cachedBaseBlockersMs = -9999;
+    _barrierGridLastMs = -9999;
+}
+window.invalidateStructureBlockersCache = invalidateStructureBlockersCache;
+
 function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
     const nowMs = performance.now();
-    // Cache the base structure/obstacle blocker list and precomputed pinch-gap midpoints for 180ms
-    // Eliminates the O(N^2) per-point nested loop that caused severe frame lag during combat!
-    if (!_cachedBaseBlockers || (nowMs - _cachedBaseBlockersMs) > 180) {
+    if (!_cachedBaseBlockers || (nowMs - _cachedBaseBlockersMs) > 220) {
         _cachedBaseBlockersMs = nowMs;
         const rawList = [];
+        for (let i = 0; i < SGRID_TOTAL; i++) {
+            _structGridBuckets[i].length = 0;
+        }
         if (buildingsList) {
             for (let i = 0; i < buildingsList.length; i++) {
                 const b = buildingsList[i];
                 if (!b || b.hp <= 0) continue;
                 const bRad = b.footprintRadius || (b.type === 'base' ? 2.65 : (b.type === 'turret' ? 1.35 : (b.type === 'barrier' ? 1.25 : 2.05)));
-                rawList.push({
+                const item = {
                     x: b.pos.x, z: b.pos.z, rawR: bRad, r: bRad + 0.82,
                     isBuilding: true,
                     isBridgeBarrier: b.type === 'barrier',
                     id: `b_${i}`
-                });
+                };
+                rawList.push(item);
+                _insertCircleIntoSGrid(_structGridBuckets, item, item.x, item.z, bRad + 3.2);
             }
         }
         if (enemyBuildingsList) {
@@ -1741,7 +2360,9 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
                 const eb = enemyBuildingsList[i];
                 if (!eb || eb.hp <= 0) continue;
                 const ebRad = eb.footprintRadius || (eb.role === 'citadel' ? 2.52 : (eb.role === 'spine_turret' ? 1.36 : 2.02));
-                rawList.push({ x: eb.pos.x, z: eb.pos.z, rawR: ebRad, r: ebRad + 0.82, isBuilding: true, isBridgeBarrier: false, id: `eb_${i}` });
+                const item = { x: eb.pos.x, z: eb.pos.z, rawR: ebRad, r: ebRad + 0.82, isBuilding: true, isBridgeBarrier: false, id: `eb_${i}` };
+                rawList.push(item);
+                _insertCircleIntoSGrid(_structGridBuckets, item, item.x, item.z, ebRad + 3.2);
             }
         }
         if (window.solarisBuildings && Array.isArray(window.solarisBuildings)) {
@@ -1749,7 +2370,9 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
                 const sb = window.solarisBuildings[i];
                 if (!sb || sb.hp <= 0) continue;
                 const sbRad = sb.footprintRadius || 2.15;
-                rawList.push({ x: sb.pos.x, z: sb.pos.z, rawR: sbRad, r: sbRad + 0.82, isBuilding: true, isBridgeBarrier: false, id: `sb_${i}` });
+                const item = { x: sb.pos.x, z: sb.pos.z, rawR: sbRad, r: sbRad + 0.82, isBuilding: true, isBridgeBarrier: false, id: `sb_${i}` };
+                rawList.push(item);
+                _insertCircleIntoSGrid(_structGridBuckets, item, item.x, item.z, sbRad + 3.2);
             }
         }
         for (let i = 0; i < obstacles.length; i++) {
@@ -1761,7 +2384,7 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
                 ob.type === 'military_bunker' || ob.type === 'watch_tower' || ob.type === 'mortar_emplacement' ||
                 ob.type === 'satellite_dish' || ob.type === 'camp' || ob.type === 'radioactive_waste' ||
                 ob.type === 'pond' || ob.type === 'refinery_complex' || ob.type === 'checkpoint_gate' || ob.type === 'power_substation';
-            rawList.push({
+            const item = {
                 x: ob.x, z: ob.z, rawR: ob.r,
                 r: isHardBarrier ? (ob.r + 0.65) : (isTerrainStructureOrPond ? (ob.r + 0.68) : (ob.r + 0.44)),
                 isBuilding: isTerrainStructureOrPond,
@@ -1769,11 +2392,13 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
                 isDynamicPond: !!ob.isDynamicPond,
                 pondRef: ob.pondRef || null,
                 id: `ob_${i}`
-            });
+            };
+            rawList.push(item);
+            const maxInfR = (ob.isDynamicPond ? ob.r * 1.45 : ob.r) + 3.2;
+            _insertCircleIntoSGrid(_structGridBuckets, item, item.x, item.z, maxInfR);
         }
         _cachedBaseBlockers = rawList;
 
-        // Precompute narrow pinch-gap midpoints ONCE per 180ms cache refresh instead of per point query!
         const pinches = [];
         const maxPinchGap = 3.2;
         for (let i = 0; i < rawList.length; i++) {
@@ -1800,7 +2425,6 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
         _cachedPinchZones = pinches;
     }
 
-    // Update effective radius `r` in-place for the current caller's `selfRad` without allocating new objects
     const radAddBld = selfRad + 0.42;
     const radAddOb = Math.min(0.42, selfRad * 0.72) + 0.12;
     for (let i = 0; i < _cachedBaseBlockers.length; i++) {
@@ -1810,21 +2434,24 @@ function gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList) {
     return _cachedBaseBlockers;
 }
 
-// Checks if a unit of radius `selfRad` can physically fit & stand at (wx, wz) without colliding with buildings, terrain structures, puddles, or narrow gaps
 function isPointWalkableForUnitSize(wx, wz, selfRad, structCircles, targetPos = null) {
     if (!isWalkableGround(wx, wz, selfRad)) return false;
     if (typeof isPointInWaterPond === 'function' && isPointInWaterPond(wx, wz, selfRad + 0.45)) return false;
 
-    for (let i = 0; i < structCircles.length; i++) {
-        const sc = structCircles[i];
+    const bucket = _structGridBuckets[_toSGridCoord(wz) * SGRID_DIM + _toSGridCoord(wx)];
+    for (let i = 0; i < bucket.length; i++) {
+        const sc = bucket[i];
         const dx = wx - sc.x;
         if (dx > 10.5 || dx < -10.5) continue;
         const dz = wz - sc.z;
         if (dz > 10.5 || dz < -10.5) continue;
+        const effR = !sc.isBuilding
+            ? (sc.rawR + selfRad * 0.65 + 0.12)
+            : (sc.rawR + selfRad + 0.42);
         if (!sc.isBridgeBarrier && !sc.isDynamicPond && targetPos) {
             const tdx = targetPos.x - sc.x;
             const tdz = targetPos.z - sc.z;
-            const tr = sc.r + 0.75;
+            const tr = effR + 0.75;
             if (tdx * tdx + tdz * tdz < tr * tr) continue;
         }
         if (sc.isDynamicPond && sc.pondRef) {
@@ -1833,13 +2460,9 @@ function isPointWalkableForUnitSize(wx, wz, selfRad, structCircles, targetPos = 
             if (dx * dx + dz * dz < lobeR * lobeR) return false;
             continue;
         }
-        const effR = !sc.isBuilding
-            ? (sc.rawR + selfRad * 0.65 + 0.12)
-            : sc.r;
         if (dx * dx + dz * dz < effR * effR) return false;
     }
 
-    // Fast O(P) Pinch-Gap Fit Check against precomputed narrow structure gaps
     const minPassableGap = selfRad * 2.0 + 0.42;
     for (let i = 0; i < _cachedPinchZones.length; i++) {
         const pz = _cachedPinchZones[i];
@@ -1854,6 +2477,7 @@ function isPointWalkableForUnitSize(wx, wz, selfRad, structCircles, targetPos = 
     }
     return true;
 }
+window.isPointWalkableForUnitSize = isPointWalkableForUnitSize;
 
 function isSegmentClearForUnitSize(ax, az, bx, bz, selfRad, structCircles, targetPos = null) {
     const dist = Math.hypot(bx - ax, bz - az);
@@ -1865,16 +2489,52 @@ function isSegmentClearForUnitSize(ax, az, bx, bz, selfRad, structCircles, targe
         if (!isPointWalkableForUnitSize(px, pz, selfRad, structCircles, targetPos)) {
             return false;
         }
-        // Treat severe stuck babyspots outside of bridges as requiring an A* detour
         if (!isOnRiverBridge(px, pz, 1.8) && getNavStuckPenalty(px, pz) > 3.2) {
             return false;
         }
     }
     return true;
 }
+window.isSegmentClearForUnitSize = isSegmentClearForUnitSize;
 
-// Fast Octile A* Pathfinder on Walkable Mesh Grid (Size-Aware for `selfRad`, Bridge Walkways & Learned Stuck Babyspots)
-function computeAStarWalkablePath(startPos, goalPos, selfRad, structCircles) {
+function _astarHeapPush(nodeIdx) {
+    let i = ++_astarHeapSize;
+    const f = _astarFScore[nodeIdx];
+    while (i > 1) {
+        const parent = i >> 1;
+        const pNode = _astarHeapNodes[parent];
+        if (f >= _astarFScore[pNode]) break;
+        _astarHeapNodes[i] = pNode;
+        i = parent;
+    }
+    _astarHeapNodes[i] = nodeIdx;
+}
+
+function _astarHeapPop() {
+    const top = _astarHeapNodes[1];
+    const last = _astarHeapNodes[_astarHeapSize--];
+    if (_astarHeapSize > 0) {
+        const f = _astarFScore[last];
+        let i = 1;
+        const half = _astarHeapSize >> 1;
+        while (i <= half) {
+            let child = i << 1;
+            if (child < _astarHeapSize && _astarFScore[_astarHeapNodes[child + 1]] < _astarFScore[_astarHeapNodes[child]]) {
+                child++;
+            }
+            if (f <= _astarFScore[_astarHeapNodes[child]]) break;
+            _astarHeapNodes[i] = _astarHeapNodes[child];
+            i = child;
+        }
+        _astarHeapNodes[i] = last;
+    }
+    return top;
+}
+
+// Fast Octile A* Pathfinder on Walkable Mesh Grid (Uses Binary Min-Heap + Precomputed Static Terrain Grid + Congestion Penalty!)
+function computeAStarWalkablePath(startPos, goalPos, selfRad, structCircles, extraCongestionPenalty = 0) {
+    _ensureStaticAStarGridBaked();
+
     const toGrid = (v) => Math.max(0, Math.min(NAV_GRID_DIM - 1, Math.floor((v + NAV_GRID_HALF) / NAV_CELL_SIZE)));
     const toWorld = (g) => -NAV_GRID_HALF + (g + 0.5) * NAV_CELL_SIZE;
 
@@ -1882,50 +2542,42 @@ function computeAStarWalkablePath(startPos, goalPos, selfRad, structCircles) {
     const gx = toGrid(goalPos.x), gz = toGrid(goalPos.z);
     if (sx === gx && sz === gz) return [goalPos.clone()];
 
-    const totalCells = NAV_GRID_DIM * NAV_GRID_DIM;
-    const gScore = new Float32Array(totalCells).fill(Infinity);
-    const fScoreArr = new Float32Array(totalCells).fill(Infinity);
-    const parent = new Int32Array(totalCells).fill(-1);
-    const closed = new Uint8Array(totalCells);
+    _astarGScore.fill(Infinity);
+    _astarFScore.fill(Infinity);
+    _astarParent.fill(-1);
+    _astarClosed.fill(0);
+    _astarHeapSize = 0;
 
     const startIdx = sz * NAV_GRID_DIM + sx;
     const goalIdx = gz * NAV_GRID_DIM + gx;
-    gScore[startIdx] = 0;
-    fScoreArr[startIdx] = Math.hypot(gx - sx, gz - sz);
-
-    const openList = [startIdx];
+    _astarGScore[startIdx] = 0;
+    _astarFScore[startIdx] = Math.hypot(gx - sx, gz - sz);
+    _astarHeapPush(startIdx);
 
     let bestNode = startIdx;
     let bestHeuristic = Math.hypot(gx - sx, gz - sz);
     let iterations = 0;
-    const maxIterations = 1500;
+    const maxIterations = 950;
+    const reqWalkMask = selfRad >= 0.72 ? 2 : 1;
 
     const dirs = [
         [1, 0, 1.0], [-1, 0, 1.0], [0, 1, 1.0], [0, -1, 1.0],
         [1, 1, 1.414], [1, -1, 1.414], [-1, 1, 1.414], [-1, -1, 1.414]
     ];
 
-    while (openList.length > 0 && iterations < maxIterations) {
+    while (_astarHeapSize > 0 && iterations < maxIterations) {
         iterations++;
-        let minIdx = 0;
-        let minF = fScoreArr[openList[0]];
-        for (let i = 1; i < openList.length; i++) {
-            const f = fScoreArr[openList[i]];
-            if (f < minF) { minF = f; minIdx = i; }
-        }
-        const curr = openList[minIdx];
-        openList[minIdx] = openList[openList.length - 1];
-        openList.pop();
+        const curr = _astarHeapPop();
 
         if (curr === goalIdx) {
             bestNode = curr;
             break;
         }
-        if (closed[curr]) continue;
-        closed[curr] = 1;
+        if (_astarClosed[curr]) continue;
+        _astarClosed[curr] = 1;
 
         const cx = curr % NAV_GRID_DIM;
-        const cz = Math.floor(curr / NAV_GRID_DIM);
+        const cz = (curr / NAV_GRID_DIM) | 0;
         const hDist = Math.hypot(gx - cx, gz - cz);
         if (hDist < bestHeuristic) {
             bestHeuristic = hDist;
@@ -1937,56 +2589,42 @@ function computeAStarWalkablePath(startPos, goalPos, selfRad, structCircles) {
             const nz = cz + dirs[d][1];
             if (nx < 0 || nx >= NAV_GRID_DIM || nz < 0 || nz >= NAV_GRID_DIM) continue;
             const nIdx = nz * NAV_GRID_DIM + nx;
-            if (closed[nIdx]) continue;
+            if (_astarClosed[nIdx]) continue;
 
             const wx = toWorld(nx);
             const wz = toWorld(nz);
-            const nearGoalOnSlope = Math.hypot(wx - goalPos.x, wz - goalPos.z) < 2.8 && isWalkableGround(wx, wz, selfRad * 0.4);
-            if (nIdx !== goalIdx && !nearGoalOnSlope && !isPointWalkableForUnitSize(wx, wz, selfRad, structCircles, goalPos)) {
-                continue;
+            const gdx = wx - goalPos.x, gdz = wz - goalPos.z;
+            const nearGoalOnSlope = (gdx * gdx + gdz * gdz < 7.84) && ((_astarStaticWalkable[nIdx] & 1) !== 0 || isWalkableGround(wx, wz, selfRad * 0.4));
+            if (nIdx !== goalIdx && !nearGoalOnSlope) {
+                if ((_astarStaticWalkable[nIdx] & reqWalkMask) === 0) continue;
+                if (!isPointWalkableForUnitSize(wx, wz, selfRad, structCircles, goalPos)) continue;
             }
 
-            let stepCost = dirs[d][2];
-            if (isOnRiverBridge(wx, wz)) {
-                stepCost *= 0.72;
-            } else if (typeof getSupplyRoadFactor === 'function') {
-                const rf = getSupplyRoadFactor(wx, wz);
-                if (rf > 0.12) {
-                    // Strongly favor supply roads & ramp corridors so units follow roads smoothly!
-                    stepCost *= (1.0 - rf * 0.38);
-                } else {
-                    // Strongly penalize steep/complex off-road slopes so A* routes cleanly around cliffs, craters, canyons & mountains
-                    const norm = getTerrainNormal(wx, wz);
-                    const slopeGrade = Math.max(0, 1.0 - norm.y);
-                    if (slopeGrade > 0.06) {
-                        stepCost += slopeGrade * 6.5;
-                    }
+            let stepCost = dirs[d][2] * (_astarStaticCostMult[nIdx] || 1.0);
+            if (NAV_STUCK_HOTSPOTS.length > 0) {
+                const stuckPenalty = getNavStuckPenalty(wx, wz);
+                if (stuckPenalty > 0) {
+                    stepCost += stuckPenalty * (3.2 + extraCongestionPenalty);
                 }
             }
-            // Self-Calibrating Babyspot Penalty: route around coordinates where units previously got stuck!
-            const stuckPenalty = getNavStuckPenalty(wx, wz);
-            if (stuckPenalty > 0) {
-                stepCost += stuckPenalty * 3.2;
-            }
 
-            const tentativeG = gScore[curr] + stepCost;
-            if (tentativeG < gScore[nIdx]) {
-                parent[nIdx] = curr;
-                gScore[nIdx] = tentativeG;
-                fScoreArr[nIdx] = tentativeG + Math.hypot(gx - nx, gz - nz) * 1.15;
-                openList.push(nIdx);
+            const tentativeG = _astarGScore[curr] + stepCost;
+            if (tentativeG < _astarGScore[nIdx]) {
+                _astarParent[nIdx] = curr;
+                _astarGScore[nIdx] = tentativeG;
+                _astarFScore[nIdx] = tentativeG + Math.hypot(gx - nx, gz - nz) * 1.15;
+                _astarHeapPush(nIdx);
             }
         }
     }
 
-    // Reconstruct path from bestNode
     const rawPts = [];
     let trace = bestNode;
     while (trace !== -1 && trace !== startIdx) {
         const tx = toWorld(trace % NAV_GRID_DIM);
-        const tz = toWorld(Math.floor(trace / NAV_GRID_DIM));
+        const tz = toWorld((trace / NAV_GRID_DIM) | 0);
         rawPts.push(new THREE.Vector3(tx, getSurfaceHeightWithBridges(tx, tz), tz));
-        trace = parent[trace];
+        trace = _astarParent[trace];
     }
     rawPts.reverse();
     rawPts.push(goalPos.clone());
@@ -2009,72 +2647,92 @@ function computeAStarWalkablePath(startPos, goalPos, selfRad, structCircles) {
     }
     return smoothed;
 }
+window.computeAStarWalkablePath = computeAStarWalkablePath;
+
+const _localUnitBlockerScratch = [];
 
 function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, blockerList = null, buildingsList = null, enemyBuildingsList = null) {
+    const _navT0 = (window.PERF_PROFILER && window.PERF_PROFILER.enabled) ? performance.now() : 0;
     if (selfActor && selfActor.bridgeClearedTimer > 0) {
         selfActor.bridgeClearedTimer = Math.max(0, selfActor.bridgeClearedTimer - dt);
     }
     const rawToTargetX = targetPos.x - currPos.x;
     const rawToTargetZ = targetPos.z - currPos.z;
     const distToTarget = Math.hypot(rawToTargetX, rawToTargetZ);
-    if (distToTarget < 0.01) return new THREE.Vector3();
+    if (distToTarget < 0.01) {
+        if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+        return _stepReturnScratch.set(0, 0, 0);
+    }
 
     const selfRad = (selfActor && selfActor.radius) ? selfActor.radius : 0.52;
     const isTank = !!(selfActor && (selfActor.type === 'tank' || selfActor.type === 'siege_tank'));
     const structCircles = gatherStructureBlockers(selfRad, buildingsList, enemyBuildingsList);
 
-    // 0. Bridge Guardrail Escape & Centering Logic
-    const rc = getRiverCoords(currPos.x, currPos.z);
+    // 0. Bridge Guardrail Escape & Centering Logic (Uses unified bridge orthonormal basis!)
     const onOrCrossingBridge = isOnRiverBridge(currPos.x, currPos.z, 1.4) || !!(selfActor && selfActor.inBridgeChute);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        const dU = Math.abs(rc.u - bCenterU);
-        if (dU <= RIVER_HALF_WIDTH + 1.35) {
-            const dS = rc.s - br.sCoord;
+        if (br.destroyed) continue;
+        const bc = getBridgeLocalCoords(br, currPos.x, currPos.z);
+        const dU = Math.abs(bc.localU);
+        const effRiverHalfW = br.riverHalfW || RIVER_HALF_WIDTH;
+        if (dU <= effRiverHalfW + 1.45) {
+            const dS = bc.localS;
             const absDS = Math.abs(dS);
             const safeCorridor = br.halfWidth - 0.52 - Math.min(0.24, selfRad * 0.30);
             if (absDS > safeCorridor && absDS <= br.halfWidth + 1.35) {
                 const pushInwardSign = dS > 0 ? -1 : 1;
-                const inwardX = pushInwardSign * 0.70710678;
-                const inwardZ = -pushInwardSign * 0.70710678;
+                const cosY = br.cosYaw !== undefined ? br.cosYaw : RIVER_COS;
+                const sinY = br.sinYaw !== undefined ? br.sinYaw : RIVER_SIN;
+                const inwardX = pushInwardSign * cosY;
+                const inwardZ = -pushInwardSign * sinY;
 
-                if (absDS >= br.halfWidth - 0.20 && dU > RIVER_HALF_WIDTH + 0.25) {
-                    const bankSign = (rc.u - bCenterU) >= 0 ? 1 : -1;
-                    const inlandX = bankSign * 0.70710678;
-                    const inlandZ = bankSign * 0.70710678;
-                    const aroundRailVec = new THREE.Vector3(inlandX * 0.68 + inwardX * 0.72, 0, inlandZ * 0.68 + inwardZ * 0.72).normalize();
+                if (absDS >= br.halfWidth - 0.20 && dU > effRiverHalfW + 0.25) {
+                    const bankSign = bc.localU >= 0 ? 1 : -1;
+                    const inlandX = bankSign * sinY;
+                    const inlandZ = bankSign * cosY;
+                    _stepReturnScratch.set(inlandX * 0.68 + inwardX * 0.72, 0, inlandZ * 0.68 + inwardZ * 0.72).normalize();
                     if (selfActor && selfActor.smoothStepDir) {
-                        selfActor.smoothStepDir.lerp(aroundRailVec, Math.min(1, dt * 14.0)).normalize();
-                        return selfActor.smoothStepDir.clone();
+                        selfActor.smoothStepDir.lerp(_stepReturnScratch, Math.min(1, dt * 14.0)).normalize();
+                        if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+                        return _stepReturnScratch.copy(selfActor.smoothStepDir);
                     }
-                    return aroundRailVec;
+                    if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+                    return _stepReturnScratch;
                 }
 
                 const toTgtNormX = rawToTargetX / distToTarget;
                 const toTgtNormZ = rawToTargetZ / distToTarget;
-                const centerBlend = new THREE.Vector3(toTgtNormX * 0.80 + inwardX * 0.60, 0, toTgtNormZ * 0.80 + inwardZ * 0.60).normalize();
+                _stepReturnScratch.set(toTgtNormX * 0.80 + inwardX * 0.60, 0, toTgtNormZ * 0.80 + inwardZ * 0.60).normalize();
                 if (selfActor && selfActor.smoothStepDir) {
-                    selfActor.smoothStepDir.lerp(centerBlend, Math.min(1, dt * 14.0)).normalize();
-                    return selfActor.smoothStepDir.clone();
+                    selfActor.smoothStepDir.lerp(_stepReturnScratch, Math.min(1, dt * 14.0)).normalize();
+                    if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+                    return _stepReturnScratch.copy(selfActor.smoothStepDir);
                 }
-                return centerBlend;
+                if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+                return _stepReturnScratch;
             }
         }
     }
 
-    // 1. If unit is currently overlapping any building/obstacle footprint or multi-lobe pond edge, immediately push radially & tangentially outward!
-    for (let i = 0; i < structCircles.length; i++) {
-        const sc = structCircles[i];
-        if (!sc.isBridgeBarrier && !sc.isDynamicPond && Math.hypot(targetPos.x - sc.x, targetPos.z - sc.z) < sc.r + 0.45) continue;
+    // 1. If unit is currently overlapping any building/obstacle footprint in its local spatial bucket, push radially & tangentially outward!
+    const localStructBucket = _structGridBuckets[_toSGridCoord(currPos.z) * SGRID_DIM + _toSGridCoord(currPos.x)];
+    for (let i = 0; i < localStructBucket.length; i++) {
+        const sc = localStructBucket[i];
+        const effScR = sc.rawR + (sc.isBuilding ? (selfRad + 0.42) : (Math.min(0.42, selfRad * 0.72) + 0.12));
+        if (!sc.isBridgeBarrier && !sc.isDynamicPond) {
+            const tdx = targetPos.x - sc.x, tdz = targetPos.z - sc.z;
+            if (tdx * tdx + tdz * tdz < (effScR + 0.45) * (effScR + 0.45)) continue;
+        }
         const dx = currPos.x - sc.x;
         const dz = currPos.z - sc.z;
-        const d = Math.hypot(dx, dz);
         let minOverlapR = sc.isBuilding ? (sc.rawR + selfRad + 0.28) : (sc.rawR + selfRad * 0.78 + 0.20);
         if (sc.isDynamicPond && sc.pondRef) {
             minOverlapR = getDynamicPondRadiusAtAngle(sc.pondRef, Math.atan2(dz, dx)) + selfRad + 0.48;
         }
-        if (d < minOverlapR && d > 0.0001) {
+        const dSq = dx * dx + dz * dz;
+        if (dSq < minOverlapR * minOverlapR && dSq > 0.000001) {
+            const d = Math.sqrt(dSq);
             const rnx = dx / d;
             const rnz = dz / d;
             const t1x = -rnz, t1z = rnx;
@@ -2083,37 +2741,52 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
             const dot2 = t2x * rawToTargetX + t2z * rawToTargetZ;
             const tx = dot1 >= dot2 ? t1x : t2x;
             const tz = dot1 >= dot2 ? t1z : t2z;
-            const escapeVec = new THREE.Vector3(rnx * 0.58 + tx * 0.82, 0, rnz * 0.58 + tz * 0.82).normalize();
-            if (isWalkableGround(currPos.x + escapeVec.x * 0.55, currPos.z + escapeVec.z * 0.55, selfRad * 0.45)) {
-                return escapeVec;
+            _stepReturnScratch.set(rnx * 0.58 + tx * 0.82, 0, rnz * 0.58 + tz * 0.82).normalize();
+            if (isWalkableGround(currPos.x + _stepReturnScratch.x * 0.55, currPos.z + _stepReturnScratch.z * 0.55, selfRad * 0.45)) {
+                if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+                return _stepReturnScratch;
             }
         }
     }
 
     // 2. Use Size-Aware Walkable A* Pathfinding when direct segment is blocked by terrain structures, puddles/ponds, or cliffs
-    // Optimized: Only evaluate segment raycast & A* when repath timer expires or goal moves!
     let steerTarget = targetPos;
     if (selfActor) {
-        selfActor.navRepathTimer = (selfActor.navRepathTimer || 0) - dt;
-        const goalMoved = !selfActor.navGoalPos || Math.hypot(targetPos.x - selfActor.navGoalPos.x, targetPos.z - selfActor.navGoalPos.z) > 2.4;
+        selfActor.navRepathTimer = (Number.isFinite(selfActor.navRepathTimer) ? selfActor.navRepathTimer : 0) - dt;
+        const goalMoved = !selfActor.navGoalPos ||
+            ((targetPos.x - selfActor.navGoalPos.x) * (targetPos.x - selfActor.navGoalPos.x) +
+             (targetPos.z - selfActor.navGoalPos.z) * (targetPos.z - selfActor.navGoalPos.z)) > 5.76;
 
         if (onOrCrossingBridge) {
             selfActor.navWaypoints = null;
         } else if (selfActor.navRepathTimer <= 0 || goalMoved) {
-            selfActor.navGoalPos = targetPos.clone();
-            selfActor.navRepathTimer = 0.48 + (Math.random() * 0.22);
+            if (!selfActor.navGoalPos) selfActor.navGoalPos = targetPos.clone();
+            else selfActor.navGoalPos.copy(targetPos);
+            const tierIdx = (window.PERF_MANAGER && window.PERF_MANAGER.current && Number.isFinite(window.PERF_MANAGER.current.tierIndex))
+                ? window.PERF_MANAGER.current.tierIndex
+                : 0;
+            selfActor.navRepathTimer = (0.52 + tierIdx * 0.16) + ((selfActor._aiSlotId || 0) % 7) * 0.04;
             const directClear = distToTarget < 75.0 && isSegmentClearForUnitSize(currPos.x, currPos.z, targetPos.x, targetPos.z, selfRad, structCircles, targetPos);
             if (directClear) {
                 selfActor.navWaypoints = null;
             } else {
-                selfActor.navWaypoints = computeAStarWalkablePath(currPos, targetPos, selfRad, structCircles);
+                selfActor.navWaypoints = computeAStarWalkablePath(
+                    currPos,
+                    targetPos,
+                    selfRad,
+                    structCircles,
+                    selfActor._navCongestionWeight || 0
+                );
             }
         }
 
         if (selfActor.navWaypoints && selfActor.navWaypoints.length > 0) {
+            const reachRad = Math.max(1.75, selfRad * 2.2);
+            const reachRadSq = reachRad * reachRad;
             while (selfActor.navWaypoints.length > 1) {
                 const wp = selfActor.navWaypoints[0];
-                if (Math.hypot(wp.x - currPos.x, wp.z - currPos.z) < Math.max(1.75, selfRad * 2.2)) {
+                const wdx = wp.x - currPos.x, wdz = wp.z - currPos.z;
+                if (wdx * wdx + wdz * wdz < reachRadSq) {
                     selfActor.navWaypoints.shift();
                 } else {
                     break;
@@ -2126,34 +2799,38 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
     const toSteerX = steerTarget.x - currPos.x;
     const toSteerZ = steerTarget.z - currPos.z;
     const steerDist = Math.hypot(toSteerX, toSteerZ) || 0.001;
-    let desiredDir = new THREE.Vector3(toSteerX / steerDist, 0, toSteerZ / steerDist);
+    let desiredDirX = toSteerX / steerDist;
+    let desiredDirZ = toSteerZ / steerDist;
 
-    // 2B. CONTINUOUS TANGENTIAL DEFLECTION FIELD AROUND ALL TERRAIN STRUCTURES, MULTI-LOBE PUDDLES/PONDS, STEEP SLOPES & LEARNED STUCK BABYSPOTS:
-    // Smoothly bends unit trajectories around buildings, bunkers, ruins, rocks, trees, water puddles, and steep terrain before collision!
+    // 2B. CONTINUOUS TANGENTIAL DEFLECTION FIELD AROUND LOCAL SPATIAL BUCKET STRUCTURES & PONDS:
     let propFlowX = 0;
     let propFlowZ = 0;
-    for (let i = 0; i < structCircles.length; i++) {
-        const sc = structCircles[i];
-        if (!sc.isBridgeBarrier && !sc.isDynamicPond && Math.hypot(targetPos.x - sc.x, targetPos.z - sc.z) < sc.r + 0.55) continue;
+    for (let i = 0; i < localStructBucket.length; i++) {
+        const sc = localStructBucket[i];
+        const effScR = sc.rawR + (sc.isBuilding ? (selfRad + 0.42) : (Math.min(0.42, selfRad * 0.72) + 0.12));
+        if (!sc.isBridgeBarrier && !sc.isDynamicPond) {
+            const tdx = targetPos.x - sc.x, tdz = targetPos.z - sc.z;
+            if (tdx * tdx + tdz * tdz < (effScR + 0.55) * (effScR + 0.55)) continue;
+        }
         const toObX = sc.x - currPos.x;
         const toObZ = sc.z - currPos.z;
-        const distToOb = Math.hypot(toObX, toObZ);
         let effObR = sc.rawR;
         if (sc.isDynamicPond && sc.pondRef) {
             effObR = getDynamicPondRadiusAtAngle(sc.pondRef, Math.atan2(-toObZ, -toObX));
         }
         const margin = sc.isDynamicPond ? 1.45 : (sc.isBuilding ? 1.35 : 1.15);
         const influenceRad = effObR + selfRad + margin;
-        if (distToOb < influenceRad && distToOb > 0.001) {
+        const distToObSq = toObX * toObX + toObZ * toObZ;
+        if (distToObSq < influenceRad * influenceRad && distToObSq > 0.000001) {
+            const distToOb = Math.sqrt(distToObSq);
             const obDirX = toObX / distToOb;
             const obDirZ = toObZ / distToOb;
-            const forwardDot = obDirX * desiredDir.x + obDirZ * desiredDir.z;
+            const forwardDot = obDirX * desiredDirX + obDirZ * desiredDirZ;
             if (forwardDot > 0.05) {
                 const tLX = -obDirZ, tLZ = obDirX;
                 const tRX = obDirZ,  tRZ = -obDirX;
-                const dotL = tLX * desiredDir.x + tLZ * desiredDir.z;
-                const dotR = tRX * desiredDir.x + tRZ * desiredDir.z;
-                // Maintain consistent side choice when wall-following or flanking around trees/rocks
+                const dotL = tLX * desiredDirX + tLZ * desiredDirZ;
+                const dotR = tRX * desiredDirX + tRZ * desiredDirZ;
                 let tangX = dotL >= dotR ? tLX : tRX;
                 let tangZ = dotL >= dotR ? tLZ : tRZ;
                 if (selfActor && selfActor.wallFollowSign && Math.abs(dotL - dotR) < 0.25) {
@@ -2169,17 +2846,17 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
 
     // Steep Terrain Escarpment Deflection: if the slope ahead is steep, deflect tangentially along the contour line!
     if (!onOrCrossingBridge) {
-        const aheadX = currPos.x + desiredDir.x * (selfRad + 1.35);
-        const aheadZ = currPos.z + desiredDir.z * (selfRad + 1.35);
-        const aheadNorm = getTerrainNormal(aheadX, aheadZ);
+        const aheadX = currPos.x + desiredDirX * (selfRad + 1.35);
+        const aheadZ = currPos.z + desiredDirZ * (selfRad + 1.35);
+        const aheadNorm = getTerrainNormalInto(aheadX, aheadZ, _normalScratchVec);
         if (aheadNorm.y < 0.68) {
             const nLen = Math.hypot(aheadNorm.x, aheadNorm.z) || 1;
             const downSlopeX = aheadNorm.x / nLen;
             const downSlopeZ = aheadNorm.z / nLen;
             const cLX = -downSlopeZ, cLZ = downSlopeX;
             const cRX = downSlopeZ,  cRZ = -downSlopeX;
-            const cDotL = cLX * desiredDir.x + cLZ * desiredDir.z;
-            const cDotR = cRX * desiredDir.x + cRZ * desiredDir.z;
+            const cDotL = cLX * desiredDirX + cLZ * desiredDirZ;
+            const cDotR = cRX * desiredDirX + cRZ * desiredDirZ;
             const contourX = cDotL >= cDotR ? cLX : cRX;
             const contourZ = cDotL >= cDotR ? cLZ : cRZ;
             const steepness = THREE.MathUtils.clamp((0.68 - aheadNorm.y) * 4.5, 0, 2.8);
@@ -2194,11 +2871,12 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
             const hs = NAV_STUCK_HOTSPOTS[i];
             const toHsX = hs.x - currPos.x;
             const toHsZ = hs.z - currPos.z;
-            const distToHs = Math.hypot(toHsX, toHsZ);
-            if (distToHs < hs.radius && distToHs > 0.001) {
+            const distToHsSq = toHsX * toHsX + toHsZ * toHsZ;
+            if (distToHsSq < hs.radius * hs.radius && distToHsSq > 0.000001) {
+                const distToHs = Math.sqrt(distToHsSq);
                 const hsDirX = toHsX / distToHs;
                 const hsDirZ = toHsZ / distToHs;
-                if (hsDirX * desiredDir.x + hsDirZ * desiredDir.z > 0.0) {
+                if (hsDirX * desiredDirX + hsDirZ * desiredDirZ > 0.0) {
                     const sign = (selfActor && selfActor.flankSign < 0) ? -1 : 1;
                     const tangX = -hsDirZ * sign;
                     const tangZ = hsDirX * sign;
@@ -2213,8 +2891,8 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
     if (!onOrCrossingBridge && distToTarget > 4.5 && typeof getSupplyRoadFactor === 'function') {
         const rfCurr = getSupplyRoadFactor(currPos.x, currPos.z);
         if (rfCurr > 0.05 && rfCurr < 0.88) {
-            const perpX = -desiredDir.z;
-            const perpZ = desiredDir.x;
+            const perpX = -desiredDirZ;
+            const perpZ = desiredDirX;
             const rfLeft = getSupplyRoadFactor(currPos.x + perpX * 1.4, currPos.z + perpZ * 1.4);
             const rfRight = getSupplyRoadFactor(currPos.x - perpX * 1.4, currPos.z - perpZ * 1.4);
             const roadGrad = rfLeft - rfRight;
@@ -2225,10 +2903,16 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
         }
     }
     if (propFlowX * propFlowX + propFlowZ * propFlowZ > 0.0001) {
-        desiredDir.x += propFlowX;
-        desiredDir.z += propFlowZ;
-        desiredDir.normalize();
+        desiredDirX += propFlowX;
+        desiredDirZ += propFlowZ;
+        const dNorm = Math.hypot(desiredDirX, desiredDirZ) || 1;
+        desiredDirX /= dNorm;
+        desiredDirZ /= dNorm;
     }
+
+    const localBlockers = (typeof window.queryGroundUnitsNearInto === 'function')
+        ? window.queryGroundUnitsNearInto(currPos.x, currPos.z, selfRad + 4.2, _localUnitBlockerScratch)
+        : (blockerList || _localUnitBlockerScratch);
 
     // ACTIVE PATH-YIELDING ("GIVE PATH"): Lighter ground units proactively step aside for friendly Tanks & Heavy Mechs!
     const isHeavySelf = isTank || (selfActor && (
@@ -2236,11 +2920,11 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
         selfActor.variant === 'behemoth' ||
         selfActor.variant === 'crusher'
     ));
-    if (!isHeavySelf && selfActor && blockerList && blockerList.length > 0) {
+    if (!isHeavySelf && selfActor && localBlockers.length > 0) {
         let yieldVecX = 0;
         let yieldVecZ = 0;
-        for (let i = 0; i < blockerList.length; i++) {
-            const other = blockerList[i];
+        for (let i = 0; i < localBlockers.length; i++) {
+            const other = localBlockers[i];
             if (!other || other === selfActor || other.isAir || other.hp <= 0) continue;
             const isHeavyOther = other.type === 'tank' || other.type === 'siege_tank' ||
                 (other.type === 'valkyrie' && other.mechMode) ||
@@ -2250,9 +2934,10 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
 
             const dx = currPos.x - other.mesh.position.x;
             const dz = currPos.z - other.mesh.position.z;
-            const dist = Math.hypot(dx, dz);
             const yieldRadius = (other.radius || 1.15) + selfRad + 2.35;
-            if (dist < yieldRadius && dist > 0.001) {
+            const distSq = dx * dx + dz * dz;
+            if (distSq < yieldRadius * yieldRadius && distSq > 0.000001) {
+                const dist = Math.sqrt(distSq);
                 const heavyYaw = other.currentYaw !== undefined ? other.currentYaw : (other.mesh ? other.mesh.rotation.y : 0);
                 const hDirX = (other.smoothStepDir && other.smoothStepDir.lengthSq() > 0.01) ? other.smoothStepDir.x : Math.sin(heavyYaw);
                 const hDirZ = (other.smoothStepDir && other.smoothStepDir.lengthSq() > 0.01) ? other.smoothStepDir.z : Math.cos(heavyYaw);
@@ -2277,9 +2962,11 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
             }
         }
         if (yieldVecX * yieldVecX + yieldVecZ * yieldVecZ > 0.001) {
-            desiredDir.x += yieldVecX;
-            desiredDir.z += yieldVecZ;
-            desiredDir.normalize();
+            desiredDirX += yieldVecX;
+            desiredDirZ += yieldVecZ;
+            const dNorm = Math.hypot(desiredDirX, desiredDirZ) || 1;
+            desiredDirX /= dNorm;
+            desiredDirZ /= dNorm;
         }
     }
 
@@ -2288,25 +2975,25 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
     const midLook = Math.max(0.82, stepDist * 2.0);
 
     function isBlockedByUnit(px, pz) {
-        if (!blockerList || !selfActor) return false;
-        for (let i = 0; i < blockerList.length; i++) {
-            const other = blockerList[i];
+        if (!selfActor || localBlockers.length === 0) return false;
+        for (let i = 0; i < localBlockers.length; i++) {
+            const other = localBlockers[i];
             if (other === selfActor || other.isAir || other.hp <= 0) continue;
             const isOtherHeavy = other.type === 'tank' || other.type === 'siege_tank' ||
                 (other.type === 'valkyrie' && other.mechMode) ||
                 other.variant === 'behemoth' ||
                 other.variant === 'crusher';
             const isOtherAnchored = !!(other.type === 'siege_tank' && other.siegeMode);
-            // Heavy units have right-of-way over lighter infantry, EXCEPT they must steer around anchored Siege Tanks!
             if (isHeavySelf && !isOtherHeavy && !isOtherAnchored) continue;
             const ox = other.mesh.position.x;
             const oz = other.mesh.position.z;
             const relX = ox - currPos.x;
             const relZ = oz - currPos.z;
-            if (relX * desiredDir.x + relZ * desiredDir.z <= -0.05) continue;
+            if (relX * desiredDirX + relZ * desiredDirZ <= -0.05) continue;
             const extraPad = isOtherAnchored ? 0.38 : ((isTank && other.type === 'tank') ? 0.05 : (isOtherHeavy ? 0.28 : 0.16));
             const minClearance = selfRad + (other.radius || 0.52) + extraPad;
-            if (Math.hypot(px - ox, pz - oz) < minClearance) return true;
+            const dx = px - ox, dz = pz - oz;
+            if (dx * dx + dz * dz < minClearance * minClearance) return true;
         }
         return false;
     }
@@ -2319,20 +3006,19 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
         ? selfActor.wallFollowSign
         : ((selfActor && selfActor.flankSign < 0) ? -1 : 1);
 
-    // Streamlined 12-angle 360-degree turn-around probe fan (cuts per-unit CPU probe cost by 40% while preserving full turn-around agility!)
     const testAngles = activeSign < 0
         ? [0, -0.26, 0.26, -0.58, 0.58, -0.98, 0.98, -1.48, 1.48, -2.15, 2.15, Math.PI]
         : [0, 0.26, -0.26, 0.58, -0.58, 0.98, -0.98, 1.48, -1.48, 2.15, -2.15, Math.PI];
 
-    let chosenStep = null;
-    let fallbackStructSafeDir = null;
-    let fallbackTerrainDir = null;
+    let chosenX = 0, chosenZ = 0, hasChosen = false;
+    let fallbackStructX = 0, fallbackStructZ = 0, hasFallbackStruct = false;
+    let fallbackTerrX = 0, fallbackTerrZ = 0, hasFallbackTerr = false;
 
     for (let i = 0; i < testAngles.length; i++) {
         const ang = testAngles[i];
         const cos = Math.cos(ang), sin = Math.sin(ang);
-        const dx = desiredDir.x * cos - desiredDir.z * sin;
-        const dz = desiredDir.x * sin + desiredDir.z * cos;
+        const dx = desiredDirX * cos - desiredDirZ * sin;
+        const dz = desiredDirX * sin + desiredDirZ * cos;
 
         const nearProbeX = currPos.x + dx * (selfRad + 0.30);
         const nearProbeZ = currPos.z + dz * (selfRad + 0.30);
@@ -2341,42 +3027,48 @@ function computeSafeGroundStep(currPos, targetPos, speed, dt, selfActor = null, 
         const probeX = currPos.x + dx * lookAhead;
         const probeZ = currPos.z + dz * lookAhead;
 
-        if (isWalkableGround(nearProbeX, nearProbeZ, selfRad * 0.65) &&
-            isWalkableGround(midProbeX, midProbeZ, selfRad * 0.65) &&
+        if (!isBlockedByStructure(nearProbeX, nearProbeZ) &&
+            !isBlockedByStructure(midProbeX, midProbeZ) &&
             isWalkableGround(probeX, probeZ, selfRad * 0.65)) {
-            if (!fallbackTerrainDir) fallbackTerrainDir = new THREE.Vector3(dx, 0, dz);
-            const structBlocked = isBlockedByStructure(nearProbeX, nearProbeZ) || isBlockedByStructure(midProbeX, midProbeZ);
-            if (!structBlocked) {
-                if (!fallbackStructSafeDir) fallbackStructSafeDir = new THREE.Vector3(dx, 0, dz);
-                if (!isBlockedByUnit(nearProbeX, nearProbeZ)) {
-                    chosenStep = new THREE.Vector3(dx, 0, dz);
-                    break;
-                }
+            if (!hasFallbackTerr) { fallbackTerrX = dx; fallbackTerrZ = dz; hasFallbackTerr = true; }
+            if (!hasFallbackStruct) { fallbackStructX = dx; fallbackStructZ = dz; hasFallbackStruct = true; }
+            if (!isBlockedByUnit(nearProbeX, nearProbeZ)) {
+                chosenX = dx; chosenZ = dz; hasChosen = true;
+                break;
             }
+        } else if (!hasFallbackTerr &&
+                   isWalkableGround(nearProbeX, nearProbeZ, selfRad * 0.65) &&
+                   isWalkableGround(midProbeX, midProbeZ, selfRad * 0.65) &&
+                   isWalkableGround(probeX, probeZ, selfRad * 0.65)) {
+            fallbackTerrX = dx; fallbackTerrZ = dz; hasFallbackTerr = true;
         }
     }
 
-    const finalDir = chosenStep || fallbackStructSafeDir || fallbackTerrainDir || desiredDir;
+    const finalX = hasChosen ? chosenX : (hasFallbackStruct ? fallbackStructX : (hasFallbackTerr ? fallbackTerrX : desiredDirX));
+    const finalZ = hasChosen ? chosenZ : (hasFallbackStruct ? fallbackStructZ : (hasFallbackTerr ? fallbackTerrZ : desiredDirZ));
+    _stepReturnScratch.set(finalX, 0, finalZ);
 
     if (selfActor) {
         if (!selfActor.smoothStepDir) {
-            selfActor.smoothStepDir = finalDir.clone();
+            selfActor.smoothStepDir = _stepReturnScratch.clone();
         } else {
             const smoothRate = isTank ? 6.5 : 14.0;
-            selfActor.smoothStepDir.lerp(finalDir, Math.min(1, dt * smoothRate));
+            selfActor.smoothStepDir.lerp(_stepReturnScratch, Math.min(1, dt * smoothRate));
             if (selfActor.smoothStepDir.lengthSq() > 0.0001) {
                 selfActor.smoothStepDir.normalize();
             } else {
-                selfActor.smoothStepDir.copy(finalDir);
+                selfActor.smoothStepDir.copy(_stepReturnScratch);
             }
         }
-        return selfActor.smoothStepDir.clone();
+        if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+        return _stepReturnScratch.copy(selfActor.smoothStepDir);
     }
 
-    return finalDir;
+    if (_navT0 > 0) window.PERF_PROFILER.addSample('groundNavigation', performance.now() - _navT0);
+    return _stepReturnScratch;
 }
 
-// Universal Clear Spawn & Escape Point Finder: supports both (originX, originZ, targetX, targetZ, rad, blds, enemyBlds, units) and (originVec3, ...)
+// Universal Clear Spawn & Escape Point Finder: accelerated via spatial structure & ground-unit grids
 function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
     let ox = 0, oz = 0, tx = 0, tz = 1, unitRadius = 0.55;
     let buildingsList = [];
@@ -2384,7 +3076,6 @@ function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
     let unitsList = [];
 
     if (arg1 && typeof arg1 === 'object' && 'x' in arg1) {
-        // Legacy object signature: (originPos, unitRadius, isAir, buildingsList, unitsList)
         ox = Number(arg1.x) || 0;
         oz = Number(arg1.z) || 0;
         unitRadius = typeof arg2 === 'number' ? arg2 : 0.55;
@@ -2397,7 +3088,6 @@ function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
         tx = ox;
         tz = oz + 4.0;
     } else {
-        // 8-argument signature: (originX, originZ, targetX, targetZ, unitRadius, buildingsList, enemyBuildingsList, unitsList)
         ox = Number(arg1) || 0;
         oz = Number(arg2) || 0;
         tx = Number.isFinite(Number(arg3)) ? Number(arg3) : ox;
@@ -2408,11 +3098,16 @@ function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
         unitsList = Array.isArray(arg8) ? arg8 : [];
     }
 
+    gatherStructureBlockers(unitRadius, buildingsList, enemyBuildingsList);
+
     const baseAngle = Math.atan2(tx - ox, tz - oz);
     const candidateRings = [2.65, 3.45, 4.35, 5.35, 6.45];
     const angleOffsets = [0, 0.36, -0.36, 0.72, -0.72, 1.08, -1.08, 1.45, -1.45, 1.85, -1.85, 2.25, -2.25, 2.68, -2.68, Math.PI];
 
     let fallbackBuildingFreePt = null;
+    const nearbyUnits = (typeof window.queryGroundUnitsNearInto === 'function')
+        ? window.queryGroundUnitsNearInto(ox, oz, 8.5, _localUnitBlockerScratch)
+        : (unitsList || []);
 
     for (let rIdx = 0; rIdx < candidateRings.length; rIdx++) {
         const dist = candidateRings[rIdx];
@@ -2421,37 +3116,17 @@ function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
             const px = ox + Math.sin(ang) * dist;
             const pz = oz + Math.cos(ang) * dist;
 
-            if (!isWalkableGround(px, pz)) continue;
+            if (!isWalkableGround(px, pz, unitRadius * 0.5)) continue;
 
-            // 1. Check natural obstacles
+            // 1. Check natural obstacles & buildings via spatial bucket
             let blocked = false;
-            for (let i = 0; i < obstacles.length; i++) {
-                const ob = obstacles[i];
-                if (Math.hypot(px - ob.x, pz - ob.z) < ob.r + unitRadius + 0.35) {
-                    blocked = true;
-                    break;
-                }
-            }
-            if (blocked) continue;
-
-            // 2. Check Friendly Buildings
-            for (let i = 0; i < buildingsList.length; i++) {
-                const b = buildingsList[i];
-                if (!b || b.hp <= 0) continue;
-                const bRad = b.type === 'base' ? 2.28 : (b.type === 'turret' ? 1.38 : 1.98);
-                if (Math.hypot(px - b.pos.x, pz - b.pos.z) < bRad + unitRadius + 0.42) {
-                    blocked = true;
-                    break;
-                }
-            }
-            if (blocked) continue;
-
-            // 3. Check Enemy Buildings
-            for (let i = 0; i < enemyBuildingsList.length; i++) {
-                const eb = enemyBuildingsList[i];
-                if (!eb || eb.hp <= 0) continue;
-                const ebRad = eb.role === 'citadel' ? 2.48 : (eb.role === 'spine_turret' ? 1.32 : 1.98);
-                if (Math.hypot(px - eb.pos.x, pz - eb.pos.z) < ebRad + unitRadius + 0.42) {
+            const bucket = _structGridBuckets[_toSGridCoord(pz) * SGRID_DIM + _toSGridCoord(px)];
+            for (let i = 0; i < bucket.length; i++) {
+                const sc = bucket[i];
+                const dx = px - sc.x;
+                const dz = pz - sc.z;
+                const reqR = sc.rawR + unitRadius + (sc.isBuilding ? 0.42 : 0.35);
+                if (dx * dx + dz * dz < reqR * reqR) {
                     blocked = true;
                     break;
                 }
@@ -2462,16 +3137,17 @@ function findClearSpawnPoint(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
                 fallbackBuildingFreePt = new THREE.Vector3(px, getTerrainHeight(px, pz), pz);
             }
 
-            // 4. Check existing Ground Units so spawned units don't stack on top of each other
+            // 2. Check nearby Ground Units so spawned units don't stack on top of each other
             let unitOverlap = false;
-            if (unitsList) {
-                for (let i = 0; i < unitsList.length; i++) {
-                    const u = unitsList[i];
-                    if (!u || u.isAir || u.hp <= 0 || !u.mesh) continue;
-                    if (Math.hypot(px - u.mesh.position.x, pz - u.mesh.position.z) < (u.radius || 0.52) + unitRadius + 0.16) {
-                        unitOverlap = true;
-                        break;
-                    }
+            for (let i = 0; i < nearbyUnits.length; i++) {
+                const u = nearbyUnits[i];
+                if (!u || u.isAir || u.hp <= 0 || !u.mesh) continue;
+                const dx = px - u.mesh.position.x;
+                const dz = pz - u.mesh.position.z;
+                const minU = (u.radius || 0.52) + unitRadius + 0.16;
+                if (dx * dx + dz * dz < minU * minU) {
+                    unitOverlap = true;
+                    break;
                 }
             }
             if (!unitOverlap) {
@@ -2529,15 +3205,33 @@ function addMapMesh(obj) {
     generatedMapMeshes.push(obj);
     return obj;
 }
+function disposeObjectGeometriesSafely(rootObj) {
+    if (!rootObj || typeof rootObj.traverse !== 'function') return;
+    rootObj.traverse(child => {
+        if (child && child.isMesh && child.geometry && child.geometry !== terrainGeo && child.geometry !== fowGeo) {
+            if (!child.geometry.userData || !child.geometry.userData.sharedGlobalGeo) {
+                try { child.geometry.dispose(); } catch (e) {}
+            }
+        }
+    });
+}
+
 function clearGeneratedMapMeshes() {
     while (generatedMapMeshes.length > 0) {
         const obj = generatedMapMeshes.pop();
-        if (obj && obj.parent) obj.parent.remove(obj);
+        if (obj) {
+            if (obj.parent) obj.parent.remove(obj);
+            disposeObjectGeometriesSafely(obj);
+        }
     }
     while (envMapMeshes.length > 0) {
         const obj = envMapMeshes.pop();
-        if (obj && obj.parent) obj.parent.remove(obj);
+        if (obj) {
+            if (obj.parent) obj.parent.remove(obj);
+            disposeObjectGeometriesSafely(obj);
+        }
     }
+    _roadSpatialCacheReady = false;
 }
 
 const terrainGeo = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE, IS_MOBILE ? 108 : 168, IS_MOBILE ? 108 : 168);
@@ -2576,11 +3270,13 @@ let SOUTH_ROAD_HUB = new THREE.Vector3(0, 0, -14);
 let NORTH_ROAD_HUB = new THREE.Vector3(0, 0, 6);
 let DYNAMIC_ROAD_SEGMENTS = [];
 let ROAD_JUNCTION_NODES = [];
+window.DYNAMIC_ROAD_SEGMENTS = DYNAMIC_ROAD_SEGMENTS;
+window.ROAD_JUNCTION_NODES = ROAD_JUNCTION_NODES;
 
 // ============================================================================
-// ALGORITHMIC PROCEDURAL SPLINE ROAD NETWORK GENERATOR (SEED-DRIVEN TOPOLOGY!)
-// Generates a clean, non-overlapping highway network with Cut-Off Ruined Road Ends
-// and smooth terrain grading along every roadbed so roads never cross bumps or overlap!
+// ALGORITHMIC GRAPH-BASED SPLINE ROAD NETWORK & O(1) SPATIAL ROAD CACHE
+// Evaluates C1/C2 cubic Bezier curves with control-point obstacle routing,
+// Laplacian XZ fairing, arc-length parameterization, and longitudinal grade clamping!
 // ============================================================================
 function evaluateRoadSplineRawPoint(seg, t) {
     const u = 1.0 - t;
@@ -2595,7 +3291,6 @@ function evaluateRoadSplineRawPoint(seg, t) {
         px = b0 * seg.ax + b1 * seg.c1x + b2 * seg.c2x + b3 * seg.bx;
         pz = b0 * seg.az + b1 * seg.c1z + b2 * seg.c2z + b3 * seg.bz;
     } else {
-        // Smooth Quadratic/Sinusoidal Curve with zero endpoint distortion
         const dx = seg.bx - seg.ax, dz = seg.bz - seg.az;
         const len = Math.hypot(dx, dz) || 1;
         const nx = -dz / len, nz = dx / len;
@@ -2605,69 +3300,145 @@ function evaluateRoadSplineRawPoint(seg, t) {
         pz = seg.az + t * dz + nz * bend;
     }
 
-    // Smooth radial obstacle avoidance around dynamic oasis ponds AND non-ramp cliff rims of Base/Corner Ramp Platforms!
-    const endPin = Math.sin(t * Math.PI);
-    if (endPin > 0.001) {
-        for (let i = 0; i < DYNAMIC_PONDS.length; i++) {
-            const pd = DYNAMIC_PONDS[i];
-            const dxP = px - pd.x;
-            const dzP = pz - pd.z;
-            const dPond = Math.hypot(dxP, dzP);
-            const angP = Math.atan2(dzP, dxP);
-            const effPondR = getDynamicPondRadiusAtAngle(pd, angP);
-            const minClear = effPondR + 3.6;
-            if (dPond < minClear && dPond > 0.01) {
-                const push = (minClear - dPond) * endPin;
-                px += (dxP / dPond) * push;
-                pz += (dzP / dPond) * push;
-            }
-        }
-        for (let b = 0; b < BASE_TERRAIN_ZONES.length; b++) {
-            const bz = BASE_TERRAIN_ZONES[b];
-            if (!bz || bz.mode === 'no_ramp') continue;
-            const dxB = px - bz.x;
-            const dzB = pz - bz.z;
-            const dBase = Math.hypot(dxB, dzB);
-            const cliffClearR = (bz.rimOuter || 20.0) + 4.2;
-            if (dBase < cliffClearR && dBase > 0.01) {
-                const zm = getBaseZoneRampMetrics(bz, px, pz);
-                // If not aligned with one of the ramp openings, smoothly guide the road around the cliff rim toward the ramp!
-                if (!zm.inRampAngle) {
-                    const push = (cliffClearR - dBase) * endPin;
-                    px += (dxB / dBase) * push;
-                    pz += (dzB / dBase) * push;
-                }
-            }
-        }
-    }
-
-    const widthMorph = (seg.baseWidth || 3.0) + Math.sin(t * Math.PI) * (seg.morphAmp || 0.06);
+    const widthMorph = (seg.baseWidth || 3.0) + Math.sin(t * Math.PI) * (seg.morphAmp || 0.04);
     return { x: px, z: pz, halfWidth: widthMorph * 0.5 };
 }
 
-function precomputeRoadSegmentSamples(seg, numSamples = 56) {
-    const samples = [];
-    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-    const maxHalfW = ((seg.baseWidth || 3.0) + Math.abs(seg.morphAmp || 0.2)) * 0.5 + 2.6;
+function precomputeRoadSegmentSamples(seg, numSamples = 64) {
+    const rawPts = [];
+    const maxHalfW = ((seg.baseWidth || 3.0) + Math.abs(seg.morphAmp || 0.2)) * 0.5 + 2.8;
 
+    // 1. Evaluate initial Bezier/curve samples
     for (let i = 0; i <= numSamples; i++) {
         const t = i / numSamples;
         const pt = evaluateRoadSplineRawPoint(seg, t);
-        pt.y = getTerrainHeight(pt.x, pt.z);
-        if (pt.x < minX) minX = pt.x;
-        if (pt.x > maxX) maxX = pt.x;
-        if (pt.z < minZ) minZ = pt.z;
-        if (pt.z > maxZ) maxZ = pt.z;
-        samples.push(pt);
+        rawPts.push(pt);
     }
 
-    // Smooth sample elevations along the spline (3 passes of moving average) so the roadbed has zero sudden bumps!
-    for (let pass = 0; pass < 3; pass++) {
+    // 2. Soft interior obstacle-avoidance relaxation around ponds, river bends & non-ramp base cliffs
+    //    Followed by 6 passes of Laplacian XZ smoothing so obstacle routing NEVER introduces sharp corners or zigzags!
+    for (let iter = 0; iter < 3; iter++) {
+        for (let i = 2; i <= numSamples - 2; i++) {
+            const t = i / numSamples;
+            const endPin = Math.sin(t * Math.PI);
+            const pt = rawPts[i];
+
+            for (let p = 0; p < DYNAMIC_PONDS.length; p++) {
+                const pd = DYNAMIC_PONDS[p];
+                const dxP = pt.x - pd.x;
+                const dzP = pt.z - pd.z;
+                const dPond = Math.hypot(dxP, dzP);
+                const effPondR = getDynamicPondRadiusAtAngle(pd, Math.atan2(dzP, dxP));
+                const minClear = effPondR + pt.halfWidth + 2.6;
+                if (dPond < minClear && dPond > 0.01) {
+                    const push = (minClear - dPond) * 0.65 * endPin;
+                    pt.x += (dxP / dPond) * push;
+                    pt.z += (dzP / dPond) * push;
+                }
+            }
+
+            if (HAS_VALLEY_RIVER && !seg.isBridgeCauseway) {
+                const rc = getRiverCoords(pt.x, pt.z);
+                const minRivClear = (rc.halfWidth || RIVER_HALF_WIDTH) + pt.halfWidth + 3.2;
+                if (rc.dist < minRivClear) {
+                    const pushSign = rc.signedDist >= 0 ? 1 : -1;
+                    const targetU = rc.centerU + pushSign * minRivClear;
+                    const wSafe = riverCoordsToWorld(rc.s, targetU);
+                    pt.x = THREE.MathUtils.lerp(pt.x, wSafe.x, 0.65 * endPin);
+                    pt.z = THREE.MathUtils.lerp(pt.z, wSafe.z, 0.65 * endPin);
+                }
+            }
+
+            for (let b = 0; b < BASE_TERRAIN_ZONES.length; b++) {
+                const bz = BASE_TERRAIN_ZONES[b];
+                if (!bz || bz.mode === 'no_ramp') continue;
+                const dxB = pt.x - bz.x;
+                const dzB = pt.z - bz.z;
+                const dBase = Math.hypot(dxB, dzB);
+                const cliffClearR = (bz.rimOuter || 20.0) + 3.8;
+                if (dBase < cliffClearR && dBase > 0.01) {
+                    const zm = getBaseZoneRampMetrics(bz, pt.x, pt.z);
+                    if (!zm.inRampAngle && zm.rampBlend < 0.15) {
+                        const push = (cliffClearR - dBase) * 0.55 * endPin;
+                        pt.x += (dxB / dBase) * push;
+                        pt.z += (dzB / dBase) * push;
+                    }
+                }
+            }
+        }
+
+        // Laplacian XZ fairing pass (keeps i=0,1 and i=numSamples-1,numSamples pinned to preserve exact bridge/ramp entry tangents!)
+        for (let sPass = 0; sPass < 2; sPass++) {
+            for (let i = 2; i <= numSamples - 2; i++) {
+                rawPts[i].x = (rawPts[i - 1].x + rawPts[i].x * 2.0 + rawPts[i + 1].x) * 0.25;
+                rawPts[i].z = (rawPts[i - 1].z + rawPts[i].z * 2.0 + rawPts[i + 1].z) * 0.25;
+            }
+        }
+    }
+
+    // 3. Uniform Arc-Length Resampling so vertex spacing, lane dashes, and curvature are 100% uniform
+    const cumArc = new Float32Array(numSamples + 1);
+    cumArc[0] = 0;
+    for (let i = 1; i <= numSamples; i++) {
+        cumArc[i] = cumArc[i - 1] + Math.hypot(rawPts[i].x - rawPts[i - 1].x, rawPts[i].z - rawPts[i - 1].z);
+    }
+    const totalLength = Math.max(0.01, cumArc[numSamples]);
+    const samples = [];
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+
+    let searchIdx = 0;
+    for (let i = 0; i <= numSamples; i++) {
+        const targetS = (i / numSamples) * totalLength;
+        while (searchIdx < numSamples - 1 && cumArc[searchIdx + 1] < targetS) {
+            searchIdx++;
+        }
+        const segLen = Math.max(0.0001, cumArc[searchIdx + 1] - cumArc[searchIdx]);
+        const frac = THREE.MathUtils.clamp((targetS - cumArc[searchIdx]) / segLen, 0, 1);
+        const p0 = rawPts[searchIdx];
+        const p1 = rawPts[searchIdx + 1];
+        const sx = p0.x + (p1.x - p0.x) * frac;
+        const sz = p0.z + (p1.z - p0.z) * frac;
+        const shw = p0.halfWidth + (p1.halfWidth - p0.halfWidth) * frac;
+        const sy = THREE.MathUtils.clamp(getTerrainHeight(sx, sz), 0.14, 3.2);
+
+        if (sx < minX) minX = sx;
+        if (sx > maxX) maxX = sx;
+        if (sz < minZ) minZ = sz;
+        if (sz > maxZ) maxZ = sz;
+        samples.push({ x: sx, y: sy, z: sz, halfWidth: shw, arc: targetS });
+    }
+
+    // 4. Lock bridge-entry endpoints to 0.30m so road elevation meets the bridge approach ramp toe seamlessly
+    if (seg.isBridgeCauseway) {
+        for (let b = 0; b < BRIDGES.length; b++) {
+            const br = BRIDGES[b];
+            if (Math.hypot(samples[0].x - br.southEntry.x, samples[0].z - br.southEntry.z) < 2.5 ||
+                Math.hypot(samples[0].x - br.northEntry.x, samples[0].z - br.northEntry.z) < 2.5) {
+                samples[0].y = 0.28;
+            }
+            const last = samples[numSamples];
+            if (Math.hypot(last.x - br.southEntry.x, last.z - br.southEntry.z) < 2.5 ||
+                Math.hypot(last.x - br.northEntry.x, last.z - br.northEntry.z) < 2.5) {
+                last.y = 0.28;
+            }
+        }
+    }
+
+    // 5. Longitudinal Elevation Profile Smoothing & Max-Grade Clamping (8 passes)
+    for (let pass = 0; pass < 8; pass++) {
         for (let i = 1; i < numSamples; i++) {
             samples[i].y = (samples[i - 1].y + samples[i].y * 2.0 + samples[i + 1].y) * 0.25;
         }
     }
+    const maxGrade = 0.085; // Max 8.5% longitudinal highway grade
+    for (let i = 1; i <= numSamples; i++) {
+        const ds = Math.max(0.2, samples[i].arc - samples[i - 1].arc);
+        const maxDeltaY = ds * maxGrade;
+        samples[i].y = THREE.MathUtils.clamp(samples[i].y, samples[i - 1].y - maxDeltaY, samples[i - 1].y + maxDeltaY);
+    }
 
+    // 6. Compute unit tangents, normals & curvature at each sample
+    let maxCurvature = 0;
     for (let i = 0; i <= numSamples; i++) {
         const prev = samples[Math.max(0, i - 1)];
         const next = samples[Math.min(numSamples, i + 1)];
@@ -2680,8 +3451,18 @@ function precomputeRoadSegmentSamples(seg, numSamples = 56) {
         samples[i].tz = tz;
         samples[i].nx = -tz;
         samples[i].nz = tx;
+        if (i > 0) {
+            const dAng = Math.abs(Math.atan2(
+                samples[i].tx * samples[i - 1].tz - samples[i].tz * samples[i - 1].tx,
+                samples[i].tx * samples[i - 1].tx + samples[i].tz * samples[i - 1].tz
+            ));
+            const ds = Math.max(0.25, samples[i].arc - samples[i - 1].arc);
+            maxCurvature = Math.max(maxCurvature, dAng / ds);
+        }
     }
 
+    seg.totalLength = totalLength;
+    seg.maxCurvature = maxCurvature;
     seg.samples = samples;
     seg.bbox = {
         minX: minX - maxHalfW,
@@ -2690,6 +3471,70 @@ function precomputeRoadSegmentSamples(seg, numSamples = 56) {
         maxZ: maxZ + maxHalfW
     };
     return seg;
+}
+
+// Bakes the O(1) Spatial Road Lookup Grid (ROAD_FACTOR_CACHE & ROAD_ELEVATION_CACHE) across the 261x261 map grid
+function bakeRoadSpatialLookupGrid() {
+    ROAD_FACTOR_CACHE.fill(0);
+    ROAD_ELEVATION_CACHE.fill(0);
+    _roadSpatialCacheReady = false;
+
+    for (let sIdx = 0; sIdx < DYNAMIC_ROAD_SEGMENTS.length; sIdx++) {
+        const seg = DYNAMIC_ROAD_SEGMENTS[sIdx];
+        const samples = seg.samples;
+        if (!samples || samples.length < 2 || !seg.bbox) continue;
+
+        const minGX = Math.max(0, Math.floor(seg.bbox.minX + HEIGHT_CACHE_HALF - 1));
+        const maxGX = Math.min(HEIGHT_CACHE_DIM - 1, Math.ceil(seg.bbox.maxX + HEIGHT_CACHE_HALF + 1));
+        const minGZ = Math.max(0, Math.floor(seg.bbox.minZ + HEIGHT_CACHE_HALF - 1));
+        const maxGZ = Math.min(HEIGHT_CACHE_DIM - 1, Math.ceil(seg.bbox.maxZ + HEIGHT_CACHE_HALF + 1));
+
+        for (let gz = minGZ; gz <= maxGZ; gz++) {
+            const wz = gz - HEIGHT_CACHE_HALF;
+            const rowOff = gz * HEIGHT_CACHE_DIM;
+            for (let gx = minGX; gx <= maxGX; gx++) {
+                const wx = gx - HEIGHT_CACHE_HALF;
+                let bestD = Infinity;
+                let bestHW = 2.0;
+                let bestY = 0.25;
+
+                for (let i = 0; i < samples.length - 1; i++) {
+                    const a = samples[i];
+                    const b = samples[i + 1];
+                    const abx = b.x - a.x;
+                    const abz = b.z - a.z;
+                    const lenSq = abx * abx + abz * abz || 1;
+                    const proj = Math.max(0, Math.min(1, ((wx - a.x) * abx + (wz - a.z) * abz) / lenSq));
+                    const px = a.x + abx * proj;
+                    const pz = a.z + abz * proj;
+                    const d = Math.hypot(wx - px, wz - pz);
+                    if (d < bestD) {
+                        bestD = d;
+                        bestHW = a.halfWidth + (b.halfWidth - a.halfWidth) * proj;
+                        bestY = a.y + (b.y - a.y) * proj;
+                    }
+                }
+
+                let factor = 0.0;
+                if (bestD < bestHW + 0.6) {
+                    factor = 1.0 - (bestD / (bestHW + 0.6)) * 0.22;
+                } else if (bestD < bestHW + 2.4) {
+                    factor = (1.0 - (bestD - (bestHW + 0.6)) / 1.8) * 0.75;
+                }
+
+                if (factor > 0.0) {
+                    const cellIdx = rowOff + gx;
+                    const prevF = ROAD_FACTOR_CACHE[cellIdx];
+                    if (factor > prevF) {
+                        ROAD_FACTOR_CACHE[cellIdx] = factor;
+                        ROAD_ELEVATION_CACHE[cellIdx] = bestY;
+                    }
+                }
+            }
+        }
+    }
+
+    _roadSpatialCacheReady = true;
 }
 
 // Helper to auto-position road endpoints & tangent vectors to align with nearby Base / Corner Platform Ramps!
@@ -2714,7 +3559,6 @@ function getRampAlignedRoadPlaza(anchorX, anchorZ, towardX, towardZ, defaultPull
         for (let k = 0; k < openingOffsets.length; k++) {
             const candAng = baseAng + openingOffsets[k];
             let diff = Math.abs(Math.atan2(Math.sin(candAng - toTargetAng), Math.cos(candAng - toTargetAng)));
-            // Prefer primary ramp unless a secondary ramp opening faces significantly closer toward the road target
             if (k > 0) diff += 0.25;
             if (diff < bestAngDiff) {
                 bestAngDiff = diff;
@@ -2744,6 +3588,7 @@ function getRampAlignedRoadPlaza(anchorX, anchorZ, towardX, towardZ, defaultPull
 
 function computeDynamicRoadAndLandmarkLayout() {
     _roadGradingActive = false;
+    _roadSpatialCacheReady = false;
 
     // Auto-position Allied Base Plaza, Enemy Base Plaza & Solaris Gate Plaza to align directly with nearby Ramp Openings!
     const alliedBasePlaza = getRampAlignedRoadPlaza(
@@ -2773,7 +3618,7 @@ function computeDynamicRoadAndLandmarkLayout() {
         10.5
     );
 
-    // Dynamically place Abandoned Town Center on the opposite flank from Solaris Enclave (strictly away from any river!)
+    // Dynamically place Abandoned Town Center on the opposite flank from Solaris Enclave (strictly away from any river using RIVER_SIN/RIVER_COS!)
     const solLatProj = (SOLARIS_BASE_POS.x - alliedBasePlaza.x) * rightX + (SOLARIS_BASE_POS.z - alliedBasePlaza.z) * rightZ;
     const townSide = solLatProj >= 0 ? -1 : 1;
     const townAlong = (0.34 + seededRandom() * 0.10) * axisLen;
@@ -2783,8 +3628,8 @@ function computeDynamicRoadAndLandmarkLayout() {
     if (HAS_VALLEY_RIVER && getRiverDist(rawTownX, rawTownZ) < RIVER_HALF_WIDTH + 16.0) {
         const rcTown = getRiverCoords(rawTownX, rawTownZ);
         const pushSign = rcTown.signedDist >= 0 ? 1 : -1;
-        rawTownX += pushSign * 14.0 * 0.7071;
-        rawTownZ += pushSign * 14.0 * 0.7071;
+        rawTownX += pushSign * 15.0 * RIVER_SIN;
+        rawTownZ += pushSign * 15.0 * RIVER_COS;
     }
     const safeTownPt = relocateToSafeSlopePosition(rawTownX, rawTownZ, 11.5);
     ABANDONED_TOWN_CENTER = { x: safeTownPt.x, z: safeTownPt.z };
@@ -2828,26 +3673,45 @@ function computeDynamicRoadAndLandmarkLayout() {
         });
     }
 
-    // Helper to build a smooth, realistic C1 Bezier highway segment that auto-aligns with nearby ramp directions!
+    // Helper to build a smooth, realistic C1 Bezier highway segment that auto-aligns with ramp & bridge tangent directions!
+    // NOTE: Control handle at pA extends OUTWARD from pA (+pA.dir), whereas at pB it extends OUTWARD from pB (+pB.dir) so the road enters pB collinearly!
     function makeCurvedBezierRoad(pA, pB, width = 4.5, lateralBend = 0, extraProps = {}) {
         const dx = pB.x - pA.x;
         const dz = pB.z - pA.z;
         const len = Math.hypot(dx, dz) || 1;
         const nx = -dz / len;
         const nz = dx / len;
-        const handleLen = Math.min(18.0, len * 0.33);
-        const c1x = (pA.dirX !== undefined)
-            ? (pA.x + pA.dirX * handleLen + nx * (lateralBend * 0.35))
+        const handleLen = Math.min(18.0, len * 0.32);
+
+        let c1x = (pA.dirX !== undefined)
+            ? (pA.x + pA.dirX * handleLen + nx * (lateralBend * 0.28))
             : (pA.x + dx * 0.33 + nx * lateralBend);
-        const c1z = (pA.dirZ !== undefined)
-            ? (pA.z + pA.dirZ * handleLen + nz * (lateralBend * 0.35))
+        let c1z = (pA.dirZ !== undefined)
+            ? (pA.z + pA.dirZ * handleLen + nz * (lateralBend * 0.28))
             : (pA.z + dz * 0.33 + nz * lateralBend);
-        const c2x = (pB.dirX !== undefined)
-            ? (pB.x + pB.dirX * handleLen + nx * (lateralBend * 0.25))
+        let c2x = (pB.dirX !== undefined)
+            ? (pB.x + pB.dirX * handleLen + nx * (lateralBend * 0.22))
             : (pA.x + dx * 0.67 + nx * (lateralBend * 0.5));
-        const c2z = (pB.dirZ !== undefined)
-            ? (pB.z + pB.dirZ * handleLen + nz * (lateralBend * 0.25))
+        let c2z = (pB.dirZ !== undefined)
+            ? (pB.z + pB.dirZ * handleLen + nz * (lateralBend * 0.22))
             : (pA.z + dz * 0.67 + nz * (lateralBend * 0.5));
+
+        // Deflect control handles cleanly around any oasis ponds before spline evaluation
+        for (let p = 0; p < DYNAMIC_PONDS.length; p++) {
+            const pd = DYNAMIC_PONDS[p];
+            const minClear = pd.r * 1.35 + width + 3.0;
+            const d1 = Math.hypot(c1x - pd.x, c1z - pd.z);
+            if (d1 < minClear && d1 > 0.01) {
+                c1x += ((c1x - pd.x) / d1) * (minClear - d1);
+                c1z += ((c1z - pd.z) / d1) * (minClear - d1);
+            }
+            const d2 = Math.hypot(c2x - pd.x, c2z - pd.z);
+            if (d2 < minClear && d2 > 0.01) {
+                c2x += ((c2x - pd.x) / d2) * (minClear - d2);
+                c2z += ((c2z - pd.z) / d2) * (minClear - d2);
+            }
+        }
+
         return Object.assign({
             mode: 'bezier',
             ax: pA.x, az: pA.z,
@@ -2861,7 +3725,7 @@ function computeDynamicRoadAndLandmarkLayout() {
     }
 
     // Generate Clean, Non-Circular Military Asphalt Highway Network:
-    // Zero roundabouts, zero circular loops, and seamless straight alignment into bridge ramps!
+    // Zero roundabouts, zero circular loops, and 100% collinear tangent alignment into bridge approach ramps!
     ROAD_JUNCTION_NODES = [];
     if (HAS_VALLEY_RIVER && BRIDGES.length > 0) {
         let mainBr = BRIDGES[0];
@@ -2883,7 +3747,12 @@ function computeDynamicRoadAndLandmarkLayout() {
         const mainCenterU = getRiverCenterUAtS(mainBr.sCoord);
 
         SOUTH_ROAD_HUB = new THREE.Vector3(mainEntry.x, 0, mainEntry.z);
+        SOUTH_ROAD_HUB.dirX = mainEntry.dirX;
+        SOUTH_ROAD_HUB.dirZ = mainEntry.dirZ;
+
         NORTH_ROAD_HUB = new THREE.Vector3(mainExit.x, 0, mainExit.z);
+        NORTH_ROAD_HUB.dirX = mainExit.dirX;
+        NORTH_ROAD_HUB.dirZ = mainExit.dirZ;
 
         const tcx = ABANDONED_TOWN_CENTER.x;
         const tcz = ABANDONED_TOWN_CENTER.z;
@@ -2894,6 +3763,8 @@ function computeDynamicRoadAndLandmarkLayout() {
             ? { x: (alliedBasePlaza.x + SOUTH_ROAD_HUB.x) * 0.5, z: (alliedBasePlaza.z + SOUTH_ROAD_HUB.z) * 0.5 }
             : { x: (NORTH_ROAD_HUB.x + enemyBasePlaza.x) * 0.5, z: (NORTH_ROAD_HUB.z + enemyBasePlaza.z) * 0.5 };
 
+        ROAD_JUNCTION_NODES.push({ x: townConnectPt.x, z: townConnectPt.z, r: 3.2 });
+
         const solRC = getRiverCoords(solarisGatePlaza.x, solarisGatePlaza.z);
         const solSameAsSouth = (solRC.signedDist * southHubRC.signedDist >= 0);
 
@@ -2903,16 +3774,16 @@ function computeDynamicRoadAndLandmarkLayout() {
         };
 
         DYNAMIC_ROAD_SEGMENTS = [
-            // 1. Primary Two-Lane Asphalt Highway Spine approaching and exiting Main Bridge (NO closed loop!)
-            makeCurvedBezierRoad(alliedBasePlaza, SOUTH_ROAD_HUB, 4.6, (seededRandom() - 0.5) * 1.4, {
-                isTrunk: true, isBridgeCauseway: true, bridgeCenterU: mainCenterU
+            // 1. Primary Two-Lane Asphalt Highway Spine approaching and exiting Main Bridge (Collinear with bridge span!)
+            makeCurvedBezierRoad(alliedBasePlaza, SOUTH_ROAD_HUB, 4.6, (seededRandom() - 0.5) * 1.1, {
+                isTrunk: true, isBridgeCauseway: true, bridgeCenterU: mainCenterU, connectedBridgeId: mainBr.id
             }),
-            makeCurvedBezierRoad(NORTH_ROAD_HUB, enemyBasePlaza, 4.6, (seededRandom() - 0.5) * 1.4, {
-                isTrunk: true, isBridgeCauseway: true, bridgeCenterU: mainCenterU
+            makeCurvedBezierRoad(NORTH_ROAD_HUB, enemyBasePlaza, 4.6, (seededRandom() - 0.5) * 1.1, {
+                isTrunk: true, isBridgeCauseway: true, bridgeCenterU: mainCenterU, connectedBridgeId: mainBr.id
             }),
 
-            // 2. Branch Highway to Abandoned Town + Town Cross Street (Tree topology — never forms a circle!)
-            makeCurvedBezierRoad(townConnectPt, ABANDONED_TOWN_CENTER, 4.0, (seededRandom() - 0.5) * 1.2, { isBranch: true }),
+            // 2. Branch Highway to Abandoned Town + Town Cross Street
+            makeCurvedBezierRoad(townConnectPt, ABANDONED_TOWN_CENTER, 4.0, (seededRandom() - 0.5) * 1.0, { isBranch: true }),
             {
                 ax: tcx - 11.5, az: tcz,
                 bx: tcx + 11.5, bz: tcz,
@@ -2925,33 +3796,48 @@ function computeDynamicRoadAndLandmarkLayout() {
             },
 
             // 3. Cut-Off Ruined Road Spur for tactical roadblock/ambush landmark
-            makeCurvedBezierRoad(townConnectPt, cutSpurEnd, 3.8, (seededRandom() - 0.5) * 1.0, { isBranch: true, isCutRoadEnd: true })
+            makeCurvedBezierRoad(townConnectPt, cutSpurEnd, 3.8, (seededRandom() - 0.5) * 0.8, { isBranch: true, isCutRoadEnd: true })
         ];
 
-        // Connect Solaris Enclave via Secondary Bridge or direct T-spur (without looping back to both bases!)
-        if (secBr) {
-            const secEntry = alliedToSouth <= alliedToNorth ? secBr.southEntry : secBr.northEntry;
-            const secExit  = alliedToSouth <= alliedToNorth ? secBr.northEntry : secBr.southEntry;
-            const secCenterU = getRiverCenterUAtS(secBr.sCoord);
-            const nearSecHub = solSameAsSouth ? secEntry : secExit;
-            const farSecHub  = solSameAsSouth ? secExit : secEntry;
-            const mainSideAnchor = solSameAsSouth ? NORTH_ROAD_HUB : SOUTH_ROAD_HUB;
-            DYNAMIC_ROAD_SEGMENTS.push(
-                makeCurvedBezierRoad(solarisGatePlaza, nearSecHub, 4.1, 0.0, {
-                    isBranch: true, isBridgeCauseway: true, bridgeCenterU: secCenterU
-                }),
-                makeCurvedBezierRoad(farSecHub, mainSideAnchor, 4.0, (seededRandom() - 0.5) * 1.2, {
-                    isBranch: true, isBridgeCauseway: true, bridgeCenterU: secCenterU
-                })
-            );
-        } else {
+        // Connect Solaris Enclave via Secondary Bridge or direct T-spur (and connect any 3rd bridge so every bridge has valid road approaches!)
+        for (let bIdx = 0; bIdx < BRIDGES.length; bIdx++) {
+            const br = BRIDGES[bIdx];
+            if (br === mainBr) continue;
+            const brEntry = alliedToSouth <= alliedToNorth ? br.southEntry : br.northEntry;
+            const brExit  = alliedToSouth <= alliedToNorth ? br.northEntry : br.southEntry;
+            const brCenterU = getRiverCenterUAtS(br.sCoord);
+            if (br === secBr) {
+                const nearSecHub = solSameAsSouth ? brEntry : brExit;
+                const farSecHub  = solSameAsSouth ? brExit : brEntry;
+                const mainSideAnchor = solSameAsSouth ? NORTH_ROAD_HUB : SOUTH_ROAD_HUB;
+                DYNAMIC_ROAD_SEGMENTS.push(
+                    makeCurvedBezierRoad(solarisGatePlaza, nearSecHub, 4.1, 0.0, {
+                        isBranch: true, isBridgeCauseway: true, bridgeCenterU: brCenterU, connectedBridgeId: br.id
+                    }),
+                    makeCurvedBezierRoad(farSecHub, mainSideAnchor, 4.0, (seededRandom() - 0.5) * 0.9, {
+                        isBranch: true, isBridgeCauseway: true, bridgeCenterU: brCenterU, connectedBridgeId: br.id
+                    })
+                );
+            } else {
+                // Connect 3rd flanking bridge to the trunk highway hubs on both banks
+                DYNAMIC_ROAD_SEGMENTS.push(
+                    makeCurvedBezierRoad(alliedBasePlaza, brEntry, 3.9, 0.0, {
+                        isBranch: true, isBridgeCauseway: true, bridgeCenterU: brCenterU, connectedBridgeId: br.id
+                    }),
+                    makeCurvedBezierRoad(brExit, enemyBasePlaza, 3.9, 0.0, {
+                        isBranch: true, isBridgeCauseway: true, bridgeCenterU: brCenterU, connectedBridgeId: br.id
+                    })
+                );
+            }
+        }
+        if (!secBr) {
             const solAnchor = solSameAsSouth ? SOUTH_ROAD_HUB : NORTH_ROAD_HUB;
             DYNAMIC_ROAD_SEGMENTS.push(
-                makeCurvedBezierRoad(solAnchor, solarisGatePlaza, 4.1, (seededRandom() - 0.5) * 1.2, { isBranch: true })
+                makeCurvedBezierRoad(solAnchor, solarisGatePlaza, 4.1, (seededRandom() - 0.5) * 1.0, { isBranch: true })
             );
         }
     } else {
-        // Open Valley / Canyon Highway Spine: Straight/gently-curving arterial highway with clean T-junction branches (ZERO circles!)
+        // Open Valley / Canyon Highway Spine: Straight/gently-curving arterial highway with clean T-junction branches
         const sSwing1 = townSide * (2.5 + seededRandom() * 2.5);
         const sSwing2 = -townSide * (2.5 + seededRandom() * 2.5);
         const hub1T = 0.35;
@@ -2966,6 +3852,10 @@ function computeDynamicRoadAndLandmarkLayout() {
             alliedBasePlaza.x + fwdX * (axisLen * hub2T) + rightX * sSwing2,
             0,
             alliedBasePlaza.z + fwdZ * (axisLen * hub2T) + rightZ * sSwing2
+        );
+        ROAD_JUNCTION_NODES.push(
+            { x: SOUTH_ROAD_HUB.x, z: SOUTH_ROAD_HUB.z, r: 3.4 },
+            { x: NORTH_ROAD_HUB.x, z: NORTH_ROAD_HUB.z, r: 3.4 }
         );
 
         const cutSpur1End = {
@@ -3005,7 +3895,8 @@ function computeDynamicRoadAndLandmarkLayout() {
         precomputeRoadSegmentSamples(DYNAMIC_ROAD_SEGMENTS[i], 64);
     }
 
-    // Activate smooth terrain roadbed grading now that road splines & target elevations are sampled!
+    // Bake O(1) Spatial Road Factor & Elevation Lookup Caches before activating terrain grading!
+    bakeRoadSpatialLookupGrid();
     _roadGradingActive = true;
 
     // Plan and merge long tactical trench networks BEFORE baking terrain vertices so trenches are physically carved into the soil mesh!
@@ -3050,7 +3941,6 @@ function planTacticalTrenchesAndMergeNetwork() {
             const bz = BASE_TERRAIN_ZONES[b];
             if (bz && Math.hypot(cx - bz.x, cz - bz.z) < (bz.rimOuter || 22.0) + halfL + 8.5) return false;
         }
-        // Sample 7 points along the entire long trench + end ramps to guarantee no road, river, pond, or steep cliff overlap
         for (let s = -3; s <= 3; s++) {
             const dAlong = (s / 3) * (halfL + 2.2);
             const px = cx + sinR * dAlong;
@@ -3064,7 +3954,6 @@ function planTacticalTrenchesAndMergeNetwork() {
                 if (Math.hypot(px - pd.x, pz - pd.z) < pd.r * 1.35 + 4.0) return false;
             }
         }
-        // Prevent unmerged trenches from colliding awkwardly with already planned trenches
         for (let t = 0; t < DYNAMIC_TRENCHES.length; t++) {
             const other = DYNAMIC_TRENCHES[t];
             if (Math.hypot(cx - other.x, cz - other.z) < (halfL + other.halfLen + 5.5)) return false;
@@ -3104,20 +3993,17 @@ function planTacticalTrenchesAndMergeNetwork() {
             }
         }
 
-        // If this is a major fortified trench with mergeWing enabled, attach a seamlessly merged angled wing/communication trench segment!
         if (placedMain && spec.mergeWing) {
             const endSign = (i % 2 === 0) ? 1 : -1;
-            const wingTurn = endSign * (0.58 + seededRandom() * 0.22); // Angled chevron / L-bend
+            const wingTurn = endSign * (0.58 + seededRandom() * 0.22);
             const wingRot = placedMain.rotY + wingTurn;
             const wingLen = 11.5 + seededRandom() * 3.0;
             const wingHalfLen = wingLen * 0.48;
-            // Shared junction node at the end of the main trench
             const jx = placedMain.x + placedMain.sinR * (endSign * (placedMain.halfLen - 0.55));
             const jz = placedMain.z + placedMain.cosR * (endSign * (placedMain.halfLen - 0.55));
             const wx = jx + Math.sin(wingRot) * (endSign * (wingHalfLen - 0.55));
             const wz = jz + Math.cos(wingRot) * (endSign * (wingHalfLen - 0.55));
 
-            // Verify the wing segment is clear of roads/rivers/ponds
             let wingClear = true;
             for (let s = -2; s <= 2; s++) {
                 const dA = (s / 2) * (wingHalfLen + 1.8);
@@ -3168,6 +4054,7 @@ function evaluateDynamicRoadPoint(seg, t) {
         const s1 = seg.samples[i1];
         return {
             x: s0.x + (s1.x - s0.x) * frac,
+            y: (s0.y !== undefined && s1.y !== undefined) ? (s0.y + (s1.y - s0.y) * frac) : 0.25,
             z: s0.z + (s1.z - s0.z) * frac,
             halfWidth: s0.halfWidth + (s1.halfWidth - s0.halfWidth) * frac
         };
@@ -3175,7 +4062,27 @@ function evaluateDynamicRoadPoint(seg, t) {
     return evaluateRoadSplineRawPoint(seg, t);
 }
 
+// O(1) Bilinear Spatial Road Factor Lookup (Eliminates O(N*M) per-vertex and per-frame road sample scanning!)
 function getSupplyRoadFactor(vx, vz) {
+    if (_roadSpatialCacheReady) {
+        const fx = vx + HEIGHT_CACHE_HALF;
+        const fz = vz + HEIGHT_CACHE_HALF;
+        if (fx >= 0 && fx < HEIGHT_CACHE_DIM - 1 && fz >= 0 && fz < HEIGHT_CACHE_DIM - 1) {
+            const ix = fx | 0;
+            const iz = fz | 0;
+            const tx = fx - ix;
+            const tz = fz - iz;
+            const row0 = iz * HEIGHT_CACHE_DIM + ix;
+            const row1 = row0 + HEIGHT_CACHE_DIM;
+            const r00 = ROAD_FACTOR_CACHE[row0];
+            const r10 = ROAD_FACTOR_CACHE[row0 + 1];
+            const r01 = ROAD_FACTOR_CACHE[row1];
+            const r11 = ROAD_FACTOR_CACHE[row1 + 1];
+            return (r00 + (r10 - r00) * tx) * (1.0 - tz) + (r01 + (r11 - r01) * tx) * tz;
+        }
+        return 0.0;
+    }
+
     let bestFactor = 0.0;
     for (let sIdx = 0; sIdx < DYNAMIC_ROAD_SEGMENTS.length; sIdx++) {
         const seg = DYNAMIC_ROAD_SEGMENTS[sIdx];
@@ -3202,22 +4109,28 @@ function getSupplyRoadFactor(vx, vz) {
                     bestFactor = Math.max(bestFactor, (1.0 - (d - (hw + 0.6)) / 1.6) * 0.72);
                 }
             }
-        } else {
-            const dx = seg.bx - seg.ax, dz = seg.bz - seg.az;
-            const lenSq = dx * dx + dz * dz || 1;
-            const approxT = Math.max(0, Math.min(1, ((vx - seg.ax) * dx + (vz - seg.az) * dz) / lenSq));
-            const pt = evaluateDynamicRoadPoint(seg, approxT);
-            const d = Math.hypot(vx - pt.x, vz - pt.z);
-            const hw = pt.halfWidth;
-            if (d < hw + 0.6) {
-                bestFactor = Math.max(bestFactor, 1.0 - (d / (hw + 0.6)) * 0.22);
-            } else if (d < hw + 2.2) {
-                bestFactor = Math.max(bestFactor, (1.0 - (d - (hw + 0.6)) / 1.6) * 0.72);
-            }
         }
     }
     return bestFactor;
 }
+
+// O(1) Bilinear Spatial Road Target Elevation Lookup for Smooth Roadbed Terrain Grading
+function getRoadTargetElevationAt(vx, vz, fallbackH = 0.25) {
+    if (_roadSpatialCacheReady) {
+        const fx = vx + HEIGHT_CACHE_HALF;
+        const fz = vz + HEIGHT_CACHE_HALF;
+        if (fx >= 0 && fx < HEIGHT_CACHE_DIM - 1 && fz >= 0 && fz < HEIGHT_CACHE_DIM - 1) {
+            const ix = Math.round(fx);
+            const iz = Math.round(fz);
+            const cellIdx = iz * HEIGHT_CACHE_DIM + ix;
+            if (ROAD_FACTOR_CACHE[cellIdx] > 0.01) {
+                return ROAD_ELEVATION_CACHE[cellIdx];
+            }
+        }
+    }
+    return THREE.MathUtils.clamp(fallbackH * 0.22 + 0.24, 0.14, 1.25);
+}
+window.getRoadTargetElevationAt = getRoadTargetElevationAt;
 
 // Updates a local bounding box of the O(1) bilinear height cache when craters or building pads deform the terrain
 function updateLocalTerrainHeightCache(cx, cz, radius) {
@@ -3317,8 +4230,10 @@ function rebuildTerrainVerticesAndColors() {
             col.copy(laneDist < 1.8 ? cBridgeCenter : cBridgeDeck);
         } else if (vy < -8.0) {
             col.copy(cRavineAbyss);
-        } else if (vy < -0.45) {
-            col.copy(cRavineWall).lerp(cCliffSlate, Math.min(1, (vy + 6.0) / 5.5));
+        } else if (vy < -0.25) {
+            const submergeBlend = THREE.MathUtils.smoothstep(-0.25 - vy, 0.0, 1.35);
+            const deepWallCol = cRavineWall.clone().lerp(cCliffSlate, Math.min(1, (vy + 6.0) / 5.5));
+            col.lerp(deepWallCol, submergeBlend);
         } else if (vy > 5.8) {
             col.copy(cSnowPeak);
         } else if (vy > 1.8) {
@@ -3330,6 +4245,38 @@ function rebuildTerrainVerticesAndColors() {
         } else if (vy > 0.65) {
             col.lerp(cHighlandMoss, Math.min(0.48, (vy - 0.55) * 0.55));
             if (vy > 1.35) col.lerp(cCliffSlate, Math.min(0.45, (vy - 1.35) * 0.55));
+        }
+
+        // Soft riparian shoreline & riverbank transition in terrain vertex colors
+        if (HAS_VALLEY_RIVER) {
+            const rc = getRiverCoords(vx, vz);
+            const localHalfW = rc.halfWidth || RIVER_HALF_WIDTH;
+            const maxShoreReach = localHalfW + 5.6;
+            if (rc.dist <= maxShoreReach) {
+                const shingleGrain = (Math.sin(vx * 0.92 + vz * 0.84 + MAP_SEED * 0.17) * 0.5 + 0.5);
+                const cDeepSilt = new THREE.Color(0x122832);
+                const cShallowShoal = new THREE.Color(0x27464b);
+                const cWetMud = new THREE.Color(0x3d382f).lerp(new THREE.Color(0x484339), shingleGrain * 0.55);
+                const cRiparianLoam = new THREE.Color(0x524c3e).lerp(cLushVerge, shingleGrain * 0.35);
+
+                if (rc.dist < localHalfW * 0.72) {
+                    const tDeep = rc.dist / Math.max(0.5, localHalfW * 0.72);
+                    col.copy(cDeepSilt).lerp(cShallowShoal, tDeep * 0.55);
+                } else if (rc.dist < localHalfW + 0.45) {
+                    const tShoal = (rc.dist - localHalfW * 0.72) / Math.max(0.25, localHalfW * 0.28 + 0.45);
+                    const sShoal = tShoal * tShoal * (3.0 - 2.0 * tShoal);
+                    col.copy(cShallowShoal).lerp(cWetMud, sShoal);
+                } else if (rc.dist < localHalfW + 2.25) {
+                    const tLap = (rc.dist - (localHalfW + 0.45)) / 1.80;
+                    const sLap = tLap * tLap * (3.0 - 2.0 * tLap);
+                    const targetBank = cWetMud.clone().lerp(cRiparianLoam, sLap);
+                    col.lerp(targetBank, 0.88 * (1.0 - roadF * 0.65));
+                } else {
+                    const tBank = (rc.dist - (localHalfW + 2.25)) / 3.35;
+                    const sBank = 1.0 - (tBank * tBank * (3.0 - 2.0 * tBank));
+                    col.lerp(cRiparianLoam, sBank * 0.68 * (1.0 - roadF * 0.75));
+                }
+            }
         }
 
         if (roadF > 0.04 && vy > -0.35 && vy < 2.8 && slope < 0.24) {
@@ -3800,6 +4747,12 @@ function updateZergCreepColors(radius, isReceding = false, forceFullSync = false
 }
 
 function createOasisPonds() {
+    const cPondDeep = new THREE.Color(0x0c3144);
+    const cPondMid = new THREE.Color(0x1d5c6d);
+    const cPondShore = new THREE.Color(0x4c473b);
+    const cPondVert = new THREE.Color();
+    const cPondCanyon = new THREE.Color();
+
     DYNAMIC_PONDS.forEach(pd => {
         // Build an organic, multi-lobed dynamic pond water mesh matching getDynamicPondRadiusAtAngle(pd, ang)
         const radialSegs = 64;
@@ -3807,17 +4760,37 @@ function createOasisPonds() {
         const pondGeo = new THREE.RingGeometry(0.02, 1.0, radialSegs, ringSegs);
         pondGeo.rotateX(-Math.PI / 2);
         const pAttr = pondGeo.attributes.position;
+        const pColors = new Float32Array(pAttr.count * 3);
+
         for (let i = 0; i < pAttr.count; i++) {
             const vx = pAttr.getX(i);
             const vz = pAttr.getZ(i);
             const normR = Math.hypot(vx, vz);
+            let wx = pd.x;
+            let wz = pd.z;
             if (normR > 0.001) {
                 const ang = Math.atan2(vz, vx);
                 const targetR = getDynamicPondRadiusAtAngle(pd, ang);
-                pAttr.setX(i, (vx / normR) * normR * targetR);
-                pAttr.setZ(i, (vz / normR) * normR * targetR);
+                const lx = (vx / normR) * normR * targetR;
+                const lz = (vz / normR) * normR * targetR;
+                pAttr.setX(i, lx);
+                pAttr.setZ(i, lz);
+                wx += lx;
+                wz += lz;
             }
+            sampleCanyonFloorColorAt(wx, wz, cPondCanyon);
+            const rFrac = THREE.MathUtils.clamp(normR, 0, 1);
+            if (rFrac < 0.65) {
+                cPondVert.copy(cPondDeep).lerp(cPondMid, rFrac / 0.65);
+            } else {
+                const tShore = (rFrac - 0.65) / 0.35;
+                cPondVert.copy(cPondMid).lerp(cPondShore, tShore).lerp(cPondCanyon, tShore * 0.45);
+            }
+            pColors[i * 3] = cPondVert.r;
+            pColors[i * 3 + 1] = cPondVert.g;
+            pColors[i * 3 + 2] = cPondVert.b;
         }
+        pondGeo.setAttribute('color', new THREE.BufferAttribute(pColors, 3));
         pondGeo.computeVertexNormals();
         const pondMesh = new THREE.Mesh(pondGeo, MAT.waterShader);
         pondMesh.position.set(pd.x, -0.42, pd.z);
@@ -3826,70 +4799,367 @@ function createOasisPonds() {
     });
 }
 
+const riverbankTransitionMat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    map: terrainDetailTex,
+    roughness: 0.84,
+    metalness: 0.04,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1
+});
+if (typeof SHADER_ENGINE !== 'undefined' && typeof SHADER_ENGINE.applyTerrainShader === 'function') {
+    SHADER_ENGINE.applyTerrainShader(riverbankTransitionMat);
+}
+
+// Helper: samples the procedural canyon floor vertex color at world (wx, wz) so riverbank skirts match 100% seamlessly
+function sampleCanyonFloorColorAt(wx, wz, outColor) {
+    const target = outColor || new THREE.Color();
+    const gx = THREE.MathUtils.clamp(Math.round(((wx / MAP_SIZE) + 0.5) * TERRAIN_GRID_SEGS), 0, TERRAIN_GRID_SEGS);
+    const gz = THREE.MathUtils.clamp(Math.round(((wz / MAP_SIZE) + 0.5) * TERRAIN_GRID_SEGS), 0, TERRAIN_GRID_SEGS);
+    const vIdx = (gz * TERRAIN_GRID_COLS + gx) * 3;
+    if (baseColors && vIdx + 2 < baseColors.length) {
+        target.setRGB(baseColors[vIdx], baseColors[vIdx + 1], baseColors[vIdx + 2]);
+    } else {
+        target.copy(cGrass);
+    }
+    return target;
+}
+
 function createValleyRiver() {
     if (!HAS_VALLEY_RIVER) return;
-    const segsAlong = 112;
-    const segsAcross = 12;
-    const riverHalfW = RIVER_HALF_WIDTH + 0.55;
-    const riverGeo = new THREE.PlaneGeometry(136, riverHalfW * 2, segsAlong, segsAcross);
+
+    // 1. Soft Shoreline Transition Vertex Color Painting on the Canyon Floor (terrainGeo)
+    // Eliminates sharp seams between the carved river channel, wet shoreline, and surrounding canyon floor
+    const colorAttr = terrainGeo.attributes.color;
+    const cDeepSilt = new THREE.Color(0x122832);
+    const cShallowShoal = new THREE.Color(0x27464b);
+    const cWetMudBase = new THREE.Color(0x3d382f);
+    const cWetShingle = new THREE.Color(0x484339);
+    const cRiparianLoamBase = new THREE.Color(0x524c3e);
+    const tmpMud = new THREE.Color();
+    const tmpLoam = new THREE.Color();
+    const tmpCol = new THREE.Color();
+
+    if (colorAttr) {
+        for (let i = 0; i < posAttr.count; i++) {
+            const vx = posAttr.getX(i);
+            const vz = posAttr.getZ(i);
+            const rc = getRiverCoords(vx, vz);
+            const localHalfW = rc.halfWidth || RIVER_HALF_WIDTH;
+            const maxShoreReach = localHalfW + 5.6;
+            if (rc.dist > maxShoreReach) continue;
+
+            const roadF = getSupplyRoadFactor(vx, vz);
+            const shingleGrain = (Math.sin(vx * 0.92 + vz * 0.84 + MAP_SEED * 0.17) * 0.5 + 0.5);
+            tmpMud.copy(cWetMudBase).lerp(cWetShingle, shingleGrain * 0.55);
+            tmpLoam.copy(cRiparianLoamBase).lerp(cLushVerge, shingleGrain * 0.35);
+            tmpCol.setRGB(baseColors[i * 3], baseColors[i * 3 + 1], baseColors[i * 3 + 2]);
+
+            if (rc.dist < localHalfW * 0.72) {
+                const tDeep = rc.dist / Math.max(0.5, localHalfW * 0.72);
+                tmpCol.copy(cDeepSilt).lerp(cShallowShoal, tDeep * 0.55);
+            } else if (rc.dist < localHalfW + 0.45) {
+                const tShoal = (rc.dist - localHalfW * 0.72) / Math.max(0.25, localHalfW * 0.28 + 0.45);
+                const sShoal = tShoal * tShoal * (3.0 - 2.0 * tShoal);
+                tmpCol.copy(cShallowShoal).lerp(tmpMud, sShoal);
+            } else if (rc.dist < localHalfW + 2.25) {
+                const tLap = (rc.dist - (localHalfW + 0.45)) / 1.80;
+                const sLap = tLap * tLap * (3.0 - 2.0 * tLap);
+                const targetBank = tmpMud.clone().lerp(tmpLoam, sLap);
+                tmpCol.lerp(targetBank, 0.88 * (1.0 - roadF * 0.65));
+            } else {
+                const tBank = (rc.dist - (localHalfW + 2.25)) / 3.35;
+                const sBank = 1.0 - (tBank * tBank * (3.0 - 2.0 * tBank));
+                tmpCol.lerp(tmpLoam, sBank * 0.68 * (1.0 - roadF * 0.75));
+            }
+
+            baseColors[i * 3] = tmpCol.r;
+            baseColors[i * 3 + 1] = tmpCol.g;
+            baseColors[i * 3 + 2] = tmpCol.b;
+            if (typeof isPointOnZergCreep !== 'function' || !isPointOnZergCreep(vx, vz)) {
+                liveColors[i * 3] = tmpCol.r;
+                liveColors[i * 3 + 1] = tmpCol.g;
+                liveColors[i * 3 + 2] = tmpCol.b;
+                colorAttr.setXYZ(i, tmpCol.r, tmpCol.g, tmpCol.b);
+            }
+        }
+        colorAttr.needsUpdate = true;
+    }
+
+    // 2. Terrain-Blended Riverbank & Shallow-Shoal Skirt Geometry (Both Riverbanks)
+    // Conforms to the procedural canyon floor on the outer bank and slopes smoothly beneath the water plane on the inner shoal
+    const bankSegsAlong = 136;
+    const bankSegsAcross = 8;
+    const bankHalfLength = 69.0;
+    const cCanyonSample = new THREE.Color();
+    const cBankVertex = new THREE.Color();
+
+    [-1, 1].forEach(bankSign => {
+        const bVertCount = (bankSegsAlong + 1) * (bankSegsAcross + 1);
+        const bPositions = new Float32Array(bVertCount * 3);
+        const bColors = new Float32Array(bVertCount * 3);
+        const bUvs = new Float32Array(bVertCount * 2);
+        const bIndices = [];
+
+        let ptr = 0;
+        let uvPtr = 0;
+        for (let ia = 0; ia <= bankSegsAlong; ia++) {
+            const tAlong = ia / bankSegsAlong;
+            const sCoord = (tAlong - 0.5) * (bankHalfLength * 2.0);
+            const centerU = getRiverCenterUAtS(sCoord);
+            const localHalfW = getRiverHalfWidthAtS(sCoord);
+
+            // Span from submerged inner shoal (0.52 * localHalfW) across waterline out onto canyon floor (localHalfW + 3.65m)
+            const innerOffset = localHalfW * 0.52;
+            const outerOffset = localHalfW + 3.65;
+
+            for (let ic = 0; ic <= bankSegsAcross; ic++) {
+                const tAcross = ic / bankSegsAcross; // 0 = inner submerged shoal, 1 = outer canyon floor weld
+                const radialDist = THREE.MathUtils.lerp(innerOffset, outerOffset, tAcross);
+                const uCoord = centerU + bankSign * radialDist;
+                const wPt = riverCoordsToWorld(sCoord, uCoord);
+                const groundH = getTerrainHeight(wPt.x, wPt.z);
+
+                // Smoothly blend elevation from submerged shoal bed through shoreline meniscus to exact canyon floor height
+                const shoreFeather = THREE.MathUtils.smoothstep(tAcross, 0.0, 0.42);
+                const outerWeld = THREE.MathUtils.smoothstep(tAcross, 0.65, 1.0);
+                const shoalBedY = Math.min(groundH, RIVER_WATER_Y - 0.36 * (1.0 - shoreFeather));
+                let bankY = THREE.MathUtils.lerp(shoalBedY, groundH, shoreFeather);
+                // Add subtle organic river-pebble bank crown in the mid-bank zone, fading to 0.002m weld at outer edge
+                const bankCrown = Math.sin(tAcross * Math.PI) * (1.0 - outerWeld) * 0.024;
+                bankY = bankY + bankCrown + 0.002 * (1.0 - outerWeld);
+
+                // Suppress bank skirt height inside bridge footprints so it never pokes through bridge ramps
+                if (getRiverBridgeFactor(wPt.x, wPt.z) > 0.05) {
+                    bankY = Math.min(bankY, groundH - 0.015);
+                }
+
+                bPositions[ptr] = wPt.x;
+                bPositions[ptr + 1] = bankY;
+                bPositions[ptr + 2] = wPt.z;
+
+                // Paint vertex color across the bank skirt: submerged silt -> wet shingle -> riparian loam -> exact canyon floor color
+                const grain = Math.sin(wPt.x * 1.15 + wPt.z * 0.95 + MAP_SEED * 0.23) * 0.5 + 0.5;
+                sampleCanyonFloorColorAt(wPt.x, wPt.z, cCanyonSample);
+                tmpMud.copy(cWetMudBase).lerp(cWetShingle, grain * 0.6);
+                tmpLoam.copy(cRiparianLoamBase).lerp(cCanyonSample, 0.35 + grain * 0.25);
+
+                if (tAcross < 0.28) {
+                    const f = tAcross / 0.28;
+                    cBankVertex.copy(cDeepSilt).lerp(cShallowShoal, f);
+                } else if (tAcross < 0.56) {
+                    const f = (tAcross - 0.28) / 0.28;
+                    const sf = f * f * (3.0 - 2.0 * f);
+                    cBankVertex.copy(cShallowShoal).lerp(tmpMud, sf);
+                } else if (tAcross < 0.82) {
+                    const f = (tAcross - 0.56) / 0.26;
+                    const sf = f * f * (3.0 - 2.0 * f);
+                    cBankVertex.copy(tmpMud).lerp(tmpLoam, sf);
+                } else {
+                    const f = (tAcross - 0.82) / 0.18;
+                    const sf = f * f * (3.0 - 2.0 * f);
+                    cBankVertex.copy(tmpLoam).lerp(cCanyonSample, sf);
+                }
+
+                bColors[ptr] = cBankVertex.r;
+                bColors[ptr + 1] = cBankVertex.g;
+                bColors[ptr + 2] = cBankVertex.b;
+                ptr += 3;
+
+                bUvs[uvPtr] = tAcross;
+                bUvs[uvPtr + 1] = tAlong * 24.0;
+                uvPtr += 2;
+            }
+        }
+
+        const rowStride = bankSegsAcross + 1;
+        for (let ia = 0; ia < bankSegsAlong; ia++) {
+            for (let ic = 0; ic < bankSegsAcross; ic++) {
+                const a = ia * rowStride + ic;
+                const b = a + 1;
+                const c = a + rowStride;
+                const d = c + 1;
+                if (bankSign > 0) {
+                    bIndices.push(a, c, b, b, c, d);
+                } else {
+                    bIndices.push(a, b, c, b, d, c);
+                }
+            }
+        }
+
+        const bankGeo = new THREE.BufferGeometry();
+        bankGeo.setAttribute('position', new THREE.BufferAttribute(bPositions, 3));
+        bankGeo.setAttribute('color', new THREE.BufferAttribute(bColors, 3));
+        bankGeo.setAttribute('uv', new THREE.BufferAttribute(bUvs, 2));
+        bankGeo.setIndex(bIndices);
+        bankGeo.computeVertexNormals();
+        const bankMesh = new THREE.Mesh(bankGeo, riverbankTransitionMat);
+        bankMesh.receiveShadow = true;
+        addMapMesh(bankMesh);
+    });
+
+    // 3. Variable-Width Meandering River Water Plane with Shoreline Vertex Color Painting & Terrain-Welded Edges
+    const segsAlong = 136;
+    const segsAcross = 16;
+    const riverGeo = new THREE.PlaneGeometry(138, 1.0, segsAlong, segsAcross);
     riverGeo.rotateX(-Math.PI / 2);
     const rPos = riverGeo.attributes.position;
+    const rColors = new Float32Array(rPos.count * 3);
+
+    const cWaterDeep = new THREE.Color(0x0c3144);
+    const cWaterMid = new THREE.Color(0x1d5c6d);
+    const cWaterShoal = new THREE.Color(0x366e72);
+    const cWaterShoreEdge = new THREE.Color(0x4c473b);
+    const cVertWater = new THREE.Color();
 
     for (let i = 0; i < rPos.count; i++) {
         const sCoord = rPos.getX(i);
-        const across = rPos.getZ(i);
+        const normZ = rPos.getZ(i) * 2.0; // [-1, 1] across river channel
         const centerU = getRiverCenterUAtS(sCoord);
+        const localHalfW = getRiverHalfWidthAtS(sCoord) + 0.68;
+        const across = normZ * localHalfW;
         const uCoord = centerU + across;
         const wPt = riverCoordsToWorld(sCoord, uCoord);
-        rPos.setXYZ(i, wPt.x, RIVER_WATER_Y, wPt.z);
+        const edgeFrac = Math.abs(normZ);
+
+        // Weld outer shoreline vertices smoothly into the sloped riverbank terrain so zero floating gaps can ever appear
+        const groundH = getTerrainHeight(wPt.x, wPt.z);
+        const meniscusDrop = Math.pow(edgeFrac, 2.6) * 0.032;
+        const edgeTerrainBlend = THREE.MathUtils.smoothstep(edgeFrac, 0.74, 1.0);
+        const targetEdgeY = Math.min(RIVER_WATER_Y + 0.008, groundH + 0.012);
+        const waterY = THREE.MathUtils.lerp(RIVER_WATER_Y - meniscusDrop, targetEdgeY, edgeTerrainBlend * 0.85);
+        rPos.setXYZ(i, wPt.x, waterY, wPt.z);
+
+        // Multi-stop vertex color gradient: deep thalweg -> mid channel -> shallow turquoise shoal -> canyon-floor-matched shoreline
+        sampleCanyonFloorColorAt(wPt.x, wPt.z, cCanyonSample);
+        const shoreTargetCol = cWaterShoreEdge.clone().lerp(cCanyonSample, 0.45);
+        if (edgeFrac < 0.45) {
+            cVertWater.copy(cWaterDeep).lerp(cWaterMid, edgeFrac / 0.45);
+        } else if (edgeFrac < 0.80) {
+            cVertWater.copy(cWaterMid).lerp(cWaterShoal, (edgeFrac - 0.45) / 0.35);
+        } else {
+            const tEdge = (edgeFrac - 0.80) / 0.20;
+            const sEdge = tEdge * tEdge * (3.0 - 2.0 * tEdge);
+            cVertWater.copy(cWaterShoal).lerp(shoreTargetCol, sEdge);
+        }
+
+        rColors[i * 3] = cVertWater.r;
+        rColors[i * 3 + 1] = cVertWater.g;
+        rColors[i * 3 + 2] = cVertWater.b;
     }
+    riverGeo.setAttribute('color', new THREE.BufferAttribute(rColors, 3));
     riverGeo.computeVertexNormals();
     const riverMesh = new THREE.Mesh(riverGeo, MAT.waterShader);
     addMapMesh(riverMesh);
 
     const bridgeDeckMat = MAT.gunmetal || new THREE.MeshStandardMaterial({ color: 0x64748b, roughness: 0.45, metalness: 0.65 });
     const bridgePierMat = MAT.darkSteel || new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.7, metalness: 0.4 });
+    const bridgeConcreteMat = concreteRuinMat || new THREE.MeshStandardMaterial({ color: 0x6b7280, roughness: 0.85, metalness: 0.15 });
+    const bridgeGirderMat = rustedSteelMat || new THREE.MeshStandardMaterial({ color: 0x5a3826, roughness: 0.68, metalness: 0.65 });
     const bridgeHazardMat = MAT.hazard || bridgeDeckMat;
 
-    RIVER_BRIDGES.forEach((rb) => {
+    RIVER_BRIDGES.forEach((rb, bridgeIdx) => {
         const s0 = rb.sCoord;
-        const centerU = getRiverCenterUAtS(s0);
+        const centerU = (typeof rb.centerU === 'number') ? rb.centerU : getRiverCenterUAtS(s0);
         const cWorld = riverCoordsToWorld(s0, centerU);
+
+        // Ensure bridge orientation is 100% perpendicular to the local river tangent at s0
+        const localSlope = getRiverTangentSlopeAtS(s0);
+        const localSkew = Math.atan(localSlope);
+        const bridgeYaw = (typeof rb.yaw === 'number') ? rb.yaw : (RIVER_ANGLE - localSkew);
+        rb.yaw = bridgeYaw;
+        rb.cosYaw = Math.cos(bridgeYaw);
+        rb.sinYaw = Math.sin(bridgeYaw);
+        rb.centerX = cWorld.x;
+        rb.centerZ = cWorld.z;
+        rb.centerU = centerU;
 
         const bridgeGroup = new THREE.Group();
         bridgeGroup.position.set(cWorld.x, 0, cWorld.z);
-        // Align 3D bridge mesh 100% with the orthonormal (s, u) river coordinate axes so visual guardrails match navigation bounds!
-        bridgeGroup.rotation.y = Math.PI / 4;
+        // Align 3D bridge mesh with the exact local perpendicular crossing frame (rb.yaw)
+        bridgeGroup.rotation.y = bridgeYaw;
 
+        const archetype = rb.archetype || (bridgeIdx === 0 ? 'truss_bridge' : (bridgeIdx === 1 ? 'concrete_causeway' : 'industrial_girder'));
+        rb.archetype = archetype;
         const bridgeWidth = rb.halfWidth * 2.0;
-        const flatHalfSpan = RIVER_HALF_WIDTH + 0.95;
+        const localRiverHW = getRiverHalfWidthAtS(s0);
+        const flatHalfSpan = rb.flatHalfSpan || (localRiverHW + 0.95);
         const spanLength = flatHalfSpan * 2.0;
-        const rampReachU = RIVER_HALF_WIDTH + 3.35;
+        const rampReachU = rb.rampReachU || (localRiverHW + 3.45);
+        rb.flatHalfSpan = flatHalfSpan;
+        rb.rampReachU = rampReachU;
 
-        // 1. Main Armored Steel Roadway Deck Slab (top surface at y = 0.35)
-        const mainDeck = new THREE.Mesh(createExtrudedArmorHullGeo(bridgeWidth, 0.22, spanLength), bridgeDeckMat);
-        mainDeck.position.set(0, 0.24, 0);
+        const primaryStructMat = archetype === 'concrete_causeway'
+            ? bridgeConcreteMat
+            : (archetype === 'industrial_girder' ? bridgeGirderMat : bridgeDeckMat);
+
+        // Intact center span group (hidden when bridge is destroyed in combat)
+        const intactSpanGroup = new THREE.Group();
+        bridgeGroup.add(intactSpanGroup);
+        rb.intactSpanGroup = intactSpanGroup;
+        rb.bridgeGroup = bridgeGroup;
+
+        // Destroyed collapsed span group (shown when bridge HP reaches 0)
+        const destroyedSpanGroup = new THREE.Group();
+        destroyedSpanGroup.visible = Boolean(rb.destroyed);
+        bridgeGroup.add(destroyedSpanGroup);
+        rb.destroyedSpanGroup = destroyedSpanGroup;
+
+        // 1. Main Armored Roadway Deck Slab (top surface at y = 0.35)
+        const deckThickness = archetype === 'concrete_causeway' ? 0.30 : 0.22;
+        const mainDeck = new THREE.Mesh(
+            createExtrudedArmorHullGeo(bridgeWidth, deckThickness, spanLength),
+            primaryStructMat
+        );
+        mainDeck.position.set(0, 0.35 - deckThickness * 0.5, 0);
         mainDeck.castShadow = !IS_MOBILE;
         mainDeck.receiveShadow = true;
-        bridgeGroup.add(mainDeck);
+        intactSpanGroup.add(mainDeck);
 
-        // Dark Asphalt Roadway Surface Inlay across the Bridge Deck so the road visually flows right across the bridge!
-        const roadInlayW = Math.min(bridgeWidth * 0.72, 5.2);
-        const deckAsphalt = new THREE.Mesh(createExtrudedArmorHullGeo(roadInlayW, 0.02, spanLength + 0.08), dynamicRoadAsphaltMat);
-        deckAsphalt.position.set(0, 0.348, 0);
+        // Dark Asphalt Roadway Surface Inlay across the Bridge Deck so the road visually flows right across the bridge
+        const roadInlayW = Math.min(bridgeWidth * 0.74, 5.2);
+        const deckAsphalt = new THREE.Mesh(
+            createExtrudedArmorHullGeo(roadInlayW, 0.022, spanLength + 0.10),
+            dynamicRoadAsphaltMat
+        );
+        deckAsphalt.position.set(0, 0.349, 0);
         deckAsphalt.receiveShadow = true;
-        bridgeGroup.add(deckAsphalt);
+        intactSpanGroup.add(deckAsphalt);
 
-        // Center Yellow Tactical Lane Divider Stripes on Bridge Deck
+        // Continuous White Highway Edge Lines + Center Yellow Tactical Lane Divider Stripes on Bridge Deck
+        [-roadInlayW * 0.46, roadInlayW * 0.46].forEach(edgeX => {
+            const edgeLine = new THREE.Mesh(
+                createExtrudedArmorHullGeo(0.11, 0.024, spanLength + 0.06),
+                dynamicRoadEdgeLineMat
+            );
+            edgeLine.position.set(edgeX, 0.361, 0);
+            intactSpanGroup.add(edgeLine);
+        });
         for (let zStripe = -spanLength * 0.42; zStripe <= spanLength * 0.42; zStripe += 2.2) {
-            const stripe = new THREE.Mesh(createExtrudedArmorHullGeo(0.18, 0.025, 1.10), dynamicRoadStripeMat);
-            stripe.position.set(0, 0.362, zStripe);
-            bridgeGroup.add(stripe);
+            const stripe = new THREE.Mesh(
+                createExtrudedArmorHullGeo(0.18, 0.026, 1.10),
+                dynamicRoadStripeMat
+            );
+            stripe.position.set(0, 0.363, zStripe);
+            intactSpanGroup.add(stripe);
         }
 
-        // 2. Terrain-Conforming Approach Ramps on Both Riverbanks (connects y = 0.35 deck to exact road ribbon height at rampReachU!)
+        //Collapsed Span Wreckage Meshes (visible only when destroyed)
         [-1, 1].forEach(endSign => {
-            const rStepsU = 8;
+            const brokenSlab = new THREE.Mesh(
+                createExtrudedArmorHullGeo(bridgeWidth * 0.92, 0.22, spanLength * 0.36),
+                primaryStructMat
+            );
+            brokenSlab.position.set(0, -0.12, endSign * (spanLength * 0.32));
+            brokenSlab.rotation.x = endSign * 0.38;
+            destroyedSpanGroup.add(brokenSlab);
+        });
+
+        // 2. Terrain-Conforming Approach Ramps & Bank Abutment Foundations on Both Riverbanks
+        // Uses bridgeLocalToWorld(rb, localX, localZ) so every vertex matches the exact rotated bridge frame!
+        [-1, 1].forEach(endSign => {
+            const rStepsU = 10;
             const rStepsS = 8;
             const rPosArr = [];
             const rIdxArr = [];
@@ -3904,13 +5174,13 @@ function createValleyRiver() {
                 for (let is = 0; is <= rStepsS; is++) {
                     const tS = (is / rStepsS) - 0.5;
                     const localX = tS * bridgeWidth;
-                    const wPt = riverCoordsToWorld(s0 + localX, centerU + localZ);
+                    const wPt = bridgeLocalToWorld(rb, localX, localZ);
                     const groundY = getTerrainHeight(wPt.x, wPt.z) + 0.064;
                     const topY = THREE.MathUtils.lerp(0.35, groundY, smoothRamp);
                     rPosArr.push(localX, topY, localZ);
 
                     const asphX = tS * roadInlayW;
-                    const wPtAsph = riverCoordsToWorld(s0 + asphX, centerU + localZ);
+                    const wPtAsph = bridgeLocalToWorld(rb, asphX, localZ);
                     const gAsphY = getTerrainHeight(wPtAsph.x, wPtAsph.z) + 0.064;
                     const asphTopY = THREE.MathUtils.lerp(0.352, gAsphY + 0.002, smoothRamp);
                     asphPosArr.push(asphX, asphTopY, localZ);
@@ -3937,7 +5207,7 @@ function createValleyRiver() {
             rampGeo.setAttribute('position', new THREE.Float32BufferAttribute(rPosArr, 3));
             rampGeo.setIndex(rIdxArr);
             rampGeo.computeVertexNormals();
-            const rampMesh = new THREE.Mesh(rampGeo, bridgeDeckMat);
+            const rampMesh = new THREE.Mesh(rampGeo, primaryStructMat);
             rampMesh.receiveShadow = true;
             bridgeGroup.add(rampMesh);
 
@@ -3949,47 +5219,178 @@ function createValleyRiver() {
             rampAsphMesh.receiveShadow = true;
             bridgeGroup.add(rampAsphMesh);
 
-            // Side retaining cheeks under the ramp
+            // Concrete/Steel Bank Abutment Headwall & Retaining Wingwalls anchored into the riverbank
+            const abutmentW = bridgeWidth + 0.55;
+            const abutmentWPt = bridgeLocalToWorld(rb, 0, endSign * flatHalfSpan);
+            const bankBedY = Math.min(-0.45, getTerrainHeight(abutmentWPt.x, abutmentWPt.z) - 0.35);
+            const abutmentH = Math.max(0.65, 0.32 - bankBedY);
+            const abutment = new THREE.Mesh(
+                createExtrudedArmorHullGeo(abutmentW, abutmentH, 0.58),
+                bridgeConcreteMat
+            );
+            abutment.position.set(0, 0.32 - abutmentH * 0.5, endSign * flatHalfSpan);
+            abutment.castShadow = !IS_MOBILE;
+            abutment.receiveShadow = true;
+            bridgeGroup.add(abutment);
+
+            // Side retaining cheeks under the approach ramp
+            const rampLen = rampReachU - flatHalfSpan;
             [-bridgeWidth * 0.48, bridgeWidth * 0.48].forEach(cheekX => {
-                const cheek = new THREE.Mesh(createExtrudedArmorHullGeo(0.18, 0.34, rampReachU - flatHalfSpan), bridgePierMat);
-                cheek.position.set(cheekX, 0.14, endSign * (flatHalfSpan + (rampReachU - flatHalfSpan) * 0.5));
+                const cheek = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.22, 0.46, rampLen),
+                    bridgePierMat
+                );
+                cheek.position.set(cheekX, 0.12, endSign * (flatHalfSpan + rampLen * 0.5));
                 bridgeGroup.add(cheek);
             });
         });
 
-        // 3. Heavy Concrete & Steel Bridge Support Piers Standing in the River Water
+        // 3. Heavy Concrete & Steel Bridge Support Piers Extending All the Way Down to the Riverbed
         [-bridgeWidth * 0.38, bridgeWidth * 0.38].forEach(px => {
             [-spanLength * 0.26, spanLength * 0.26].forEach(pz => {
-                const pier = new THREE.Mesh(createSculptedLatheBarrelGeo(0.32, 0.42, 1.35, 10), bridgePierMat);
-                pier.position.set(px, -0.38, pz);
+                const pierWPt = bridgeLocalToWorld(rb, px, pz);
+                const bedY = Math.min(-1.35, getTerrainHeight(pierWPt.x, pierWPt.z) - 0.25);
+                const pierTopY = 0.26;
+                const pierH = Math.max(1.2, pierTopY - bedY);
+                const pierCenterY = bedY + pierH * 0.5;
+
+                const pier = new THREE.Mesh(
+                    createSculptedLatheBarrelGeo(0.34, 0.48, pierH, 10),
+                    archetype === 'concrete_causeway' ? bridgeConcreteMat : bridgePierMat
+                );
+                pier.position.set(px, pierCenterY, pz);
                 pier.castShadow = !IS_MOBILE;
                 pier.receiveShadow = true;
                 bridgeGroup.add(pier);
+
+                // Underwater concrete footing pad seated into the riverbed
+                const footing = new THREE.Mesh(
+                    createSculptedLatheBarrelGeo(0.54, 0.66, 0.38, 10),
+                    bridgeConcreteMat
+                );
+                footing.position.set(px, bedY + 0.18, pz);
+                bridgeGroup.add(footing);
             });
         });
 
-        // 4. Side Steel Guardrails, Structural Trusses & Glowing Bridge Entry Beacons
-        [-bridgeWidth * 0.47, bridgeWidth * 0.47].forEach(railX => {
-            const topRail = new THREE.Mesh(createExtrudedArmorHullGeo(0.16, 0.14, spanLength + 1.2), bridgePierMat);
-            topRail.position.set(railX, 0.68, 0);
-            topRail.castShadow = !IS_MOBILE;
-            const midRail = new THREE.Mesh(createExtrudedArmorHullGeo(0.12, 0.08, spanLength + 1.0), bridgeHazardMat);
-            midRail.position.set(railX, 0.48, 0);
-            bridgeGroup.add(topRail, midRail);
-
-            for (let postZ = -spanLength * 0.5; postZ <= spanLength * 0.5; postZ += 2.15) {
-                const post = new THREE.Mesh(createExtrudedArmorHullGeo(0.22, 0.58, 0.22), bridgePierMat);
-                post.position.set(railX, 0.48, postZ);
-                post.castShadow = !IS_MOBILE;
-                bridgeGroup.add(post);
-
-                if (Math.abs(Math.abs(postZ) - spanLength * 0.5) < 0.5) {
-                    const beacon = new THREE.Mesh(createSculptedArmorDomeGeo(0.12, 10, 10), MAT.cyanGlow);
-                    beacon.position.set(railX, 0.85, postZ);
-                    bridgeGroup.add(beacon);
-                }
-            }
+        // Cross-beam pier caps connecting left and right columns beneath the deck
+        [-spanLength * 0.26, spanLength * 0.26].forEach(pz => {
+            const pierCap = new THREE.Mesh(
+                createExtrudedArmorHullGeo(bridgeWidth * 0.88, 0.26, 0.52),
+                bridgePierMat
+            );
+            pierCap.position.set(0, 0.12, pz);
+            bridgeGroup.add(pierCap);
         });
+
+        // 4. Archetype-Specific Superstructure, Side Guardrails & Entry Beacons
+        [-bridgeWidth * 0.47, bridgeWidth * 0.47].forEach(railX => {
+            if (archetype === 'truss_bridge') {
+                // Overhead Military Warren Steel Truss Superstructure
+                const trussHeight = 1.65;
+                const topChord = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.22, 0.20, spanLength * 0.86),
+                    bridgePierMat
+                );
+                topChord.position.set(railX, 0.35 + trussHeight, 0);
+                topChord.castShadow = !IS_MOBILE;
+                intactSpanGroup.add(topChord);
+
+                const bottomChord = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.20, 0.16, spanLength + 0.8),
+                    bridgePierMat
+                );
+                bottomChord.position.set(railX, 0.52, 0);
+                intactSpanGroup.add(bottomChord);
+
+                const bayCount = 4;
+                const bayLen = (spanLength * 0.84) / bayCount;
+                for (let b = 0; b <= bayCount; b++) {
+                    const bz = -spanLength * 0.42 + b * bayLen;
+                    const vPost = new THREE.Mesh(
+                        createExtrudedArmorHullGeo(0.18, trussHeight, 0.18),
+                        bridgePierMat
+                    );
+                    vPost.position.set(railX, 0.35 + trussHeight * 0.5, bz);
+                    vPost.castShadow = !IS_MOBILE;
+                    intactSpanGroup.add(vPost);
+
+                    if (b < bayCount) {
+                        const diagLen = Math.hypot(bayLen, trussHeight);
+                        const diagAng = Math.atan2(bayLen, trussHeight) * (b % 2 === 0 ? 1 : -1);
+                        const diag = new THREE.Mesh(
+                            createExtrudedArmorHullGeo(0.13, diagLen, 0.13),
+                            bridgeHazardMat
+                        );
+                        diag.position.set(railX, 0.35 + trussHeight * 0.5, bz + bayLen * 0.5);
+                        diag.rotation.x = diagAng;
+                        intactSpanGroup.add(diag);
+                    }
+                }
+            } else if (archetype === 'concrete_causeway') {
+                // Heavy Jersey-Barrier Concrete Parapet Walls + Streetlight Pylons
+                const parapet = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.30, 0.56, spanLength + 1.0),
+                    bridgeConcreteMat
+                );
+                parapet.position.set(railX, 0.58, 0);
+                parapet.castShadow = !IS_MOBILE;
+                intactSpanGroup.add(parapet);
+
+                const coping = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.34, 0.08, spanLength + 1.1),
+                    bridgePierMat
+                );
+                coping.position.set(railX, 0.88, 0);
+                intactSpanGroup.add(coping);
+            } else {
+                // Industrial Girder Bridge: Heavy Box-Girder Side Beams & Hazard Railings
+                const boxGirder = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.28, 0.48, spanLength + 0.9),
+                    bridgeGirderMat
+                );
+                boxGirder.position.set(railX, 0.48, 0);
+                boxGirder.castShadow = !IS_MOBILE;
+                intactSpanGroup.add(boxGirder);
+
+                const hazardRail = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.14, 0.12, spanLength + 0.8),
+                    bridgeHazardMat
+                );
+                hazardRail.position.set(railX, 0.82, 0);
+                intactSpanGroup.add(hazardRail);
+            }
+
+            // Entry Bollards & Navigation Beacons at Both Ends of the Bridge
+            [-spanLength * 0.5, spanLength * 0.5].forEach(endZ => {
+                const bollard = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(0.32, 0.82, 0.32),
+                    bridgePierMat
+                );
+                bollard.position.set(railX, 0.62, endZ);
+                bollard.castShadow = !IS_MOBILE;
+                bridgeGroup.add(bollard);
+
+                const beacon = new THREE.Mesh(
+                    createSculptedArmorDomeGeo(0.12, 10, 10),
+                    MAT.cyanGlow
+                );
+                beacon.position.set(railX, 1.06, endZ);
+                bridgeGroup.add(beacon);
+            });
+        });
+
+        // Overhead lateral portal braces for truss bridges (high clearance so tall mechs/colossi pass underneath)
+        if (archetype === 'truss_bridge') {
+            [-spanLength * 0.38, 0, spanLength * 0.38].forEach(pz => {
+                const portalStrut = new THREE.Mesh(
+                    createExtrudedArmorHullGeo(bridgeWidth * 0.94, 0.16, 0.22),
+                    bridgePierMat
+                );
+                portalStrut.position.set(0, 2.02, pz);
+                intactSpanGroup.add(portalStrut);
+            });
+        }
 
         addMapMesh(bridgeGroup);
     });
@@ -4008,22 +5409,24 @@ function isPointInWaterPond(x, z, extraRadius = 0.4) {
             if (d <= effR + extraRadius) return true;
         }
     }
-    if (getRiverDist(x, z) <= RIVER_HALF_WIDTH + extraRadius) return true;
+    if (HAS_VALLEY_RIVER) {
+        const rc = getRiverCoords(x, z);
+        if (rc.dist <= (rc.halfWidth || RIVER_HALF_WIDTH) + extraRadius) return true;
+    }
     return false;
 }
 window.isPointInWaterPond = isPointInWaterPond;
 
 function getNearestPondInteraction(x, z, extraRadius = 0.8) {
-    // Strictly prevent any water splash or ripple when covered by or standing on a river bridge!
+    // Strictly prevent any water splash or ripple when covered by or standing on an intact river bridge!
     if (isOnRiverBridge(x, z, 0.95) || getRiverBridgeFactor(x, z) > 0.05) {
         return null;
     }
-    const rc = getRiverCoords(x, z);
     for (let i = 0; i < RIVER_BRIDGES.length; i++) {
         const br = RIVER_BRIDGES[i];
-        const bCenterU = getRiverCenterUAtS(br.sCoord);
-        if (Math.abs(rc.s - br.sCoord) <= br.halfWidth + 0.95 &&
-            Math.abs(rc.u - bCenterU) <= RIVER_HALF_WIDTH + 3.65) {
+        if (br.destroyed) continue;
+        const lc = getBridgeLocalCoords(br, x, z);
+        if (lc.absS <= br.halfWidth + 0.95 && lc.absU <= (br.rampReachU || (RIVER_HALF_WIDTH + 3.45)) + 0.25) {
             return null;
         }
     }
@@ -4041,14 +5444,18 @@ function getNearestPondInteraction(x, z, extraRadius = 0.8) {
             }
         }
     }
-    if (HAS_VALLEY_RIVER && rc.dist <= RIVER_HALF_WIDTH + extraRadius) {
-        const cPt = riverCoordsToWorld(rc.s, rc.centerU);
-        return {
-            pond: { x: cPt.x, z: cPt.z, r: RIVER_HALF_WIDTH },
-            dist: rc.dist,
-            isInside: rc.dist <= RIVER_HALF_WIDTH,
-            waterY: RIVER_WATER_Y
-        };
+    if (HAS_VALLEY_RIVER) {
+        const rc = getRiverCoords(x, z);
+        const effHalfW = rc.halfWidth || RIVER_HALF_WIDTH;
+        if (rc.dist <= effHalfW + extraRadius) {
+            const cPt = riverCoordsToWorld(rc.s, rc.centerU);
+            return {
+                pond: { x: cPt.x, z: cPt.z, r: effHalfW },
+                dist: rc.dist,
+                isInside: rc.dist <= effHalfW,
+                waterY: RIVER_WATER_Y
+            };
+        }
     }
     return null;
 }
@@ -4666,15 +6073,33 @@ function createDynamicMorphingRoadRibbon(seg, steps = 68) {
         }
 
         if (HAS_VALLEY_RIVER) {
-            const rc = getRiverCoords(curr.x, curr.z);
-            const refCenterU = (seg.isBridgeCauseway && typeof seg.bridgeCenterU === 'number') ? seg.bridgeCenterU : rc.centerU;
-            const rDist = Math.abs(rc.u - refCenterU);
-            const minRiverClearance = seg.isBridgeCauseway ? (RIVER_HALF_WIDTH + 3.05) : (RIVER_HALF_WIDTH + 3.8);
-            if (rDist < minRiverClearance) {
-                lastRow = -1;
-                prevPt = curr;
-                prevArc = cumulativeArc;
-                continue;
+            if (seg.isBridgeCauseway) {
+                // Clip bridge causeway road ribbon cleanly at the bridge approach ramp toe (with 0.15m overlap for a seamless weld)
+                let insideBridgeDeckOrRamp = false;
+                for (let b = 0; b < RIVER_BRIDGES.length; b++) {
+                    const br = RIVER_BRIDGES[b];
+                    const lc = getBridgeLocalCoords(br, curr.x, curr.z);
+                    const rampToeU = (br.rampReachU || (RIVER_HALF_WIDTH + 3.45)) - 0.15;
+                    if (lc.absS <= br.halfWidth + 1.8 && lc.absU < rampToeU) {
+                        insideBridgeDeckOrRamp = true;
+                        break;
+                    }
+                }
+                if (insideBridgeDeckOrRamp) {
+                    lastRow = -1;
+                    prevPt = curr;
+                    prevArc = cumulativeArc;
+                    continue;
+                }
+            } else {
+                const rc = getRiverCoords(curr.x, curr.z);
+                const minRiverClearance = (rc.halfWidth || RIVER_HALF_WIDTH) + 3.6;
+                if (rc.dist < minRiverClearance) {
+                    lastRow = -1;
+                    prevPt = curr;
+                    prevArc = cumulativeArc;
+                    continue;
+                }
             }
         }
 
@@ -4691,10 +6116,14 @@ function createDynamicMorphingRoadRibbon(seg, steps = 68) {
         const rx = curr.x + nx * hw, rz = curr.z + nz * hw;
         const cx = curr.x, cz = curr.z;
 
-        const baseH = getTerrainHeight(cx, cz);
+        // Sample terrain crown height and ensure road crown sits cleanly above side terrain triangles
+        const hCenter = getTerrainHeight(cx, cz);
+        const hLeft = getTerrainHeight(lx, lz);
+        const hRight = getTerrainHeight(rx, rz);
+        const baseH = Math.max(hCenter, (hCenter + Math.max(hLeft, hRight)) * 0.5);
         const cy = baseH + 0.064;
-        const ly = getTerrainHeight(lx, lz) + 0.056;
-        const ry = getTerrainHeight(rx, rz) + 0.056;
+        const ly = Math.max(hLeft + 0.052, baseH + 0.046);
+        const ry = Math.max(hRight + 0.052, baseH + 0.046);
 
         positions.push(lx, ly, lz, cx, cy, cz, rx, ry, rz);
         const vCoord = cumulativeArc * 0.42;
@@ -4723,8 +6152,8 @@ function createDynamicMorphingRoadRibbon(seg, steps = 68) {
                 const cEdgeOff = sideSign * (hw - 0.24);
                 const pEx = prevPt.x + prevNx * pEdgeOff, pEz = prevPt.z + prevNz * pEdgeOff;
                 const cEx = cx + nx * cEdgeOff, cEz = cz + nz * cEdgeOff;
-                const pEy = getTerrainHeight(pEx, pEz) + 0.072;
-                const cEy = getTerrainHeight(cEx, cEz) + 0.072;
+                const pEy = Math.max(getTerrainHeight(pEx, pEz), getTerrainHeight(prevPt.x, prevPt.z)) + 0.072;
+                const cEy = Math.max(getTerrainHeight(cEx, cEz), baseH) + 0.072;
 
                 edgeLinePositions.push(
                     pEx - prevNx * edgeLineHalfW, pEy, pEz - prevNz * edgeLineHalfW,
@@ -4741,7 +6170,7 @@ function createDynamicMorphingRoadRibbon(seg, steps = 68) {
 
             const midArc = 0.5 * (prevArc + cumulativeArc);
             const phaseInPeriod = ((midArc % dashPeriod) + dashPeriod) % dashPeriod;
-            if (phaseInPeriod <= dashDuty && t > 0.04 && t < 0.96) {
+            if (phaseInPeriod <= dashDuty && t > 0.04 && t < 0.96 && !isPointNearRoadJunctionHub(cx, cz, 0.35)) {
                 const pLx = prevPt.x - prevNx * stripeHalfW, pLz = prevPt.z - prevNz * stripeHalfW;
                 const pRx = prevPt.x + prevNx * stripeHalfW, pRz = prevPt.z + prevNz * stripeHalfW;
                 const cLx = cx - nx * stripeHalfW, cLz = cz - nz * stripeHalfW;
@@ -9651,6 +11080,26 @@ window.updateWorldGenConfig = function(key, val) {
     if (lbl) lbl.innerText = `${Math.round(window.WORLD_GEN_CONFIG[key] * 100)}%`;
 };
 
+function isSafeForProp(tx, tz, pad = 2.4) {
+    if (Math.abs(tx) > 92 || Math.abs(tz) > 92) return false;
+    if (typeof isClearForNaturalProp === 'function' && !isClearForNaturalProp(tx, tz, pad)) {
+        return false;
+    }
+    if (typeof REGISTERED_MAP_STRUCTURES !== 'undefined' && Array.isArray(REGISTERED_MAP_STRUCTURES)) {
+        for (let i = 0; i < REGISTERED_MAP_STRUCTURES.length; i++) {
+            const rs = REGISTERED_MAP_STRUCTURES[i];
+            if (rs && Math.hypot(tx - rs.x, tz - rs.z) < (rs.r || 3.0) + pad + 1.0) return false;
+        }
+    }
+    if (typeof obstacles !== 'undefined' && Array.isArray(obstacles)) {
+        for (let i = 0; i < obstacles.length; i++) {
+            const ob = obstacles[i];
+            if (ob && Math.hypot(tx - ob.x, tz - ob.z) < (ob.r || 1.2) + pad * 0.65) return false;
+        }
+    }
+    return true;
+}
+
 // Procedural Architectural Grammar Generator:
 // Builds multi-wing 3D structures with foundations, recessed framed windows, shutters, doors, porches,
 // balconies, chimneys, gutters, rooftop HVAC/water tanks, and 4 distinct deterioration states (1..4).
@@ -10397,7 +11846,9 @@ function createAutonomousWildlifeAndCivilians() {
 
     // 3. Frontier Settlement Civilians / Technicians (Patrol Settlements & Evacuate when Combat Approaches!)
     const civCount = Math.round((IS_MOBILE ? 4 : 8) * civMult);
-    const anchors = Array.isArray(DYNAMIC_LANDMARK_POS) ? DYNAMIC_LANDMARK_POS : [];
+    const anchors = (typeof REGISTERED_MAP_STRUCTURES !== 'undefined' && Array.isArray(REGISTERED_MAP_STRUCTURES) && REGISTERED_MAP_STRUCTURES.length > 0)
+        ? REGISTERED_MAP_STRUCTURES
+        : [ABANDONED_TOWN_CENTER, SOUTH_ROAD_HUB, NORTH_ROAD_HUB].filter(Boolean);
     for (let i = 0; i < civCount && anchors.length > 0; i++) {
         const anchor = anchors[i % anchors.length];
         if (!anchor) continue;
@@ -10584,6 +12035,66 @@ window.damageEnvironmentalStructuresAt = function(worldPos, blastRadius = 4.0, d
             }
         }
     }
+
+    // Also apply heavy ordnance damage to river bridges if within blast radius
+    if (typeof window.damageBridgeAt === 'function') {
+        window.damageBridgeAt(worldPos, blastRadius, damage * 0.45);
+    }
+};
+
+// Destructible & Engineer-Repairable Tactical River Bridge API:
+window.damageBridgeAt = function(worldPos, blastRadius = 4.5, damage = 45) {
+    if (!worldPos || !HAS_VALLEY_RIVER || damage <= 0) return false;
+    const wx = worldPos.x || 0;
+    const wz = worldPos.z || 0;
+    let stateChanged = false;
+
+    for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+        const rb = RIVER_BRIDGES[i];
+        if (!rb || rb.destroyed) continue;
+        const lc = getBridgeLocalCoords(rb, wx, wz);
+        const spanHalfU = rb.flatHalfSpan || (RIVER_HALF_WIDTH + 0.95);
+        if (lc.absS <= rb.halfWidth + blastRadius && lc.absU <= spanHalfU + blastRadius) {
+            rb.hp = Math.max(0, (typeof rb.hp === 'number' ? rb.hp : 1800) - damage);
+            if (rb.hp <= 0) {
+                rb.destroyed = true;
+                if (rb.intactSpanGroup) rb.intactSpanGroup.visible = false;
+                if (rb.destroyedSpanGroup) rb.destroyedSpanGroup.visible = true;
+                stateChanged = true;
+            }
+        }
+    }
+    if (stateChanged) {
+        syncFowGeometryWithTerrain();
+    }
+    return stateChanged;
+};
+
+window.repairBridgeAt = function(worldPos, repairRadius = 7.5, amount = 120) {
+    if (!worldPos || !HAS_VALLEY_RIVER || amount <= 0) return false;
+    const wx = worldPos.x || 0;
+    const wz = worldPos.z || 0;
+    let repairedAny = false;
+
+    for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+        const rb = RIVER_BRIDGES[i];
+        if (!rb) continue;
+        const maxHp = rb.maxHp || 1800;
+        if (!rb.destroyed && (rb.hp ?? maxHp) >= maxHp) continue;
+        const lc = getBridgeLocalCoords(rb, wx, wz);
+        const reachU = (rb.rampReachU || (RIVER_HALF_WIDTH + 3.45)) + repairRadius;
+        if (lc.absS <= rb.halfWidth + repairRadius && lc.absU <= reachU) {
+            rb.hp = Math.min(maxHp, (rb.hp || 0) + amount);
+            repairedAny = true;
+            if (rb.destroyed && rb.hp >= maxHp * 0.5) {
+                rb.destroyed = false;
+                if (rb.intactSpanGroup) rb.intactSpanGroup.visible = true;
+                if (rb.destroyedSpanGroup) rb.destroyedSpanGroup.visible = false;
+                syncFowGeometryWithTerrain();
+            }
+        }
+    }
+    return repairedAny;
 };
 
 // Strategic Gameplay-Environment Modifiers:
@@ -10630,9 +12141,263 @@ window.getEnvironmentalTacticalModifiers = function(x, z, isAir = false, isVehic
     return { speedMult, coverDamageMult, onRoad, inCover };
 };
 
-populateDynamicWorldPropsAndLandmarks();
+// ============================================================================
+// AUTOMATED PROCEDURAL MAP VALIDATION & SELF-REPAIR SYSTEM
+// Verifies road network continuity/slopes, river channel depth/continuity,
+// bridge-to-road connections, base buildability, and obstacle clearances.
+// ============================================================================
 
-// Dynamic Runtime Map Regeneration API (Ignores all previous cached state and computes a fresh procedural seed!)
+function validateRoadNetwork() {
+    const issues = [];
+    for (let s = 0; s < DYNAMIC_ROAD_SEGMENTS.length; s++) {
+        const seg = DYNAMIC_ROAD_SEGMENTS[s];
+        if (!seg || !Array.isArray(seg.samples) || seg.samples.length < 4) {
+            issues.push({ type: 'road_missing_samples', segIndex: s, seg });
+            continue;
+        }
+        const samples = seg.samples;
+        for (let i = 1; i < samples.length; i++) {
+            const prev = samples[i - 1];
+            const curr = samples[i];
+            const ds = Math.hypot(curr.x - prev.x, curr.z - prev.z);
+            if (ds > 0.05) {
+                const dy = Math.abs((curr.targetElevation ?? getTerrainHeight(curr.x, curr.z)) - (prev.targetElevation ?? getTerrainHeight(prev.x, prev.z)));
+                const grade = dy / ds;
+                if (grade > 0.14) {
+                    issues.push({ type: 'road_excessive_grade', segIndex: s, sampleIndex: i, grade });
+                    break;
+                }
+            }
+            if (i < samples.length - 1) {
+                const next = samples[i + 1];
+                const v1x = curr.x - prev.x, v1z = curr.z - prev.z;
+                const v2x = next.x - curr.x, v2z = next.z - curr.z;
+                const l1 = Math.hypot(v1x, v1z), l2 = Math.hypot(v2x, v2z);
+                if (l1 > 0.1 && l2 > 0.1) {
+                    const cosTurn = THREE.MathUtils.clamp((v1x * v2x + v1z * v2z) / (l1 * l2), -1, 1);
+                    const turnAngle = Math.acos(cosTurn);
+                    if (turnAngle > 0.65) {
+                        issues.push({ type: 'road_sharp_kink', segIndex: s, sampleIndex: i, turnAngle });
+                        break;
+                    }
+                }
+            }
+            if (!seg.isBridgeCauseway && HAS_VALLEY_RIVER) {
+                const rc = getRiverCoords(curr.x, curr.z);
+                if (rc.dist < (rc.halfWidth || RIVER_HALF_WIDTH) - 0.15 && !isOnRiverBridge(curr.x, curr.z, 0.5)) {
+                    issues.push({ type: 'road_enters_water_without_bridge', segIndex: s, sampleIndex: i, x: curr.x, z: curr.z });
+                    break;
+                }
+            }
+        }
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+function validateRiverGeometry() {
+    const issues = [];
+    if (!HAS_VALLEY_RIVER) return { valid: true, issues };
+
+    for (let s = -62; s <= 62; s += 2.0) {
+        const hw = getRiverHalfWidthAtS(s);
+        if (hw < 2.2 || hw > 6.5) {
+            issues.push({ type: 'river_invalid_width', s, halfWidth: hw });
+        }
+        const centerU = getRiverCenterUAtS(s);
+        const wPt = riverCoordsToWorld(s, centerU);
+        const bedH = getTerrainHeight(wPt.x, wPt.z);
+        if (bedH > RIVER_WATER_Y - 0.25) {
+            issues.push({ type: 'riverbed_above_water', s, x: wPt.x, z: wPt.z, bedH, waterY: RIVER_WATER_Y });
+        }
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+function validateBridgeConnections() {
+    const issues = [];
+    if (!HAS_VALLEY_RIVER) return { valid: true, issues };
+
+    for (let i = 0; i < RIVER_BRIDGES.length; i++) {
+        const rb = RIVER_BRIDGES[i];
+        const s0 = rb.sCoord;
+        const localSlope = getRiverTangentSlopeAtS(s0);
+        const expectedYaw = RIVER_ANGLE - Math.atan(localSlope);
+        const yawErr = Math.abs(THREE.MathUtils.euclideanModulo((rb.yaw ?? expectedYaw) - expectedYaw + Math.PI, Math.PI * 2) - Math.PI);
+        if (yawErr > 0.15) {
+            issues.push({ type: 'bridge_orientation_mismatch', bridgeIndex: i, yawErr, expectedYaw });
+        }
+        const rampReachU = rb.rampReachU || (getRiverHalfWidthAtS(s0) + 3.45);
+        [-1, 1].forEach(endSign => {
+            const toePt = bridgeLocalToWorld(rb, 0, endSign * rampReachU);
+            const toeGroundH = getTerrainHeight(toePt.x, toePt.z);
+            if (toeGroundH < RIVER_WATER_Y + 0.05) {
+                issues.push({
+                    type: 'bridge_ramp_submerged',
+                    bridgeIndex: i,
+                    endSign,
+                    x: toePt.x,
+                    z: toePt.z,
+                    toeGroundH
+                });
+            }
+            const roadFactorAtToe = getSupplyRoadFactor(toePt.x, toePt.z);
+            if (roadFactorAtToe < 0.20) {
+                issues.push({
+                    type: 'bridge_disconnected_from_road',
+                    bridgeIndex: i,
+                    endSign,
+                    x: toePt.x,
+                    z: toePt.z,
+                    roadFactorAtToe
+                });
+            }
+        });
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+function validateTerrainSlopes() {
+    const issues = [];
+    const baseAnchors = [
+        { name: 'player_start', x: PLAYER_START_POS.x, z: PLAYER_START_POS.z, r: 10.5 },
+        { name: 'enemy_base', x: ENEMY_BASE_POS.x, z: ENEMY_BASE_POS.z, r: 10.5 },
+        { name: 'solaris_base', x: SOLARIS_BASE_POS.x, z: SOLARIS_BASE_POS.z, r: 9.5 }
+    ];
+    for (let b = 0; b < baseAnchors.length; b++) {
+        const ba = baseAnchors[b];
+        const centerH = getTerrainHeight(ba.x, ba.z);
+        for (let a = 0; a < 8; a++) {
+            const ang = (a / 8) * Math.PI * 2;
+            const sx = ba.x + Math.cos(ang) * (ba.r * 0.65);
+            const sz = ba.z + Math.sin(ang) * (ba.r * 0.65);
+            const hDiff = Math.abs(getTerrainHeight(sx, sz) - centerH);
+            if (hDiff > 0.65) {
+                issues.push({ type: 'base_pad_uneven', base: ba.name, x: sx, z: sz, hDiff });
+                break;
+            }
+        }
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+function validateBuildingPlacement() {
+    const issues = [];
+    for (let i = obstacles.length - 1; i >= 0; i--) {
+        const ob = obstacles[i];
+        if (!ob || ob.isDynamicPond || ob.type === 'pond' || ob.type === 'mineral' || ob.type === 'geyser') continue;
+        // Check if a natural prop/rock/tree/ruin was placed on an active bridge or road centerline
+        if (isSpotUnderOrBlockingBridge(ob.x, ob.z, (ob.r || 0.6) + 0.5)) {
+            issues.push({ type: 'obstacle_blocking_bridge', index: i, ob });
+        } else if ((ob.isTree || ob.type === 'tree' || ob.type === 'rock') && getSupplyRoadFactor(ob.x, ob.z) > 0.68) {
+            issues.push({ type: 'obstacle_on_road_centerline', index: i, ob });
+        }
+    }
+    return { valid: issues.length === 0, issues };
+}
+
+function repairGeneratedMap(allIssues) {
+    if (!Array.isArray(allIssues) || allIssues.length === 0) return 0;
+    let repairedCount = 0;
+    let needsRoadRebake = false;
+
+    for (let i = 0; i < allIssues.length; i++) {
+        const issue = allIssues[i];
+        if (!issue) continue;
+
+        if (issue.type === 'road_missing_samples' && issue.seg) {
+            precomputeRoadSegmentSamples(issue.seg, 72);
+            needsRoadRebake = true;
+            repairedCount++;
+        } else if ((issue.type === 'road_sharp_kink' || issue.type === 'road_excessive_grade') && typeof issue.segIndex === 'number') {
+            const seg = DYNAMIC_ROAD_SEGMENTS[issue.segIndex];
+            if (seg && Array.isArray(seg.samples)) {
+                // Apply extra Laplacian smoothing passes to eliminate any residual kink or grade spike
+                const n = seg.samples.length;
+                for (let pass = 0; pass < 4; pass++) {
+                    for (let k = 1; k < n - 1; k++) {
+                        seg.samples[k].x = seg.samples[k].x * 0.5 + (seg.samples[k - 1].x + seg.samples[k + 1].x) * 0.25;
+                        seg.samples[k].z = seg.samples[k].z * 0.5 + (seg.samples[k - 1].z + seg.samples[k + 1].z) * 0.25;
+                        if (typeof seg.samples[k].targetElevation === 'number') {
+                            seg.samples[k].targetElevation = seg.samples[k].targetElevation * 0.5 +
+                                ((seg.samples[k - 1].targetElevation || 0.2) + (seg.samples[k + 1].targetElevation || 0.2)) * 0.25;
+                        }
+                    }
+                }
+                needsRoadRebake = true;
+                repairedCount++;
+            }
+        } else if (issue.type === 'bridge_orientation_mismatch' && typeof issue.bridgeIndex === 'number') {
+            const rb = RIVER_BRIDGES[issue.bridgeIndex];
+            if (rb && typeof issue.expectedYaw === 'number') {
+                rb.yaw = issue.expectedYaw;
+                rb.cosYaw = Math.cos(rb.yaw);
+                rb.sinYaw = Math.sin(rb.yaw);
+                if (rb.bridgeGroup) rb.bridgeGroup.rotation.y = rb.yaw;
+                repairedCount++;
+            }
+        } else if ((issue.type === 'obstacle_blocking_bridge' || issue.type === 'obstacle_on_road_centerline') && issue.ob) {
+            const idx = obstacles.indexOf(issue.ob);
+            if (idx !== -1) {
+                obstacles.splice(idx, 1);
+                repairedCount++;
+            }
+        }
+    }
+
+    if (needsRoadRebake) {
+        bakeRoadSpatialLookupGrid();
+        rebuildTerrainVerticesAndColors();
+        syncFowGeometryWithTerrain();
+    }
+    return repairedCount;
+}
+
+function validateGeneratedMap() {
+    const roadRes = validateRoadNetwork();
+    const riverRes = validateRiverGeometry();
+    const bridgeRes = validateBridgeConnections();
+    const slopeRes = validateTerrainSlopes();
+    const bldRes = validateBuildingPlacement();
+
+    const allIssues = [
+        ...roadRes.issues,
+        ...riverRes.issues,
+        ...bridgeRes.issues,
+        ...slopeRes.issues,
+        ...bldRes.issues
+    ];
+
+    let repairedCount = 0;
+    if (allIssues.length > 0) {
+        repairedCount = repairGeneratedMap(allIssues);
+    }
+
+    return {
+        seed: MAP_SEED,
+        valid: allIssues.length === 0 || repairedCount >= allIssues.length,
+        issueCount: allIssues.length,
+        repairedCount,
+        details: {
+            roads: roadRes.valid,
+            river: riverRes.valid,
+            bridges: bridgeRes.valid,
+            slopes: slopeRes.valid,
+            buildings: bldRes.valid
+        }
+    };
+}
+window.validateGeneratedMap = validateGeneratedMap;
+window.validateRoadNetwork = validateRoadNetwork;
+window.validateRiverGeometry = validateRiverGeometry;
+window.validateBridgeConnections = validateBridgeConnections;
+window.validateTerrainSlopes = validateTerrainSlopes;
+window.validateBuildingPlacement = validateBuildingPlacement;
+window.repairGeneratedMap = repairGeneratedMap;
+
+populateDynamicWorldPropsAndLandmarks();
+validateGeneratedMap();
+
+// Dynamic Runtime Map Regeneration API (Honors deterministic customSeed when provided, or generates a fresh 6-digit seed!)
 window.generateDynamicMapParameters = generateProceduralTopographyParameters;
 window.regenerateMapDynamically = function(customSeed, lobbyPlayers) {
     if (Array.isArray(lobbyPlayers)) {
@@ -10655,6 +12420,7 @@ window.regenerateMapDynamically = function(customSeed, lobbyPlayers) {
     _cachedBaseBlockers = null;
     _cachedPinchZones = [];
     _cachedBaseBlockersMs = -9999;
+    _astarStaticDirty = true;
     _lastSyncedCreepVertexRadius = -999;
     _lastSyncedCreepCenterX = -999;
     _lastSyncedCreepCenterZ = -999;
@@ -10662,11 +12428,15 @@ window.regenerateMapDynamically = function(customSeed, lobbyPlayers) {
 
     try { sessionStorage.removeItem('OUTPOST_MAP_SEED'); } catch (e) {}
 
-    let nextSeed = (customSeed !== undefined && Number.isFinite(Number(customSeed)) && Math.floor(Number(customSeed)) !== MAP_SEED)
-        ? Math.floor(Number(customSeed))
-        : (Math.floor(100000 + Math.random() * 899999));
-    if (nextSeed === MAP_SEED) {
-        nextSeed = ((nextSeed + 247913) % 899999) + 100000;
+    const hasExplicitSeed = (customSeed !== undefined && customSeed !== null && customSeed !== '' && Number.isFinite(Number(customSeed)) && Number(customSeed) > 0);
+    let nextSeed;
+    if (hasExplicitSeed) {
+        nextSeed = Math.floor(Number(customSeed));
+    } else {
+        nextSeed = Math.floor(100000 + Math.random() * 899999);
+        if (nextSeed === MAP_SEED) {
+            nextSeed = ((nextSeed + 247913) % 899999) + 100000;
+        }
     }
 
     generateProceduralTopographyParameters(nextSeed);
@@ -10682,6 +12452,7 @@ window.regenerateMapDynamically = function(customSeed, lobbyPlayers) {
     activeZergMainCreepMesh = null;
 
     populateDynamicWorldPropsAndLandmarks();
+    validateGeneratedMap();
     updateZergCreepColors(creepRadius, false, true);
 
     if (typeof window.resetMatchForNewMap === 'function') {

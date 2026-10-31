@@ -378,6 +378,16 @@
               <span>Wildlife &amp; Civilian Activity (<span id="val-wg-wildlifePopulation">100%</span>)</span>
               <input type="range" min="0.0" max="2.0" step="0.1" value="1.0" oninput="window.updateWorldGenConfig && window.updateWorldGenConfig('wildlifePopulation', this.value); window.updateWorldGenConfig && window.updateWorldGenConfig('civilianPopulation', this.value);" />
             </label>
+            <label class="settings-row">
+              <span>Adaptive Graphics &amp; Frame Pacing</span>
+              <select id="sel-perf-quality" style="background:#081221;color:#38bdf8;border:1px solid rgba(56,189,248,0.45);padding:3px 8px;font-family:'JetBrains Mono',monospace;font-size:11px;" onchange="window.GAME_API && window.GAME_API.setQualityPreset && window.GAME_API.setQualityPreset(this.value)">
+                <option value="AUTO" selected>AUTO (ADAPTIVE 60 FPS)</option>
+                <option value="ULTRA">ULTRA</option>
+                <option value="HIGH">HIGH</option>
+                <option value="BALANCED">BALANCED</option>
+                <option value="PERFORMANCE">PERFORMANCE (MAX FPS)</option>
+              </select>
+            </label>
           </div>
 
           <div class="settings-quick-actions">
@@ -419,6 +429,7 @@
     <script src="/textures-scene.js"></script>
     <script src="/terrain-fow.js"></script>
     <script src="/models-fx.js"></script>
+    <script src="/perf_optimizer.js"></script>
     <script src="/game.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -334,12 +334,24 @@ function makeHealthPip(color, isStructure = false) {
 
 function updateHealthPip(hb, hp, maxHp, shield = 0, maxShield = 0) {
     if (!hb || !hb.bar) return;
-    hb.bar.style.width = `${Math.max(0, Math.min(100, (hp / Math.max(1, maxHp)) * 100))}%`;
+    const hpPct = Math.round(Math.max(0, Math.min(100, (hp / Math.max(1, maxHp)) * 100)) * 2) * 0.5;
+    if (hb._lastHpPct !== hpPct) {
+        hb._lastHpPct = hpPct;
+        hb.bar.style.width = `${hpPct}%`;
+    }
     if (hb.shieldBar) {
         if (maxShield > 0) {
-            if (hb.shieldBar.style.display !== 'block') hb.shieldBar.style.display = 'block';
-            hb.shieldBar.style.width = `${Math.max(0, Math.min(100, (shield / maxShield) * 100))}%`;
-        } else if (hb.shieldBar.style.display !== 'none') {
+            if (hb._lastShDisp !== 'block') {
+                hb._lastShDisp = 'block';
+                hb.shieldBar.style.display = 'block';
+            }
+            const shPct = Math.round(Math.max(0, Math.min(100, (shield / maxShield) * 100)) * 2) * 0.5;
+            if (hb._lastShPct !== shPct) {
+                hb._lastShPct = shPct;
+                hb.shieldBar.style.width = `${shPct}%`;
+            }
+        } else if (hb._lastShDisp !== 'none') {
+            hb._lastShDisp = 'none';
             hb.shieldBar.style.display = 'none';
         }
     }
@@ -361,76 +373,124 @@ window.isWorldPosInViewport = function(wx, wy, wz, radius = 3.5) {
 };
 
 const fowSmoothAlpha = new Float32Array(FOW_RES * FOW_RES).fill(215);
+const _fowMinRatioSqGrid = new Float32Array(FOW_RES * FOW_RES);
+let _fowLastSig = 0;
+let _fowSkipStreak = 0;
+let _fowFirstPassDone = false;
 
 function updateFogOfWarVision() {
-    fowVisible.fill(0);
+    if (window.PERF_PROFILER) window.PERF_PROFILER.begin('fogOfWar');
 
     const weatherVisMult = (window.WEATHER_SYSTEM && typeof window.WEATHER_SYSTEM.getVisionMultiplier === 'function')
         ? window.WEATHER_SYSTEM.getVisionMultiplier()
         : 1.0;
+    const revealAll = !!window.fowRevealAll;
 
-    const visionSources = [];
-    const addVis = (x, z, r) => {
-        const rad = Math.max(1, r);
-        visionSources.push({ x, z, invR2: 1.0 / (rad * rad) });
-    };
-    if (!state.basePlaced) {
-        addVis(PLAYER_START_POS.x, PLAYER_START_POS.z, 36 * weatherVisMult);
-        if (typeof SOLARIS_BASE_POS !== 'undefined') {
-            addVis(SOLARIS_BASE_POS.x, SOLARIS_BASE_POS.z, 22 * weatherVisMult);
-        }
-    } else {
-        for (let i = 0; i < buildings.length; i++) {
-            const b = buildings[i];
-            if (b && b.hp > 0) addVis(b.pos.x, b.pos.z, (b.type === 'base' ? 34 : 23) * weatherVisMult);
-        }
+    // Build spatial vision signature so we can skip full canvas uploads when units are stationary and alpha has settled
+    let sig = revealAll ? 777777 : Math.round(weatherVisMult * 100);
+    if (state.basePlaced) {
+        sig = (sig * 31 + buildings.length * 17 + units.length * 13) | 0;
         for (let i = 0; i < units.length; i++) {
             const u = units[i];
-            if (u && u.hp > 0) addVis(u.mesh.position.x, u.mesh.position.z, (u.isAir ? 25 : 17.5) * weatherVisMult);
+            if (u && u.hp > 0) {
+                sig = (sig + ((Math.round(u.mesh.position.x * 0.75) * 73856093) ^ (Math.round(u.mesh.position.z * 0.75) * 19349663))) | 0;
+            }
         }
-        if (!state.solarisHostile) {
-            for (let i = 0; i < solarisBuildings.length; i++) {
-                const sb = solarisBuildings[i];
-                if (sb && sb.hp > 0) addVis(sb.pos.x, sb.pos.z, 22 * weatherVisMult);
+        for (let i = 0; i < buildings.length; i++) {
+            const b = buildings[i];
+            if (b && b.hp > 0) {
+                sig = (sig + ((Math.round(b.pos.x) * 83492791) ^ (Math.round(b.pos.z) * 2971215073))) | 0;
             }
         }
     }
 
-    const vLen = visionSources.length;
+    const canReuseVisionGrid = (_fowFirstPassDone && sig === _fowLastSig && _fowSkipStreak < 2 && !revealAll);
+    _fowLastSig = sig;
+
     const data = fowImgData.data;
-    const revealAll = !!window.fowRevealAll;
+    const halfMap = MAP_SIZE * 0.5;
+    const worldToGrid = FOW_RES / MAP_SIZE;
+    const gridToWorld = MAP_SIZE / FOW_RES;
 
-    for (let gy = 0; gy < FOW_RES; gy++) {
-        const wz = ((gy / FOW_RES) - 0.5) * MAP_SIZE;
-        const rowOffset = gy * FOW_RES;
-        for (let gx = 0; gx < FOW_RES; gx++) {
-            const wx = ((gx / FOW_RES) - 0.5) * MAP_SIZE;
-            const idx = rowOffset + gx;
+    if (revealAll) {
+        _fowSkipStreak = 0;
+        _fowFirstPassDone = true;
+        fowExplored.fill(1);
+        fowVisible.fill(1);
+        fowSmoothAlpha.fill(0);
+        for (let idx = 0, total = FOW_RES * FOW_RES; idx < total; idx++) {
+            const p = idx * 4;
+            data[p] = 6;
+            data[p + 1] = 11;
+            data[p + 2] = 18;
+            data[p + 3] = 0;
+        }
+        fowCtx.putImageData(fowImgData, 0, 0);
+        fowTexture.needsUpdate = true;
+    } else {
+        if (!canReuseVisionGrid) {
+            _fowSkipStreak = 0;
+            fowVisible.fill(0);
+            _fowMinRatioSqGrid.fill(999.0);
 
-            if (revealAll) {
-                fowExplored[idx] = 1;
-                fowVisible[idx] = 1;
-                fowSmoothAlpha[idx] = 0;
-                const p = idx * 4;
-                data[p] = 6;
-                data[p + 1] = 11;
-                data[p + 2] = 18;
-                data[p + 3] = 0;
-                continue;
-            }
+            const stampVisionCircle = (vx, vz, radius) => {
+                const rad = Math.max(1.0, radius);
+                const invR2 = 1.0 / (rad * rad);
+                const minGx = Math.max(0, Math.floor((vx - rad + halfMap) * worldToGrid));
+                const maxGx = Math.min(FOW_RES - 1, Math.ceil((vx + rad + halfMap) * worldToGrid));
+                const minGy = Math.max(0, Math.floor((vz - rad + halfMap) * worldToGrid));
+                const maxGy = Math.min(FOW_RES - 1, Math.ceil((vz + rad + halfMap) * worldToGrid));
 
-            let minRatioSq = 999;
-            for (let s = 0; s < vLen; s++) {
-                const src = visionSources[s];
-                const dx = wx - src.x;
-                const dz = wz - src.z;
-                const dSq = (dx * dx + dz * dz) * src.invR2;
-                if (dSq < minRatioSq) {
-                    minRatioSq = dSq;
-                    if (dSq < 0.35) break; // Early exit inside bright core vision
+                for (let gy = minGy; gy <= maxGy; gy++) {
+                    const wz = gy * gridToWorld - halfMap;
+                    const dz = wz - vz;
+                    const dz2 = dz * dz;
+                    const rowOff = gy * FOW_RES;
+                    for (let gx = minGx; gx <= maxGx; gx++) {
+                        const idx = rowOff + gx;
+                        const curBest = _fowMinRatioSqGrid[idx];
+                        if (curBest <= 0.30) continue; // Already inside bright core vision
+                        const wx = gx * gridToWorld - halfMap;
+                        const dx = wx - vx;
+                        const dSq = (dx * dx + dz2) * invR2;
+                        if (dSq < curBest) {
+                            _fowMinRatioSqGrid[idx] = dSq;
+                        }
+                    }
+                }
+            };
+
+            if (!state.basePlaced) {
+                stampVisionCircle(PLAYER_START_POS.x, PLAYER_START_POS.z, 38 * weatherVisMult);
+                if (typeof SOLARIS_BASE_POS !== 'undefined') {
+                    stampVisionCircle(SOLARIS_BASE_POS.x, SOLARIS_BASE_POS.z, 24 * weatherVisMult);
+                }
+            } else {
+                for (let i = 0; i < buildings.length; i++) {
+                    const b = buildings[i];
+                    if (b && b.hp > 0) stampVisionCircle(b.pos.x, b.pos.z, (b.type === 'base' ? 36 : 24) * weatherVisMult);
+                }
+                for (let i = 0; i < units.length; i++) {
+                    const u = units[i];
+                    if (u && u.hp > 0) stampVisionCircle(u.mesh.position.x, u.mesh.position.z, (u.isAir ? 26 : 18.5) * weatherVisMult);
+                }
+                if (!state.solarisHostile) {
+                    for (let i = 0; i < solarisBuildings.length; i++) {
+                        const sb = solarisBuildings[i];
+                        if (sb && sb.hp > 0) stampVisionCircle(sb.pos.x, sb.pos.z, 24 * weatherVisMult);
+                    }
                 }
             }
+        } else {
+            _fowSkipStreak++;
+        }
 
+        let anyAlphaChanged = !canReuseVisionGrid || !_fowFirstPassDone;
+        const lerpRate = (!_fowFirstPassDone || !state.basePlaced) ? 1.0 : 0.48;
+        _fowFirstPassDone = true;
+        const totalCells = FOW_RES * FOW_RES;
+        for (let idx = 0; idx < totalCells; idx++) {
+            const minRatioSq = _fowMinRatioSqGrid[idx];
             let targetAlpha = 212;
             if (minRatioSq < 1.0) {
                 fowExplored[idx] = 1;
@@ -446,8 +506,11 @@ function updateFogOfWarVision() {
                 targetAlpha = 116;
             }
 
-            fowSmoothAlpha[idx] = fowSmoothAlpha[idx] + (targetAlpha - fowSmoothAlpha[idx]) * 0.42;
-            const alpha = Math.max(0, Math.min(255, Math.round(fowSmoothAlpha[idx])));
+            const prevSmooth = fowSmoothAlpha[idx];
+            const nextSmooth = prevSmooth + (targetAlpha - prevSmooth) * lerpRate;
+            fowSmoothAlpha[idx] = nextSmooth;
+            if (Math.abs(nextSmooth - prevSmooth) > 0.35) anyAlphaChanged = true;
+            const alpha = Math.max(0, Math.min(255, (nextSmooth + 0.5) | 0));
 
             const p = idx * 4;
             data[p] = 6;
@@ -455,9 +518,12 @@ function updateFogOfWarVision() {
             data[p + 2] = 18;
             data[p + 3] = alpha;
         }
+
+        if (anyAlphaChanged) {
+            fowCtx.putImageData(fowImgData, 0, 0);
+            fowTexture.needsUpdate = true;
+        }
     }
-    fowCtx.putImageData(fowImgData, 0, 0);
-    fowTexture.needsUpdate = true;
 
     for (let i = 0; i < enemies.length; i++) {
         const e = enemies[i];
@@ -479,6 +545,8 @@ function updateFogOfWarVision() {
             if (eb.hb.root.style.display !== 'none') eb.hb.root.style.display = 'none';
         }
     }
+
+    if (window.PERF_PROFILER) window.PERF_PROFILER.end('fogOfWar');
 }
 
 // Helper to ensure AI Buildings NEVER overlap each other, never block base ramps, never spawn in rivers, and always leave wide tank/unit pathways!
@@ -4679,19 +4747,43 @@ renderTacticalMinimap();
 // 8. SPAWNERS WITH BIOLOGICAL VS MECHANICAL TAGS, SELECTION RINGS & COLLISION
 // ============================================================================
 const _projScreenVec = new THREE.Vector3();
-function projectToScreen(dom, pos, yOff = 1.3) {
+let _domProjCallCounter = 0;
+function projectToScreen(dom, pos, yOff = 1.3, forceImmediate = false) {
     if (!dom || !pos) return;
+    const t0 = window.PERF_PROFILER ? performance.now() : 0;
+
+    // Throttle DOM coordinate projection for unselected units on mobile/adaptive quality tiers
+    const stride = (!forceImmediate && window.PERF_MANAGER && window.PERF_MANAGER.current)
+        ? (window.PERF_MANAGER.current.domProjectionStride || 1)
+        : 1;
+    if (stride > 1) {
+        if (dom._projPhase === undefined) dom._projPhase = (_domProjCallCounter++) & 7;
+        const frameTick = window.PERF_PROFILER ? window.PERF_PROFILER.frameCount : (_domProjCallCounter++);
+        if (((frameTick + dom._projPhase) % stride) !== 0 && dom._lastLx !== undefined) {
+            if (window.PERF_PROFILER) window.PERF_PROFILER.addSample('domHealthBarProjection', performance.now() - t0);
+            return;
+        }
+    }
+
     _projScreenVec.set(pos.x, pos.y + yOff, pos.z);
     _projScreenVec.project(camera);
     if (_projScreenVec.z > 1 || _projScreenVec.x < -1.08 || _projScreenVec.x > 1.08 || _projScreenVec.y < -1.08 || _projScreenVec.y > 1.08) {
-        if (dom.style.display !== 'none') dom.style.display = 'none';
+        if (dom._lastDisp !== 'none') {
+            dom._lastDisp = 'none';
+            dom.style.display = 'none';
+        }
+        if (window.PERF_PROFILER) window.PERF_PROFILER.addSample('domHealthBarProjection', performance.now() - t0);
         return;
     }
-    if (dom.style.display !== 'block') dom.style.display = 'block';
+    if (dom._lastDisp !== 'block') {
+        dom._lastDisp = 'block';
+        dom.style.display = 'block';
+    }
     const lx = Math.round((_projScreenVec.x * 0.5 + 0.5) * window.innerWidth);
     const ly = Math.round((-(_projScreenVec.y * 0.5) + 0.5) * window.innerHeight);
     if (dom._lastLx !== lx) { dom._lastLx = lx; dom.style.left = `${lx}px`; }
     if (dom._lastLy !== ly) { dom._lastLy = ly; dom.style.top = `${ly}px`; }
+    if (window.PERF_PROFILER) window.PERF_PROFILER.addSample('domHealthBarProjection', performance.now() - t0);
 }
 
 let _activeCombatFloats = 0;
@@ -5003,62 +5095,344 @@ function spawnEnemyFromBuilding(variant, originPos) {
 }
 
 // ============================================================================
-// 8B. MASS-WEIGHTED COLLISION SOLVER (WITH TIGHT-BUILDING PINCH ESCAPE & AIR SEPARATION)
+// 8A. REUSABLE SPATIAL HASH GRIDS & UNIT / BUILDING COUNTER SYSTEM
 // ============================================================================
-function resolveAllUnitCollisions() {
-    const groundActors = [];
+const SPATIAL_GRID_CELL = 6.0;
+const SPATIAL_GRID_HALF = 132.0;
+const SPATIAL_GRID_DIM = 44; // 44 x 44 = 1936 buckets covering [-132..+132]
+const SPATIAL_GRID_TOTAL = SPATIAL_GRID_DIM * SPATIAL_GRID_DIM;
+
+function _createSpatialGridStore() {
+    const buckets = new Array(SPATIAL_GRID_TOTAL);
+    for (let i = 0; i < SPATIAL_GRID_TOTAL; i++) buckets[i] = [];
+    return {
+        buckets,
+        activeIndices: [],
+        clear() {
+            for (let i = 0; i < this.activeIndices.length; i++) {
+                this.buckets[this.activeIndices[i]].length = 0;
+            }
+            this.activeIndices.length = 0;
+        },
+        insert(wx, wz, item) {
+            const gx = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wx + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+            const gz = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wz + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+            const idx = gz * SPATIAL_GRID_DIM + gx;
+            const b = this.buckets[idx];
+            if (b.length === 0) this.activeIndices.push(idx);
+            b.push(item);
+        },
+        insertSpan(wx, wz, radius, item) {
+            const minGx = Math.max(0, Math.floor((wx - radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const maxGx = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wx + radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const minGz = Math.max(0, Math.floor((wz - radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const maxGz = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wz + radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            for (let gz = minGz; gz <= maxGz; gz++) {
+                const rowOff = gz * SPATIAL_GRID_DIM;
+                for (let gx = minGx; gx <= maxGx; gx++) {
+                    const idx = rowOff + gx;
+                    const b = this.buckets[idx];
+                    if (b.length === 0) this.activeIndices.push(idx);
+                    b.push(item);
+                }
+            }
+        }
+    };
+}
+
+const GROUND_UNIT_GRID = _createSpatialGridStore();
+const AIR_UNIT_GRID = _createSpatialGridStore();
+const ENEMY_GRID = _createSpatialGridStore();
+const ALLY_GRID = _createSpatialGridStore();
+const STRUCT_COLLISION_GRID = _createSpatialGridStore();
+
+const _groundActorsScratch = [];
+const _airActorsScratch = [];
+const _structCachePool = [];
+let _structCollisionSig = '';
+
+const UNIT_COUNTS = {
+    infantry: 0,
+    vehicles: 0,
+    solaris: 0,
+    ground: 0,
+    air: 0,
+    mindControlled: 0,
+    fleetStaged: 0,
+    solarisFleetStaged: 0,
+    dropships: []
+};
+
+const BUILDING_COUNTS = {
+    activeBarracks: 0,
+    activeBarracksOrGate: 0,
+    activeZergEvo: 0,
+    activeSolarisCyber: 0,
+    solarisProd: [],
+    zergSpawners: [],
+    activeShieldTurrets: []
+};
+
+let _queryStampCounter = 1;
+
+function syncUnitAndBuildingCounters() {
+    UNIT_COUNTS.infantry = 0;
+    UNIT_COUNTS.vehicles = 0;
+    UNIT_COUNTS.solaris = 0;
+    UNIT_COUNTS.ground = 0;
+    UNIT_COUNTS.air = 0;
+    UNIT_COUNTS.mindControlled = 0;
+    UNIT_COUNTS.fleetStaged = 0;
+    UNIT_COUNTS.solarisFleetStaged = 0;
+    UNIT_COUNTS.dropships.length = 0;
+
     for (let i = 0; i < units.length; i++) {
-        if (!units[i].isAir) groundActors.push(units[i]);
-    }
-    for (let i = 0; i < enemies.length; i++) {
-        if (!enemies[i].isAir) groundActors.push(enemies[i]);
+        const u = units[i];
+        if (!u || u.hp <= 0) continue;
+        if (u.isAir) UNIT_COUNTS.air++;
+        else UNIT_COUNTS.ground++;
+        if (u.isMindControlled) UNIT_COUNTS.mindControlled++;
+        if (u.fleetState === 'staging') {
+            UNIT_COUNTS.fleetStaged++;
+            if (u.type === 'zealot' || u.type === 'stalker' || u.type === 'archon') {
+                UNIT_COUNTS.solarisFleetStaged++;
+            }
+        }
+        const t = u.type;
+        if (t === 'grunt' || t === 'ranger' || t === 'medic' || t === 'rocketman' || t === 'reaper' || t === 'firebat' || t === 'marauder') {
+            UNIT_COUNTS.infantry++;
+        } else if (t === 'tank' || t === 'siege_tank' || t === 'heli' || t === 'transport' || t === 'valkyrie') {
+            UNIT_COUNTS.vehicles++;
+            if (t === 'transport') UNIT_COUNTS.dropships.push(u);
+        } else if (t === 'zealot' || t === 'stalker' || t === 'archon') {
+            UNIT_COUNTS.solaris++;
+        }
     }
 
-    const allStructs = [];
+    BUILDING_COUNTS.activeBarracks = 0;
+    BUILDING_COUNTS.activeBarracksOrGate = 0;
+    BUILDING_COUNTS.activeZergEvo = 0;
+    BUILDING_COUNTS.activeSolarisCyber = 0;
+    BUILDING_COUNTS.solarisProd.length = 0;
+    BUILDING_COUNTS.zergSpawners.length = 0;
+    BUILDING_COUNTS.activeShieldTurrets.length = 0;
+
     for (let i = 0; i < buildings.length; i++) {
         const b = buildings[i];
         if (!b || b.hp <= 0) continue;
-        allStructs.push({
-            x: b.pos.x,
-            z: b.pos.z,
-            r: b.type === 'base' ? 2.15 : (b.type === 'barrier' ? 1.55 : (b.type === 'turret' ? 1.48 : 1.92)),
-            isBarrier: b.type === 'barrier'
-        });
+        if (!b.isConstructing) {
+            if (b.type === 'barracks') {
+                BUILDING_COUNTS.activeBarracks++;
+                BUILDING_COUNTS.activeBarracksOrGate++;
+            } else if (b.type === 'solaris_gate') {
+                BUILDING_COUNTS.activeBarracksOrGate++;
+            }
+        }
+        if (b.type === 'turret' && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)) {
+            BUILDING_COUNTS.activeShieldTurrets.push(b);
+        }
     }
-    for (let i = 0; i < enemyBuildings.length; i++) {
-        const eb = enemyBuildings[i];
-        if (!eb || eb.hp <= 0) continue;
-        allStructs.push({
-            x: eb.pos.x,
-            z: eb.pos.z,
-            r: eb.role === 'citadel' ? 2.65 : (eb.role === 'spine_turret' ? 1.38 : 2.05)
-        });
-    }
+
     if (typeof solarisBuildings !== 'undefined') {
         for (let i = 0; i < solarisBuildings.length; i++) {
             const sb = solarisBuildings[i];
-            if (!sb || sb.hp <= 0) continue;
-            allStructs.push({
-                x: sb.pos.x,
-                z: sb.pos.z,
-                r: sb.footprintRadius || 1.95
-            });
-        }
-    }
-    if (typeof obstacles !== 'undefined') {
-        for (let i = 0; i < obstacles.length; i++) {
-            const ob = obstacles[i];
-            if (!ob || !ob.pos) continue;
-            if (ob.isBarrier || ob.type === 'anti_rush_barrier' || ob.type === 'battlefield_barriers') {
-                allStructs.push({
-                    x: ob.pos.x,
-                    z: ob.pos.z,
-                    r: (ob.radius || 1.65) + 0.15,
-                    isBarrier: true
-                });
+            if (!sb || sb.hp <= 0 || sb.isConstructing) continue;
+            if (sb.role === 'cyber_core') BUILDING_COUNTS.activeSolarisCyber++;
+            if (sb.role === 'gateway' || sb.role === 'robotics_bay' || sb.role === 'stargate') {
+                BUILDING_COUNTS.solarisProd.push(sb);
             }
         }
     }
+
+    for (let i = 0; i < enemyBuildings.length; i++) {
+        const eb = enemyBuildings[i];
+        if (!eb || eb.hp <= 0) continue;
+        if (eb.role === 'evo_chamber' && !eb.isConstructing) {
+            BUILDING_COUNTS.activeZergEvo++;
+        }
+        if (eb.role === 'citadel' || eb.role === 'spawning_pool' || eb.role === 'roach_warren' || eb.role === 'hydralisk_den' || eb.role === 'spire_hive') {
+            BUILDING_COUNTS.zergSpawners.push(eb);
+        }
+    }
+}
+
+// Development consistency check to verify maintained counters match raw array filters
+window.verifyUnitCountersConsistency = function() {
+    const rawInf = units.filter(u => u && u.hp > 0 && (u.type === 'grunt' || u.type === 'ranger' || u.type === 'medic' || u.type === 'rocketman' || u.type === 'reaper' || u.type === 'firebat' || u.type === 'marauder')).length;
+    const rawVeh = units.filter(u => u && u.hp > 0 && (u.type === 'tank' || u.type === 'siege_tank' || u.type === 'heli' || u.type === 'transport' || u.type === 'valkyrie')).length;
+    const rawSol = units.filter(u => u && u.hp > 0 && (u.type === 'zealot' || u.type === 'stalker' || u.type === 'archon')).length;
+    return {
+        valid: (rawInf === UNIT_COUNTS.infantry && rawVeh === UNIT_COUNTS.vehicles && rawSol === UNIT_COUNTS.solaris),
+        counters: { ...UNIT_COUNTS, dropshipsCount: UNIT_COUNTS.dropships.length },
+        raw: { infantry: rawInf, vehicles: rawVeh, solaris: rawSol }
+    };
+};
+
+function rebuildFrameSpatialGrids() {
+    GROUND_UNIT_GRID.clear();
+    AIR_UNIT_GRID.clear();
+    ENEMY_GRID.clear();
+    ALLY_GRID.clear();
+    _groundActorsScratch.length = 0;
+    _airActorsScratch.length = 0;
+
+    for (let i = 0; i < units.length; i++) {
+        const u = units[i];
+        if (!u || u.hp <= 0 || !u.mesh) continue;
+        const px = u.mesh.position.x;
+        const pz = u.mesh.position.z;
+        ALLY_GRID.insert(px, pz, u);
+        if (u.isAir) {
+            u._gridIdx = _airActorsScratch.length;
+            _airActorsScratch.push(u);
+            AIR_UNIT_GRID.insert(px, pz, u);
+        } else {
+            u._gridIdx = _groundActorsScratch.length;
+            _groundActorsScratch.push(u);
+            GROUND_UNIT_GRID.insert(px, pz, u);
+        }
+    }
+
+    for (let i = 0; i < enemies.length; i++) {
+        const e = enemies[i];
+        if (!e || e.hp <= 0 || !e.mesh) continue;
+        const px = e.mesh.position.x;
+        const pz = e.mesh.position.z;
+        ENEMY_GRID.insert(px, pz, e);
+        if (e.isAir) {
+            e._gridIdx = _airActorsScratch.length;
+            _airActorsScratch.push(e);
+            AIR_UNIT_GRID.insert(px, pz, e);
+        } else {
+            e._gridIdx = _groundActorsScratch.length;
+            _groundActorsScratch.push(e);
+            GROUND_UNIT_GRID.insert(px, pz, e);
+        }
+    }
+
+    // Rebuild structure collision spatial grid only when building/barrier counts or positions change
+    const bLen = buildings.length;
+    const ebLen = enemyBuildings.length;
+    const sbLen = typeof solarisBuildings !== 'undefined' ? solarisBuildings.length : 0;
+    const obLen = typeof obstacles !== 'undefined' ? obstacles.length : 0;
+    let aliveB = 0, aliveEB = 0, aliveSB = 0;
+    for (let i = 0; i < bLen; i++) if (buildings[i] && buildings[i].hp > 0) aliveB++;
+    for (let i = 0; i < ebLen; i++) if (enemyBuildings[i] && enemyBuildings[i].hp > 0) aliveEB++;
+    if (typeof solarisBuildings !== 'undefined') {
+        for (let i = 0; i < sbLen; i++) if (solarisBuildings[i] && solarisBuildings[i].hp > 0) aliveSB++;
+    }
+    const sig = `${bLen}:${aliveB}|${ebLen}:${aliveEB}|${sbLen}:${aliveSB}|${obLen}`;
+    if (sig !== _structCollisionSig) {
+        _structCollisionSig = sig;
+        STRUCT_COLLISION_GRID.clear();
+        let poolIdx = 0;
+        const pushStruct = (x, z, r, isBarrier) => {
+            let entry = _structCachePool[poolIdx++];
+            if (!entry) {
+                entry = { x: 0, z: 0, r: 0, isBarrier: false, _qStamp: 0 };
+                _structCachePool.push(entry);
+            }
+            entry.x = x;
+            entry.z = z;
+            entry.r = r;
+            entry.isBarrier = !!isBarrier;
+            STRUCT_COLLISION_GRID.insertSpan(x, z, r + 2.0, entry);
+        };
+
+        for (let i = 0; i < bLen; i++) {
+            const b = buildings[i];
+            if (!b || b.hp <= 0) continue;
+            pushStruct(
+                b.pos.x,
+                b.pos.z,
+                b.type === 'base' ? 2.15 : (b.type === 'barrier' ? 1.55 : (b.type === 'turret' ? 1.48 : 1.92)),
+                b.type === 'barrier'
+            );
+        }
+        for (let i = 0; i < ebLen; i++) {
+            const eb = enemyBuildings[i];
+            if (!eb || eb.hp <= 0) continue;
+            pushStruct(
+                eb.pos.x,
+                eb.pos.z,
+                eb.role === 'citadel' ? 2.65 : (eb.role === 'spine_turret' ? 1.38 : 2.05),
+                false
+            );
+        }
+        if (typeof solarisBuildings !== 'undefined') {
+            for (let i = 0; i < sbLen; i++) {
+                const sb = solarisBuildings[i];
+                if (!sb || sb.hp <= 0) continue;
+                pushStruct(sb.pos.x, sb.pos.z, sb.footprintRadius || 1.95, false);
+            }
+        }
+        if (typeof obstacles !== 'undefined') {
+            for (let i = 0; i < obLen; i++) {
+                const ob = obstacles[i];
+                if (!ob || !ob.pos) continue;
+                if (ob.isBarrier || ob.type === 'anti_rush_barrier' || ob.type === 'battlefield_barriers') {
+                    pushStruct(ob.pos.x, ob.pos.z, (ob.radius || 1.65) + 0.15, true);
+                }
+            }
+        }
+    }
+}
+
+function _queryGridNearInto(grid, wx, wz, radius, outArr) {
+    outArr.length = 0;
+    const minGx = Math.max(0, Math.floor((wx - radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const maxGx = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wx + radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const minGz = Math.max(0, Math.floor((wz - radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const maxGz = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((wz + radius + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const buckets = grid.buckets;
+    for (let gz = minGz; gz <= maxGz; gz++) {
+        const rowOff = gz * SPATIAL_GRID_DIM;
+        for (let gx = minGx; gx <= maxGx; gx++) {
+            const cell = buckets[rowOff + gx];
+            for (let k = 0; k < cell.length; k++) {
+                outArr.push(cell[k]);
+            }
+        }
+    }
+    return outArr;
+}
+
+window.queryGroundUnitsNearInto = function(wx, wz, radius, outArr) {
+    return _queryGridNearInto(GROUND_UNIT_GRID, wx, wz, radius, outArr);
+};
+window.queryEnemiesNearInto = function(wx, wz, radius, outArr) {
+    return _queryGridNearInto(ENEMY_GRID, wx, wz, radius, outArr);
+};
+window.queryAlliesNearInto = function(wx, wz, radius, outArr) {
+    return _queryGridNearInto(ALLY_GRID, wx, wz, radius, outArr);
+};
+
+// Staggered AI Decision Scheduler helper: determines if a unit should run full target/path scans on this frame
+function shouldRunUnitAIDecision(actor, unitIdx, distSqToCam, baseStride) {
+    // Immediate combat responsiveness: always run when retaliating, when current target died, or when stride === 1
+    if (actor.retaliateTarget && actor.retaliateTarget.hp > 0) return true;
+    if (actor._cachedTarget && actor._cachedTarget.hp <= 0) return true;
+    let stride = baseStride || 1;
+    if (distSqToCam > 7225) stride = Math.max(stride, 4);      // > 85m from camera
+    else if (distSqToCam > 2704) stride = Math.max(stride, 2); // > 52m from camera
+    if (stride <= 1) return true;
+    const frameTick = window.PERF_PROFILER ? window.PERF_PROFILER.frameCount : 0;
+    return ((frameTick + unitIdx) % stride) === 0;
+}
+
+// ============================================================================
+// 8B. MASS-WEIGHTED COLLISION SOLVER (SPATIAL HASH GRID + CACHED STRUCTURE GRID)
+// ============================================================================
+function resolveAllUnitCollisions() {
+    if (window.PERF_PROFILER) window.PERF_PROFILER.begin('collisionResolution');
+
+    if (_groundActorsScratch.length === 0 && (units.length > 0 || enemies.length > 0)) {
+        rebuildFrameSpatialGrids();
+    }
+
+    const groundActors = _groundActorsScratch;
+    const groundBuckets = GROUND_UNIT_GRID.buckets;
+    const structBuckets = STRUCT_COLLISION_GRID.buckets;
 
     for (let i = 0; i < groundActors.length; i++) {
         const a = groundActors[i];
@@ -5067,85 +5441,106 @@ function resolveAllUnitCollisions() {
         const isHeavyA = (a.type === 'tank' || a.type === 'siege_tank' || (a.type === 'valkyrie' && a.mechMode));
         const massA = isAnchoredA ? 99999 : (isHeavyA ? 85 : (a.variant === 'behemoth' || a.variant === 'gorgon' || a.variant === 'crusher' ? 25 : 1));
 
-        for (let j = i + 1; j < groundActors.length; j++) {
-            const b = groundActors[j];
-            const dx = b.mesh.position.x - ax;
-            const dz = b.mesh.position.z - az;
-            if (Math.abs(dx) > 4.6 || Math.abs(dz) > 4.6) continue;
-            const dist = Math.hypot(dx, dz);
-            const minSep = (a.radius || 0.55) + (b.radius || 0.55);
-            const isAnchoredB = !!(b.type === 'siege_tank' && b.siegeMode);
-            const isHeavyB = (b.type === 'tank' || b.type === 'siege_tank' || (b.type === 'valkyrie' && b.mechMode));
+        const cgx = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((ax + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+        const cgz = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((az + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+        const minGx = Math.max(0, cgx - 1);
+        const maxGx = Math.min(SPATIAL_GRID_DIM - 1, cgx + 1);
+        const minGz = Math.max(0, cgz - 1);
+        const maxGz = Math.min(SPATIAL_GRID_DIM - 1, cgz + 1);
 
-            // Proactive Human Ground Unit Pathway-Yielding ("Give Pathway to Tanks" across 4.2m forward corridor):
-            if ((isHeavyA !== isHeavyB) && !a.variant && !b.variant && dist < minSep + 2.65 && dist > 0.001) {
-                const tankActor = isHeavyA ? a : b;
-                const yieldActor = isHeavyA ? b : a;
-                if (!(yieldActor.type === 'siege_tank' && yieldActor.siegeMode)) {
-                    const tankYaw = tankActor.currentYaw !== undefined ? tankActor.currentYaw : (tankActor.mesh.rotation.y || 0);
-                    const tankFwdX = Math.sin(tankYaw);
-                    const tankFwdZ = Math.cos(tankYaw);
-                    const relX = yieldActor.mesh.position.x - tankActor.mesh.position.x;
-                    const relZ = yieldActor.mesh.position.z - tankActor.mesh.position.z;
-                    const forwardProj = relX * tankFwdX + relZ * tankFwdZ;
-                    const perpX = tankFwdZ;
-                    const perpZ = -tankFwdX;
-                    const sideDot = relX * perpX + relZ * perpZ;
-                    const laneHalfWidth = (tankActor.radius || 1.15) + (yieldActor.radius || 0.5) + 0.85;
-                    if (forwardProj > -0.95 && forwardProj < 4.2 && Math.abs(sideDot) < laneHalfWidth) {
-                        const sideSign = Math.abs(sideDot) > 0.04 ? Math.sign(sideDot) : (yieldActor.flankSign || 1);
-                        const urgency = Math.max(0.35, 1.0 - Math.abs(sideDot) / laneHalfWidth);
-                        const yieldStep = Math.min(0.14, 0.065 + urgency * 0.085);
-                        const yNextX = yieldActor.mesh.position.x + perpX * sideSign * yieldStep;
-                        const yNextZ = yieldActor.mesh.position.z + perpZ * sideSign * yieldStep;
-                        if (isWalkableGround(yNextX, yNextZ, (yieldActor.radius || 0.5) * 0.55)) {
-                            yieldActor.mesh.position.x = yNextX;
-                            yieldActor.mesh.position.z = yNextZ;
+        // 1. Spatial 3x3 Neighborhood Ground Unit vs Ground Unit Separation
+        for (let gz = minGz; gz <= maxGz; gz++) {
+            const rowOff = gz * SPATIAL_GRID_DIM;
+            for (let gx = minGx; gx <= maxGx; gx++) {
+                const cell = groundBuckets[rowOff + gx];
+                for (let k = 0; k < cell.length; k++) {
+                    const b = cell[k];
+                    if (b._gridIdx <= i) continue;
+
+                    const dx = b.mesh.position.x - ax;
+                    const dz = b.mesh.position.z - az;
+                    if (Math.abs(dx) > 4.6 || Math.abs(dz) > 4.6) continue;
+                    const distSq = dx * dx + dz * dz;
+                    const minSep = (a.radius || 0.55) + (b.radius || 0.55);
+                    const isAnchoredB = !!(b.type === 'siege_tank' && b.siegeMode);
+                    const isHeavyB = (b.type === 'tank' || b.type === 'siege_tank' || (b.type === 'valkyrie' && b.mechMode));
+                    const maxCheckRange = minSep + ((isHeavyA !== isHeavyB && !a.variant && !b.variant) ? 2.65 : 0.0);
+                    if (distSq >= maxCheckRange * maxCheckRange || distSq <= 0.000001) continue;
+
+                    const dist = Math.sqrt(distSq);
+
+                    // Proactive Human Ground Unit Pathway-Yielding ("Give Pathway to Tanks" across 4.2m forward corridor):
+                    if ((isHeavyA !== isHeavyB) && !a.variant && !b.variant && dist < minSep + 2.65) {
+                        const tankActor = isHeavyA ? a : b;
+                        const yieldActor = isHeavyA ? b : a;
+                        if (!(yieldActor.type === 'siege_tank' && yieldActor.siegeMode)) {
+                            const tankYaw = tankActor.currentYaw !== undefined ? tankActor.currentYaw : (tankActor.mesh.rotation.y || 0);
+                            const tankFwdX = Math.sin(tankYaw);
+                            const tankFwdZ = Math.cos(tankYaw);
+                            const relX = yieldActor.mesh.position.x - tankActor.mesh.position.x;
+                            const relZ = yieldActor.mesh.position.z - tankActor.mesh.position.z;
+                            const forwardProj = relX * tankFwdX + relZ * tankFwdZ;
+                            const perpX = tankFwdZ;
+                            const perpZ = -tankFwdX;
+                            const sideDot = relX * perpX + relZ * perpZ;
+                            const laneHalfWidth = (tankActor.radius || 1.15) + (yieldActor.radius || 0.5) + 0.85;
+                            if (forwardProj > -0.95 && forwardProj < 4.2 && Math.abs(sideDot) < laneHalfWidth) {
+                                const sideSign = Math.abs(sideDot) > 0.04 ? Math.sign(sideDot) : (yieldActor.flankSign || 1);
+                                const urgency = Math.max(0.35, 1.0 - Math.abs(sideDot) / laneHalfWidth);
+                                const yieldStep = Math.min(0.14, 0.065 + urgency * 0.085);
+                                const yNextX = yieldActor.mesh.position.x + perpX * sideSign * yieldStep;
+                                const yNextZ = yieldActor.mesh.position.z + perpZ * sideSign * yieldStep;
+                                if (isWalkableGround(yNextX, yNextZ, (yieldActor.radius || 0.5) * 0.55)) {
+                                    yieldActor.mesh.position.x = yNextX;
+                                    yieldActor.mesh.position.z = yNextZ;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            if (dist < minSep && dist > 0.0001) {
-                const bothTanks = (isHeavyA && isHeavyB);
-                const damp = bothTanks ? 0.22 : 0.42;
-                const overlap = Math.min(0.09, (minSep - dist) * damp);
-                const nx = dx / dist, nz = dz / dist;
+                    if (dist < minSep) {
+                        const bothTanks = (isHeavyA && isHeavyB);
+                        const damp = bothTanks ? 0.22 : 0.42;
+                        const overlap = Math.min(0.09, (minSep - dist) * damp);
+                        const invDist = 1.0 / dist;
+                        const nx = dx * invDist, nz = dz * invDist;
 
-                const massB = isAnchoredB ? 99999 : (isHeavyB ? 85 : (b.variant === 'behemoth' || b.variant === 'crusher' ? 25 : 1));
-                let ratioA = massB / (massA + massB);
-                let ratioB = massA / (massA + massB);
-                if (isHeavyA && !isHeavyB) { ratioA = 0; ratioB = 1.0; }
-                else if (isHeavyB && !isHeavyA) { ratioA = 1.0; ratioB = 0; }
+                        const massB = isAnchoredB ? 99999 : (isHeavyB ? 85 : (b.variant === 'behemoth' || b.variant === 'crusher' ? 25 : 1));
+                        let ratioA = massB / (massA + massB);
+                        let ratioB = massA / (massA + massB);
+                        if (isHeavyA && !isHeavyB) { ratioA = 0; ratioB = 1.0; }
+                        else if (isHeavyB && !isHeavyA) { ratioA = 1.0; ratioB = 0; }
 
-                // SIEGE TANK ANCHOR RULE: When a Siege Tank is in Siege Mode, its body is 100% anchored to the ground
-                // and NEVER moves or gets pushed by colliding tanks or units until it unsieges!
-                if (isAnchoredA && isAnchoredB) {
-                    ratioA = 0;
-                    ratioB = 0;
-                } else if (isAnchoredA) {
-                    ratioA = 0;
-                    ratioB = 1.0;
-                } else if (isAnchoredB) {
-                    ratioA = 1.0;
-                    ratioB = 0;
-                }
+                        // SIEGE TANK ANCHOR RULE: When a Siege Tank is in Siege Mode, its body is 100% anchored to the ground
+                        // and NEVER moves or gets pushed by colliding tanks or units until it unsieges!
+                        if (isAnchoredA && isAnchoredB) {
+                            ratioA = 0;
+                            ratioB = 0;
+                        } else if (isAnchoredA) {
+                            ratioA = 0;
+                            ratioB = 1.0;
+                        } else if (isAnchoredB) {
+                            ratioA = 1.0;
+                            ratioB = 0;
+                        }
 
-                if (ratioA > 0) {
-                    const aNextX = a.mesh.position.x - nx * overlap * ratioA;
-                    const aNextZ = a.mesh.position.z - nz * overlap * ratioA;
-                    if (isWalkableGround(aNextX, aNextZ, (a.radius || 0.5) * 0.6)) {
-                        a.mesh.position.x = aNextX;
-                        a.mesh.position.z = aNextZ;
-                    }
-                }
+                        if (ratioA > 0) {
+                            const aNextX = a.mesh.position.x - nx * overlap * ratioA;
+                            const aNextZ = a.mesh.position.z - nz * overlap * ratioA;
+                            if (isWalkableGround(aNextX, aNextZ, (a.radius || 0.5) * 0.6)) {
+                                a.mesh.position.x = aNextX;
+                                a.mesh.position.z = aNextZ;
+                            }
+                        }
 
-                if (ratioB > 0) {
-                    const bNextX = b.mesh.position.x + nx * overlap * ratioB;
-                    const bNextZ = b.mesh.position.z + nz * overlap * ratioB;
-                    if (isWalkableGround(bNextX, bNextZ, (b.radius || 0.5) * 0.6)) {
-                        b.mesh.position.x = bNextX;
-                        b.mesh.position.z = bNextZ;
+                        if (ratioB > 0) {
+                            const bNextX = b.mesh.position.x + nx * overlap * ratioB;
+                            const bNextZ = b.mesh.position.z + nz * overlap * ratioB;
+                            if (isWalkableGround(bNextX, bNextZ, (b.radius || 0.5) * 0.6)) {
+                                b.mesh.position.x = bNextX;
+                                b.mesh.position.z = bNextZ;
+                            }
+                        }
                     }
                 }
             }
@@ -5168,35 +5563,46 @@ function resolveAllUnitCollisions() {
             continue;
         }
 
-        // Keep ground units from clipping through barriers or getting wedged between tight buildings!
+        // 2. Spatial Structure & Barrier Clearance (queries only local cells instead of all buildings/obstacles)
         let touchCount = 0;
         let sumPushX = 0, sumPushZ = 0;
         let nearBldMidX = 0, nearBldMidZ = 0;
+        const stamp = ++_queryStampCounter;
 
-        for (let s = 0; s < allStructs.length; s++) {
-            const st = allStructs[s];
-            const dx = a.mesh.position.x - st.x;
-            const dz = a.mesh.position.z - st.z;
-            if (Math.abs(dx) > 4.5 || Math.abs(dz) > 4.5) continue;
-            const dist = Math.hypot(dx, dz);
-            const minSep = (a.radius || 0.55) + st.r;
+        for (let gz = minGz; gz <= maxGz; gz++) {
+            const rowOff = gz * SPATIAL_GRID_DIM;
+            for (let gx = minGx; gx <= maxGx; gx++) {
+                const sCell = structBuckets[rowOff + gx];
+                for (let s = 0; s < sCell.length; s++) {
+                    const st = sCell[s];
+                    if (st._qStamp === stamp) continue;
+                    st._qStamp = stamp;
 
-            if (dist < minSep + 0.25 && dist > 0.0001) {
-                touchCount++;
-                nearBldMidX += st.x;
-                nearBldMidZ += st.z;
-            }
+                    const dx = a.mesh.position.x - st.x;
+                    const dz = a.mesh.position.z - st.z;
+                    if (Math.abs(dx) > 4.5 || Math.abs(dz) > 4.5) continue;
+                    const distSq = dx * dx + dz * dz;
+                    const minSep = (a.radius || 0.55) + st.r;
+                    const touchLim = minSep + 0.25;
+                    if (distSq >= touchLim * touchLim || distSq <= 0.000001) continue;
 
-            if (dist < minSep && dist > 0.0001) {
-                const push = st.isBarrier
-                    ? Math.min(0.16, (minSep - dist) * 0.85 + 0.025)
-                    : Math.min(0.08, (minSep - dist) * 0.55 + 0.015);
-                const rnx = dx / dist, rnz = dz / dist;
-                const slideSign = a.wallFollowSign || a.flankSign || 1;
-                const tx = -rnz * slideSign * 0.05;
-                const tz = rnx * slideSign * 0.05;
-                sumPushX += rnx * push + tx;
-                sumPushZ += rnz * push + tz;
+                    const dist = Math.sqrt(distSq);
+                    touchCount++;
+                    nearBldMidX += st.x;
+                    nearBldMidZ += st.z;
+
+                    if (dist < minSep) {
+                        const push = st.isBarrier
+                            ? Math.min(0.16, (minSep - dist) * 0.85 + 0.025)
+                            : Math.min(0.08, (minSep - dist) * 0.55 + 0.015);
+                        const rnx = dx / dist, rnz = dz / dist;
+                        const slideSign = a.wallFollowSign || a.flankSign || 1;
+                        const tx = -rnz * slideSign * 0.05;
+                        const tz = rnx * slideSign * 0.05;
+                        sumPushX += rnx * push + tx;
+                        sumPushZ += rnz * push + tz;
+                    }
+                }
             }
         }
 
@@ -5283,50 +5689,88 @@ function resolveAllUnitCollisions() {
         }
     }
 
-    // Aerial separation for Friendly Air Units & Enemy Flying Units (with wide anti-cuddle spacing for Dropships!)
-    const airActors = [...units.filter(u => u.isAir), ...enemies.filter(e => e.isAir)];
+    if (window.PERF_PROFILER) {
+        window.PERF_PROFILER.end('collisionResolution');
+        window.PERF_PROFILER.begin('airSeparation');
+    }
+
+    // 3. Spatial Grid Aerial Separation for Friendly Air Units & Enemy Flying Units (with wide 5.2m spacing for Dropships)
+    const airActors = _airActorsScratch;
+    const airBuckets = AIR_UNIT_GRID.buckets;
     for (let i = 0; i < airActors.length; i++) {
-        for (let j = i + 1; j < airActors.length; j++) {
-            const a = airActors[i], b = airActors[j];
-            const dx = b.mesh.position.x - a.mesh.position.x;
-            const dz = b.mesh.position.z - a.mesh.position.z;
-            const dist = Math.hypot(dx, dz);
-            const isDropshipPair = (a.type === 'transport' || b.type === 'transport');
-            const minSep = isDropshipPair ? 5.2 : 2.55;
-            if (dist < minSep && dist > 0.001) {
-                const overlap = (minSep - dist) * 0.5;
-                a.mesh.position.x -= (dx / dist) * overlap;
-                a.mesh.position.z -= (dz / dist) * overlap;
-                b.mesh.position.x += (dx / dist) * overlap;
-                b.mesh.position.z += (dz / dist) * overlap;
+        const a = airActors[i];
+        const ax = a.mesh.position.x, az = a.mesh.position.z;
+        const cgx = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((ax + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+        const cgz = Math.max(0, Math.min(SPATIAL_GRID_DIM - 1, Math.floor((az + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL)));
+        const minGx = Math.max(0, cgx - 1);
+        const maxGx = Math.min(SPATIAL_GRID_DIM - 1, cgx + 1);
+        const minGz = Math.max(0, cgz - 1);
+        const maxGz = Math.min(SPATIAL_GRID_DIM - 1, cgz + 1);
+
+        for (let gz = minGz; gz <= maxGz; gz++) {
+            const rowOff = gz * SPATIAL_GRID_DIM;
+            for (let gx = minGx; gx <= maxGx; gx++) {
+                const cell = airBuckets[rowOff + gx];
+                for (let k = 0; k < cell.length; k++) {
+                    const b = cell[k];
+                    if (b._gridIdx <= i) continue;
+                    const dx = b.mesh.position.x - ax;
+                    const dz = b.mesh.position.z - az;
+                    const isDropshipPair = (a.type === 'transport' || b.type === 'transport');
+                    const minSep = isDropshipPair ? 5.2 : 2.55;
+                    const distSq = dx * dx + dz * dz;
+                    if (distSq < minSep * minSep && distSq > 0.000001) {
+                        const dist = Math.sqrt(distSq);
+                        const overlap = (minSep - dist) * 0.5 / dist;
+                        a.mesh.position.x -= dx * overlap;
+                        a.mesh.position.z -= dz * overlap;
+                        b.mesh.position.x += dx * overlap;
+                        b.mesh.position.z += dz * overlap;
+                    }
+                }
             }
         }
     }
 
-    // Physical Turret Shield Dome Barrier: NO enemy unit (ground or air) can enter the 9.5m shield radius while the shield is active!
-    const activeShieldTurrets = buildings.filter(
-        b => b && b.type === 'turret' && b.hp > 0 && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)
-    );
+    if (window.PERF_PROFILER) window.PERF_PROFILER.end('airSeparation');
+
+    // 4. Physical Turret Shield Dome Barrier using cached activeShieldTurrets + spatial enemy lookup
+    const activeShieldTurrets = BUILDING_COUNTS.activeShieldTurrets;
     if (activeShieldTurrets.length > 0) {
-        for (let ei = 0; ei < enemies.length; ei++) {
-            const e = enemies[ei];
-            if (!e || e.hp <= 0 || !e.mesh) continue;
-            for (let si = 0; si < activeShieldTurrets.length; si++) {
-                const st = activeShieldTurrets[si];
-                const dx = e.mesh.position.x - st.pos.x;
-                const dz = e.mesh.position.z - st.pos.z;
-                const dist = Math.hypot(dx, dz);
-                const minShieldDist = 9.5 + (e.radius || 0.55);
-                if (dist < minShieldDist) {
-                    const nx = dist > 0.001 ? dx / dist : 0;
-                    const nz = dist > 0.001 ? dz / dist : 1;
-                    e.mesh.position.x = st.pos.x + nx * minShieldDist;
-                    e.mesh.position.z = st.pos.z + nz * minShieldDist;
-                    if (!e.isAir) {
-                        const gy = typeof getSurfaceHeightWithBridges === 'function'
-                            ? getSurfaceHeightWithBridges(e.mesh.position.x, e.mesh.position.z)
-                            : getTerrainHeight(e.mesh.position.x, e.mesh.position.z);
-                        e.mesh.position.y = gy;
+        const enemyBuckets = ENEMY_GRID.buckets;
+        for (let si = 0; si < activeShieldTurrets.length; si++) {
+            const st = activeShieldTurrets[si];
+            const sx = st.pos.x, sz = st.pos.z;
+            const searchR = 11.2;
+            const minGx = Math.max(0, Math.floor((sx - searchR + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const maxGx = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((sx + searchR + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const minGz = Math.max(0, Math.floor((sz - searchR + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+            const maxGz = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((sz + searchR + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+
+            for (let gz = minGz; gz <= maxGz; gz++) {
+                const rowOff = gz * SPATIAL_GRID_DIM;
+                for (let gx = minGx; gx <= maxGx; gx++) {
+                    const cell = enemyBuckets[rowOff + gx];
+                    for (let k = 0; k < cell.length; k++) {
+                        const e = cell[k];
+                        if (!e || e.hp <= 0 || !e.mesh) continue;
+                        const dx = e.mesh.position.x - sx;
+                        const dz = e.mesh.position.z - sz;
+                        const minShieldDist = 9.5 + (e.radius || 0.55);
+                        const distSq = dx * dx + dz * dz;
+                        if (distSq < minShieldDist * minShieldDist) {
+                            const dist = Math.sqrt(distSq);
+                            const nx = dist > 0.001 ? dx / dist : 0;
+                            const nz = dist > 0.001 ? dz / dist : 1;
+                            e.mesh.position.x = sx + nx * minShieldDist;
+                            e.mesh.position.z = sz + nz * minShieldDist;
+                            if (!e.isAir) {
+                                const gy = typeof getSurfaceHeightWithBridges === 'function'
+                                    ? getSurfaceHeightWithBridges(e.mesh.position.x, e.mesh.position.z)
+                                    : getTerrainHeight(e.mesh.position.x, e.mesh.position.z);
+                                e.mesh.position.y = gy;
+                            }
+                        }
                     }
                 }
             }
@@ -5341,11 +5785,13 @@ function applyDamageWithTurretShield(victim, dmg, hitWorldPos = null) {
     if (!victim || dmg <= 0) return;
     const vPos = victim.mesh ? victim.mesh.position : victim.pos;
     if (vPos) {
-        for (let i = 0; i < buildings.length; i++) {
-            const b = buildings[i];
-            if (b.type === 'turret' && b.hp > 0 && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)) {
-                const d = Math.hypot(vPos.x - b.pos.x, vPos.z - b.pos.z);
-                if (d <= 9.65 || victim === b) {
+        const shieldTurrets = BUILDING_COUNTS.activeShieldTurrets;
+        for (let i = 0; i < shieldTurrets.length; i++) {
+            const b = shieldTurrets[i];
+            if (b.hp > 0 && b.maxShieldHp > 0 && b.shieldHp > 15 && !(b.shieldBrokenTimer > 0)) {
+                const dx = vPos.x - b.pos.x;
+                const dz = vPos.z - b.pos.z;
+                if (dx * dx + dz * dz <= 93.1225 || victim === b) { // 9.65^2
                     // Active Shield Barrier absorbs 100% of incoming damage until the barrier is destroyed!
                     const absorbed = Math.min(b.shieldHp, dmg);
                     b.shieldHp -= absorbed;
@@ -5395,61 +5841,292 @@ function applyDamageWithTurretShield(victim, dmg, hitWorldPos = null) {
     victim.hp -= dmg;
 }
 
-function selectSmartTarget(originPos, maxRange, canHitAir = true, preferHeavy = false, preferSwarm = false) {
+function hasClearFiringLane(shooter, targetPos) {
+    if (!shooter || !shooter.mesh || !targetPos || shooter.isAir) return true;
+    const sx = shooter.mesh.position.x;
+    const sz = shooter.mesh.position.z;
+    const dx = targetPos.x - sx;
+    const dz = targetPos.z - sz;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 2.2) return true;
+    const invD = 1.0 / dist;
+    const ux = dx * invD;
+    const uz = dz * invD;
+
+    // Check friendly tanks / buildings blocking immediate line of fire within 4.2m ahead of shooter
+    const checkLen = Math.min(dist - 0.8, 4.2);
+    for (let i = 0; i < units.length; i++) {
+        const ally = units[i];
+        if (!ally || ally === shooter || ally.hp <= 0 || ally.isAir || !ally.mesh) continue;
+        const ax = ally.mesh.position.x - sx;
+        const az = ally.mesh.position.z - sz;
+        const proj = ax * ux + az * uz;
+        if (proj <= 0.25 || proj >= checkLen) continue;
+        const perp = Math.abs(ax * (-uz) + az * ux);
+        const blockRad = (ally.isVehicle || ally.type === 'tank' || ally.type === 'siege_tank') ? 0.92 : 0.42;
+        if (perp < blockRad) return false;
+    }
+    for (let i = 0; i < buildings.length; i++) {
+        const b = buildings[i];
+        if (!b || b.hp <= 0 || !b.pos) continue;
+        const bx = b.pos.x - sx;
+        const bz = b.pos.z - sz;
+        const proj = bx * ux + bz * uz;
+        if (proj <= 0.3 || proj >= dist - 0.8) continue;
+        const perp = Math.abs(bx * (-uz) + bz * ux);
+        if (perp < (b.radius || 2.1) * 0.78) return false;
+    }
+    return true;
+}
+
+const _firingSlotScratch = new THREE.Vector3();
+function findOpenFiringSlot(shooter, targetPos) {
+    if (!shooter || !shooter.mesh || !targetPos) return targetPos;
+    const sx = shooter.mesh.position.x;
+    const sz = shooter.mesh.position.z;
+    const dx = targetPos.x - sx;
+    const dz = targetPos.z - sz;
+    const dist = Math.hypot(dx, dz) || 1;
+    const ux = dx / dist;
+    const uz = dz / dist;
+    const px = -uz;
+    const pz = ux;
+
+    const signPref = shooter.flankSign || ((units.indexOf(shooter) % 2 === 0) ? 1 : -1);
+    const offsets = [1.85 * signPref, -1.85 * signPref, 3.2 * signPref, -3.2 * signPref];
+    for (let i = 0; i < offsets.length; i++) {
+        const lat = offsets[i];
+        const candX = sx + px * lat + ux * 0.75;
+        const candZ = sz + pz * lat + uz * 0.75;
+        if (typeof isWalkableGround === 'function' && !isWalkableGround(candX, candZ, 0.48)) continue;
+        let crowded = false;
+        for (let j = 0; j < units.length; j++) {
+            const ally = units[j];
+            if (!ally || ally === shooter || ally.hp <= 0 || ally.isAir || !ally.mesh) continue;
+            const dSq = (ally.mesh.position.x - candX) * (ally.mesh.position.x - candX) + (ally.mesh.position.z - candZ) * (ally.mesh.position.z - candZ);
+            if (dSq < 1.15) { crowded = true; break; }
+        }
+        if (!crowded) {
+            return _firingSlotScratch.set(candX, getTerrainHeight(candX, candZ), candZ);
+        }
+    }
+    return _firingSlotScratch.set(sx + px * 1.9 * signPref, getTerrainHeight(sx + px * 1.9 * signPref, sz + pz * 1.9 * signPref), sz + pz * 1.9 * signPref);
+}
+
+function selectSmartTarget(originPos, maxRange, canHitAir = true, preferHeavy = false, preferSwarm = false, shooter = null) {
+    const t0 = window.PERF_PROFILER ? performance.now() : 0;
     let bestTarget = null;
     let bestScore = -Infinity;
 
-    enemies.forEach(e => {
-        if (e.hp <= 0) return;
-        if (e.isAir && !canHitAir) return;
-        const d = Math.hypot(e.mesh.position.x - originPos.x, e.mesh.position.z - originPos.z);
-        if (d > maxRange) return;
+    const ox = originPos.x;
+    const oz = originPos.z;
+    const maxRangeSq = maxRange * maxRange;
+    const shooterType = shooter ? (shooter.type || shooter.variant || '') : '';
+    const shooterDmg = shooter ? (shooter.damage || 18) : 18;
+    const shooterRange = shooter ? (shooter.range || maxRange) : maxRange;
 
-        // Base proximity score (closer enemies are higher priority)
-        let score = (maxRange - d) * 3.5;
+    // Query ENEMY_GRID within [ox - maxRange .. ox + maxRange, oz - maxRange .. oz + maxRange]
+    const minGx = Math.max(0, Math.floor((ox - maxRange + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const maxGx = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((ox + maxRange + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const minGz = Math.max(0, Math.floor((oz - maxRange + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const maxGz = Math.min(SPATIAL_GRID_DIM - 1, Math.floor((oz + maxRange + SPATIAL_GRID_HALF) / SPATIAL_GRID_CELL));
+    const enemyBuckets = ENEMY_GRID.buckets;
 
-        // Finish-off bonus: prioritize wounded targets so squads focus fire and eliminate threats quickly
-        const hpRatio = Math.max(0.05, e.hp / e.maxHp);
-        score += (1.0 - hpRatio) * 42.0;
+    for (let gz = minGz; gz <= maxGz; gz++) {
+        const rowOff = gz * SPATIAL_GRID_DIM;
+        for (let gx = minGx; gx <= maxGx; gx++) {
+            const cell = enemyBuckets[rowOff + gx];
+            for (let k = 0; k < cell.length; k++) {
+                const e = cell[k];
+                if (!e || e.hp <= 0) continue;
+                if (e.isAir && !canHitAir) continue;
+                const dx = e.mesh.position.x - ox;
+                const dz = e.mesh.position.z - oz;
+                const dSq = dx * dx + dz * dz;
+                if (dSq > maxRangeSq) continue;
+                const d = Math.sqrt(dSq);
 
-        // Threat-type tactical weighting
-        if (e.variant === 'burster' && d < 9.5) score += 95.0; // Immediate volatile baneling danger!
-        if (e.variant === 'behemoth') score += preferHeavy ? 75.0 : 28.0;
-        if (e.variant === 'gorgon')   score += preferHeavy ? 68.0 : 26.0;
-        if (e.variant === 'crusher')  score += preferHeavy ? 55.0 : 20.0;
-        if (e.variant === 'mutalisk') score += canHitAir ? 32.0 : 0;
-        if (e.variant === 'spitter')  score += 22.0;
-        if (preferSwarm && (e.variant === 'skitterer' || e.variant === 'burster')) score += 35.0;
+                // 1. Proximity & immediate firing readiness bonus
+                let score = (maxRange - d) * 3.6 + (d <= shooterRange ? 26.0 : 0);
 
-        if (score > bestScore) {
-            bestScore = score;
-            bestTarget = e;
-        }
-    });
+                // 2. Finish-off & Focus-Fire coordination bonus
+                const hpRatio = Math.max(0.05, e.hp / e.maxHp);
+                score += (1.0 - hpRatio) * 46.0;
 
-    if (!bestTarget && enemyBuildings.length > 0) {
-        let minBldDist = Infinity;
-        enemyBuildings.forEach(eb => {
-            if (eb.hp <= 0) return;
-            const d = Math.hypot(eb.pos.x - originPos.x, eb.pos.z - originPos.z);
-            if (d <= maxRange + 3.5 && d < minBldDist) {
-                minBldDist = d;
-                bestTarget = eb;
+                // 3. Overkill avoidance: penalize piling too many high-damage attackers onto a nearly dead swarm unit
+                const assigned = e._assignedAttackers || 0;
+                if (assigned > 0 && e.hp > shooterDmg * assigned * 0.85) {
+                    score += Math.min(18.0, assigned * 6.0); // Focus fire on healthy high-value targets
+                } else if (assigned >= 2 && e.hp <= shooterDmg * 1.4) {
+                    score -= assigned * 22.0; // Avoid overkill on dying light targets
+                }
+
+                // 4. Role counter & threat-type tactical weighting
+                const v = e.variant;
+                if (v === 'burster' && d < 10.5) score += 105.0; // Immediate volatile baneling danger!
+                else if (v === 'behemoth') score += preferHeavy ? 82.0 : 30.0;
+                else if (v === 'gorgon')   score += preferHeavy ? 74.0 : 28.0;
+                else if (v === 'crusher')  score += (preferHeavy || shooterType === 'marauder' || shooterType === 'stalker') ? 64.0 : 22.0;
+                else if (v === 'mutalisk') score += canHitAir ? ((shooterType === 'sniper' || shooterType === 'rocketman' || shooterType === 'valkyrie') ? 56.0 : 34.0) : 0;
+                else if (v === 'spitter')  score += (shooterType === 'sniper' || shooterType === 'reaper') ? 38.0 : 24.0;
+                if ((preferSwarm || shooterType === 'firebat' || shooterType === 'archon') && (v === 'skitterer' || v === 'burster')) {
+                    score += 42.0;
+                }
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTarget = e;
+                }
             }
-        });
+        }
     }
 
+    if (bestTarget) {
+        bestTarget._assignedAttackers = (bestTarget._assignedAttackers || 0) + 1;
+    } else if (enemyBuildings.length > 0) {
+        const bldLim = maxRange + 3.5;
+        let minBldDistSq = bldLim * bldLim;
+        for (let i = 0; i < enemyBuildings.length; i++) {
+            const eb = enemyBuildings[i];
+            if (!eb || eb.hp <= 0) continue;
+            const dx = eb.pos.x - ox;
+            const dz = eb.pos.z - oz;
+            const dSq = dx * dx + dz * dz;
+            if (dSq <= minBldDistSq) {
+                minBldDistSq = dSq;
+                bestTarget = eb;
+            }
+        }
+    }
+
+    if (window.PERF_PROFILER) {
+        window.PERF_PROFILER.addSample('targetAcquisition', performance.now() - t0);
+    }
     return bestTarget;
 }
+
+// ============================================================================
+// STRATEGIC COMMANDER, FACTION PERSONALITIES, SQUAD FORMATIONS & AI DEBUG (F8)
+// ============================================================================
+window.STRATEGIC_COMMANDER = {
+    currentStrategy: 'rush',
+    strategyTimer: 0,
+    minStrategyDuration: 18.0,
+    factionPersonality: 'zerg_swarm', // 'terran_tactical', 'solaris_precision', 'zerg_swarm'
+    primaryBridgeIdx: 0,
+    secondaryBridgeIdx: 1,
+    scores: {},
+    update(dt) {
+        this.strategyTimer += dt;
+        // Reset per-frame focus-fire attacker counters on enemies
+        for (let i = 0; i < enemies.length; i++) {
+            if (enemies[i]) enemies[i]._assignedAttackers = 0;
+        }
+        if (this.strategyTimer < this.minStrategyDuration) return;
+        this.strategyTimer = 0;
+
+        const alliedStrength = units.length + buildings.length * 1.5;
+        const enemyStrength = enemies.length + enemyBuildings.length * 1.8;
+        const ratio = enemyStrength / Math.max(1, alliedStrength);
+        const elapsed = state.elapsedSec || 0;
+        const numBridges = (typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length) ? RIVER_BRIDGES.length : 2;
+
+        // Utility evaluation across StarCraft-style strategic states
+        this.scores = {
+            rush: (elapsed < 110 ? 75 : 30) + (enemies.length >= 6 ? 25 : 0),
+            flank: (units.length >= 6 ? 68 : 35) + (numBridges > 1 ? 20 : 0),
+            pincer: (enemies.length >= 10 && numBridges > 1) ? 84 : 30,
+            siege_pressure: (ratio >= 0.9 && elapsed > 90) ? 72 : 28,
+            containment: (ratio >= 1.25 && units.length >= 4) ? 76 : 25,
+            harassment: (enemies.length >= 4 && elapsed > 45) ? 64 : 25,
+            counterattack: (state.kills > 8 && enemies.length >= 6) ? 78 : 20,
+            turtle: (enemyBuildings.length <= 2 && ratio < 0.7) ? 70 : 15
+        };
+
+        let bestStrat = this.currentStrategy;
+        let bestVal = (this.scores[bestStrat] || 0) + 10; // Hysteresis bonus to prevent rapid flipping
+        for (const k in this.scores) {
+            if (this.scores[k] > bestVal) {
+                bestVal = this.scores[k];
+                bestStrat = k;
+            }
+        }
+        this.currentStrategy = bestStrat;
+        if (numBridges > 1) {
+            this.primaryBridgeIdx = (this.primaryBridgeIdx + 1) % numBridges;
+            this.secondaryBridgeIdx = (this.primaryBridgeIdx + 1) % numBridges;
+        }
+    }
+};
+
+window.SQUAD_MANAGER = {
+    formation: 'concave', // 'line', 'wedge', 'column', 'defensive', 'flanking', 'concave'
+    getFormationOffset(actor, index, total, destPos) {
+        const isCrossingBridge = actor && actor._bridgeCrossingState && actor._bridgeCrossingState !== 'completed';
+        const activeForm = isCrossingBridge ? 'column' : this.formation;
+        const isFrontline = actor && (actor.type === 'grunt' || actor.type === 'firebat' || actor.type === 'marauder' || actor.type === 'zealot' || actor.type === 'tank');
+        const isSupport = actor && (actor.type === 'medic' || actor.type === 'siege_tank' || actor.type === 'sniper');
+
+        if (activeForm === 'column') {
+            const col = (index % 2) === 0 ? -0.75 : 0.75;
+            const row = -Math.floor(index / 2) * 1.45;
+            return { right: col, forward: row, mode: 'column' };
+        }
+        const rankDepth = isFrontline ? 1.4 : (isSupport ? -2.2 : -0.4);
+        const lateral = ((index % 7) - 3) * 1.65;
+        const arcDrop = -Math.abs((index % 7) - 3) * 0.35;
+        return { right: lateral, forward: rankDepth + arcDrop, mode: activeForm };
+    }
+};
+
+window.AI_DEBUG = {
+    enabled: false,
+    group: null,
+    hudEl: null,
+    toggle() {
+        this.enabled = !this.enabled;
+        if (!this.enabled && this.group) {
+            this.group.visible = false;
+        }
+        if (this.hudEl) {
+            this.hudEl.style.display = this.enabled ? 'block' : 'none';
+        }
+    },
+    update(dt) {
+        if (!this.enabled || typeof THREE === 'undefined' || !scene) return;
+        if (!this.group) {
+            this.group = new THREE.Group();
+            this.group.name = 'AIDebugOverlayGroup';
+            scene.add(this.group);
+        }
+        this.group.visible = true;
+        if (!this.hudEl) {
+            this.hudEl = document.createElement('div');
+            this.hudEl.style.cssText = 'position:fixed;top:64px;left:14px;z-index:9999;background:rgba(6,12,22,0.86);border:1px solid #00f0ff;color:#aef;font:11px monospace;padding:8px 10px;border-radius:6px;pointer-events:none;max-width:310px;';
+            document.body.appendChild(this.hudEl);
+        }
+        const brStates = (window.BRIDGE_TRAFFIC_MANAGER && window.BRIDGE_TRAFFIC_MANAGER.bridges)
+            ? window.BRIDGE_TRAFFIC_MANAGER.bridges.map(b => `B${b.id}:${b.direction}(occ:${b.occupants.size},qS:${b.queueSouth.length},qN:${b.queueNorth.length})`).join(' | ')
+            : 'N/A';
+        const strat = window.STRATEGIC_COMMANDER ? window.STRATEGIC_COMMANDER.currentStrategy : 'auto';
+        let stuckCount = 0;
+        for (let i = 0; i < units.length; i++) if ((units[i].stuckTimer || 0) > 0.25) stuckCount++;
+        for (let i = 0; i < enemies.length; i++) if ((enemies[i].stuckTimer || 0) > 0.25) stuckCount++;
+        this.hudEl.innerHTML = `<b>[F8] RTS AI DEBUG</b><br>Commander: <b>${strat.toUpperCase()}</b><br>Bridges: ${brStates}<br>Units: ${units.length} | Enemies: ${enemies.length} | Unsticking: ${stuckCount}`;
+    }
+};
+
+window.addEventListener('keydown', (ev) => {
+    if (ev.key === 'F8') {
+        ev.preventDefault();
+        if (window.AI_DEBUG) window.AI_DEBUG.toggle();
+    }
+});
 
 const MAX_MIND_CONTROL_UNITS = 3;
 
 function getActiveMindControlledCount() {
-    let count = 0;
-    for (let i = 0; i < units.length; i++) {
-        if (units[i] && units[i].isMindControlled && units[i].hp > 0) count++;
-    }
-    return count;
+    return UNIT_COUNTS.mindControlled;
 }
 
 function convertEnemyWithMindControl(enemyObj, emitterWorldPos) {
@@ -5522,7 +6199,8 @@ function convertEnemyWithMindControl(enemyObj, emitterWorldPos) {
         lastHitImpulse: null,
         lastHitHeavy: false
     });
-    const newCount = getActiveMindControlledCount();
+    UNIT_COUNTS.mindControlled++;
+    const newCount = UNIT_COUNTS.mindControlled;
     spawnCombatFloat(enemyObj.mesh.position, `MIND CONTROLLED! (${newCount}/${MAX_MIND_CONTROL_UNITS})`, '#d946ef');
     if (state.selectedBuilding && state.selectedBuilding.type === 'turret') {
         renderSC2CommandCard();
@@ -5531,36 +6209,41 @@ function convertEnemyWithMindControl(enemyObj, emitterWorldPos) {
     return true;
 }
 
-// Smooth Anti-Stuck Steering & Self-Calibrating "Stuck Babyspot" Spatial Memory for Ground Units
+// Intelligent 9-Step Stuck Detection & Progressive Recovery State Machine for Ground Units
 function checkAndUnstickGroundUnit(actor, targetPos, dt) {
     if (actor.isAir || !targetPos) return;
+    if (actor.type === 'siege_tank' && actor.siegeMode) return;
     if (!actor.lastProgressPos) {
         actor.lastProgressPos = actor.mesh.position.clone();
         actor.anchorCheckPos = actor.mesh.position.clone();
         actor.anchorCheckTimer = 0;
         actor.stuckTimer = 0;
+        actor.recoveryStage = 0;
+        actor.recoveryCooldown = 0;
         return;
     }
 
-    // Net-displacement anti-circling detector: if a unit runs in a small loop for 1.8s without advancing > 2.6m, break the loop immediately!
+    if (actor.recoveryCooldown > 0) {
+        actor.recoveryCooldown = Math.max(0, actor.recoveryCooldown - dt);
+    }
+
+    // Net-displacement anti-circling detector: if a unit runs in a small loop for 1.6s without advancing > 2.4m, escalate recovery!
     if (!actor.anchorCheckPos) actor.anchorCheckPos = actor.mesh.position.clone();
     actor.anchorCheckTimer = (actor.anchorCheckTimer || 0) + dt;
     let isOrbitingInPlace = false;
-    if (actor.anchorCheckTimer >= 1.8) {
-        const netDisp = Math.hypot(
-            actor.mesh.position.x - actor.anchorCheckPos.x,
-            actor.mesh.position.z - actor.anchorCheckPos.z
-        );
-        const distToGoal = Math.hypot(
-            targetPos.x - actor.mesh.position.x,
-            targetPos.z - actor.mesh.position.z
-        );
+    if (actor.anchorCheckTimer >= 1.6) {
+        const adx = actor.mesh.position.x - actor.anchorCheckPos.x;
+        const adz = actor.mesh.position.z - actor.anchorCheckPos.z;
+        const netDispSq = adx * adx + adz * adz;
+        const gdx = targetPos.x - actor.mesh.position.x;
+        const gdz = targetPos.z - actor.mesh.position.z;
+        const distToGoalSq = gdx * gdx + gdz * gdz;
         actor.anchorCheckPos.copy(actor.mesh.position);
         actor.anchorCheckTimer = 0;
-        if (netDisp < 2.6 && distToGoal > 3.5) {
+        if (netDispSq < 5.76 && distToGoalSq > 10.0) { // 2.4^2 and 3.16^2
             isOrbitingInPlace = true;
             if (actor.patrolTarget && !state.enemyBaseDiscovered && enemyBuildings.length > 0) {
-                actor.patrolTarget = new THREE.Vector3(
+                actor.patrolTarget.set(
                     ENEMY_BASE_POS.x,
                     getTerrainHeight(ENEMY_BASE_POS.x, ENEMY_BASE_POS.z),
                     ENEMY_BASE_POS.z
@@ -5569,57 +6252,86 @@ function checkAndUnstickGroundUnit(actor, targetPos, dt) {
         }
     }
 
-    const movedDist = Math.hypot(
-        actor.mesh.position.x - actor.lastProgressPos.x,
-        actor.mesh.position.z - actor.lastProgressPos.z
-    );
-    if (movedDist > 0.16 && !isOrbitingInPlace) {
+    const mdx = actor.mesh.position.x - actor.lastProgressPos.x;
+    const mdz = actor.mesh.position.z - actor.lastProgressPos.z;
+    const movedDistSq = mdx * mdx + mdz * mdz;
+    if (movedDistSq > 0.0256 && !isOrbitingInPlace) { // 0.16^2
         actor.lastProgressPos.copy(actor.mesh.position);
         actor.stuckTimer = 0;
+        if (actor.recoveryCooldown <= 0) actor.recoveryStage = 0;
     } else {
-        actor.stuckTimer = isOrbitingInPlace ? 0.50 : ((actor.stuckTimer || 0) + dt);
-        if (actor.stuckTimer > 0.42) {
-            actor.stuckTimer = 0.18; // Keep gentle steering active without hard snapping
-            actor.wallFollowSign = -(actor.wallFollowSign || actor.flankSign || 1);
-            actor.wallFollowTimer = 1.65;
+        actor.stuckTimer = isOrbitingInPlace ? 0.48 : ((actor.stuckTimer || 0) + dt);
+        if (actor.stuckTimer > 0.40) {
+            actor.stuckTimer = 0.16;
+            actor.recoveryStage = Math.min(9, (actor.recoveryStage || 0) + 1);
+            actor.recoveryCooldown = 3.2;
 
             const ax = actor.mesh.position.x;
             const az = actor.mesh.position.z;
+            const surfH = typeof getSurfaceHeightWithBridges === 'function' ? getSurfaceHeightWithBridges : getTerrainHeight;
+            const stepLen = Math.min(0.20, (actor.speed || 3.5) * dt * 1.35);
 
-            // Record this stuck babyspot into the global navigation heatmap so A* and bridge selection learn to avoid it!
+            // Step 1-2: Local obstacle avoidance & lateral sidestep around blocking neighbor
+            actor.wallFollowSign = -(actor.wallFollowSign || actor.flankSign || 1);
+            actor.wallFollowTimer = 1.65;
+
+            // Step 3: Clear blocked local waypoint & record hotspot
             if (typeof window.recordNavStuckHotspot === 'function') {
                 window.recordNavStuckHotspot(ax, az, 2.8, 1.85);
             }
-            // Clear cached A* waypoints so the unit immediately recomputes a detour around the calibrated babyspot
-            actor.navWaypoints = null;
+            if (actor.navWaypoints && actor.navWaypoints.length > 1) {
+                actor.navWaypoints.shift();
+            } else {
+                actor.navWaypoints = null;
+            }
 
-            // If this is an Enemy Zerg AI unit, recalibrate its flanking corridor & preferred bridge to make a smarter flank!
+            // Step 4-5: Request alternative bridge or repath with congestion penalty
+            if (actor.recoveryStage >= 3) {
+                actor.navWaypoints = null;
+                actor.navRepathTimer = 0;
+                if (window.BRIDGE_TRAFFIC_MANAGER) {
+                    window.BRIDGE_TRAFFIC_MANAGER.releaseActor(actor);
+                }
+                if (typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 1) {
+                    actor.preferredBridgeIdx = ((actor.preferredBridgeIdx || 0) + 1) % RIVER_BRIDGES.length;
+                }
+            }
+
+            // Step 6: Yield to higher-priority heavy unit (tank / siege_tank / crusher / behemoth)
+            const isLightInfantry = !actor.isVehicle && actor.type !== 'tank' && actor.type !== 'siege_tank' && actor.variant !== 'behemoth' && actor.variant !== 'crusher';
+            if (isLightInfantry && actor.recoveryStage >= 2) {
+                for (let ui = 0; ui < units.length; ui++) {
+                    const uOther = units[ui];
+                    if (!uOther || uOther === actor || !uOther.isVehicle || !uOther.mesh) continue;
+                    const odx = ax - uOther.mesh.position.x;
+                    const odz = az - uOther.mesh.position.z;
+                    const odSq = odx * odx + odz * odz;
+                    if (odSq > 0.01 && odSq < 5.2) {
+                        const invO = 1.0 / Math.sqrt(odSq);
+                        const yx = ax + odx * invO * stepLen * 1.4;
+                        const yz = az + odz * invO * stepLen * 1.4;
+                        if (isWalkableGround(yx, yz, 0.35)) {
+                            actor.mesh.position.x = yx;
+                            actor.mesh.position.z = yz;
+                            actor.mesh.position.y = THREE.MathUtils.lerp(actor.mesh.position.y, surfH(yx, yz), 0.5);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Step 7-9: Switch to column mode, recalibrate enemy flanker, or reset unreachable patrol target
             if (actor.variant) {
                 actor.isFlanker = true;
                 actor.flankRecalibrateCount = (actor.flankRecalibrateCount || 0) + 1;
                 actor.flankSign = (actor.flankRecalibrateCount % 2 === 0) ? 1 : -1;
                 const tactics = ['west_bridge_pincer', 'east_bridge_pincer', 'canyon_rim_envelopment', 'rear_eco_raid'];
                 actor.flankTactic = tactics[(actor.flankRecalibrateCount + Math.floor(Math.abs(ax))) % tactics.length];
-                if (typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 1) {
-                    let bestBrIdx = 0;
-                    let lowestPen = Infinity;
-                    for (let bi = 0; bi < RIVER_BRIDGES.length; bi++) {
-                        if (bi === actor.preferredBridgeIdx && RIVER_BRIDGES.length > 1) continue;
-                        const bWorld = typeof riverCoordsToWorld === 'function' ? riverCoordsToWorld(RIVER_BRIDGES[bi].sCoord, 0) : { x: 0, z: 0 };
-                        const pen = typeof window.getNavStuckPenalty === 'function' ? window.getNavStuckPenalty(bWorld.x, bWorld.z) : 0;
-                        if (pen < lowestPen) {
-                            lowestPen = pen;
-                            bestBrIdx = bi;
-                        }
-                    }
-                    actor.preferredBridgeIdx = bestBrIdx;
-                }
+            } else if (actor.recoveryStage >= 7 && actor.order === 'move') {
+                actor.order = 'attack_move';
             }
 
-            const surfH = typeof getSurfaceHeightWithBridges === 'function' ? getSurfaceHeightWithBridges : getTerrainHeight;
-            const stepLen = Math.min(0.18, (actor.speed || 3.5) * dt * 1.25);
-
-            // If near or on a river bridge or bridge exit, smoothly advance across the deck and out onto the destination bank!
+            // Smooth bridge deck / ramp progression if on or near a river bridge
             if (typeof getRiverCoords === 'function' && typeof RIVER_BRIDGES !== 'undefined' && RIVER_BRIDGES.length > 0) {
                 const rc = getRiverCoords(ax, az);
                 let bestBr = RIVER_BRIDGES[0];
@@ -5636,11 +6348,10 @@ function checkAndUnstickGroundUnit(actor, targetPos, dt) {
                 if (dU <= RIVER_HALF_WIDTH + 7.5 && minDS <= bestBr.halfWidth + 2.5) {
                     const destRC = getRiverCoords(targetPos.x, targetPos.z);
                     const uStepSign = (destRC.u - bCenterU) >= 0 ? 1 : -1;
-                    // On the water span, center toward bestBr.sCoord; once on the bridge end ramp, step straight toward targetPos!
                     let safeWorld;
                     if (dU <= RIVER_HALF_WIDTH + 2.4) {
                         const newS = rc.s + Math.sign(bestBr.sCoord - rc.s) * Math.min(Math.abs(bestBr.sCoord - rc.s), stepLen * 1.15);
-                        const newU = rc.u + uStepSign * stepLen * 1.2;
+                        const newU = rc.u + uStepSign * stepLen * 1.25;
                         safeWorld = riverCoordsToWorld(newS, newU);
                     } else {
                         const toDestX = targetPos.x - ax;
@@ -5661,7 +6372,7 @@ function checkAndUnstickGroundUnit(actor, targetPos, dt) {
                 }
             }
 
-            // Smooth tangential slide around local obstacle
+            // Smooth tangential sidestep around local obstacle
             const dx = targetPos.x - ax;
             const dz = targetPos.z - az;
             const dLen = Math.hypot(dx, dz) || 1;
@@ -5681,16 +6392,24 @@ function checkAndUnstickGroundUnit(actor, targetPos, dt) {
 
 function recordRagdollHitImpulse(victim, originPos, isHeavy = false) {
     if (!victim || !victim.mesh) return;
-    const dir = victim.mesh.position.clone().sub(originPos);
-    dir.y = 0;
-    if (dir.lengthSq() < 0.001) dir.set(Math.random() - 0.5, 0, Math.random() - 0.5);
-    dir.normalize();
+    let dx = victim.mesh.position.x - originPos.x;
+    let dz = victim.mesh.position.z - originPos.z;
+    let lenSq = dx * dx + dz * dz;
+    if (lenSq < 0.001) {
+        dx = Math.random() - 0.5;
+        dz = Math.random() - 0.5;
+        lenSq = dx * dx + dz * dz || 1;
+    }
+    const invLen = 1.0 / Math.sqrt(lenSq);
+    dx *= invLen;
+    dz *= invLen;
     const force = isHeavy ? (5.5 + Math.random() * 2.5) : (2.2 + Math.random() * 1.4);
-    victim.lastHitImpulse = new THREE.Vector3(
-        dir.x * force,
-        isHeavy ? (5.4 + Math.random() * 2.4) : (2.6 + Math.random() * 1.2),
-        dir.z * force
-    );
+    const vy = isHeavy ? (5.4 + Math.random() * 2.4) : (2.6 + Math.random() * 1.2);
+    if (victim.lastHitImpulse) {
+        victim.lastHitImpulse.set(dx * force, vy, dz * force);
+    } else {
+        victim.lastHitImpulse = new THREE.Vector3(dx * force, vy, dz * force);
+    }
     victim.lastHitHeavy = isHeavy;
 }
 
@@ -5875,11 +6594,26 @@ function shortestAngleDiff(current, target) {
 
 let _fowStepToggle = false;
 let _portrait3DAccum = 0;
+const _camForwardVec = new THREE.Vector3();
+const _camRightVec = new THREE.Vector3();
+const _worldUpVec = new THREE.Vector3(0, 1, 0);
+const _muzzleScratch = new THREE.Vector3();
+const _muzzleScratch2 = new THREE.Vector3();
+const _aimScratch = new THREE.Vector3();
+const _beamStartScratch = new THREE.Vector3();
+const _beamEndScratch = new THREE.Vector3();
+
 function animate(now) {
     requestAnimationFrame(animate);
     try {
+    const perfProf = window.PERF_PROFILER;
+    if (perfProf) perfProf.beginFrame(now);
     const rawDt = Math.min((now - prevTime) / 1000, 0.05);
     prevTime = now;
+
+    if (window.PERF_MANAGER && typeof window.PERF_MANAGER.update === 'function') {
+        window.PERF_MANAGER.update(rawDt, renderer, perfProf);
+    }
 
     if (window.titleScreenActive || window.loadingCameraSweep) {
         fowMesh.visible = false;
@@ -5909,7 +6643,18 @@ function animate(now) {
             renderTacticalMinimap();
             fowTimer = 0.2;
         }
+        if (window.PERF_PROFILER) window.PERF_PROFILER.begin('renderScene');
         renderer.render(scene, camera);
+        if (window.PERF_PROFILER) {
+            window.PERF_PROFILER.end('renderScene');
+            window.PERF_PROFILER.endFrame(renderer, {
+                units: units.length,
+                enemies: enemies.length,
+                buildings: buildings.length + enemyBuildings.length + (typeof solarisBuildings !== 'undefined' ? solarisBuildings.length : 0),
+                projectiles: projectiles.length,
+                particles: particles.length + smokeClouds.length + shockwaves.length
+            });
+        }
         return;
     }
 
@@ -5918,6 +6663,7 @@ function animate(now) {
     if (window.gamePaused) {
         controls.update();
         renderer.render(scene, camera);
+        if (window.PERF_PROFILER) window.PERF_PROFILER.endFrame(renderer);
         return;
     }
 
@@ -5925,6 +6671,7 @@ function animate(now) {
         hitstopTimer -= rawDt;
         controls.update();
         renderer.render(scene, camera);
+        if (window.PERF_PROFILER) window.PERF_PROFILER.endFrame(renderer);
         return;
     }
 
@@ -5949,12 +6696,13 @@ function animate(now) {
         if (state.swarmWaveTimer <= 0) {
             state.swarmWaveTimer = 26.0;
             let count = 0;
-            enemies.forEach(e => {
-                if (e.aiState === 'staging') {
+            for (let ei = 0; ei < enemies.length; ei++) {
+                const e = enemies[ei];
+                if (e && e.aiState === 'staging') {
                     e.aiState = e.isFlanker ? 'flank' : 'charge';
                     count++;
                 }
-            });
+            }
             if (count > 0) {
                 spawnCombatFloat(ENEMY_STAGING_POS, `SWARM WAVE ASSAULT! (${count} BIO-UNITS)`, '#d946ef');
             }
@@ -5967,28 +6715,28 @@ function animate(now) {
         }
     }
 
-    // WASD / Arrow Keys Camera Panning
+    // WASD / Arrow Keys Camera Panning (Zero per-frame Vector3 allocations)
     const panSpeed = 34 * dt;
-    const forward = new THREE.Vector3();
-    camera.getWorldDirection(forward);
-    forward.y = 0; forward.normalize();
-    const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+    camera.getWorldDirection(_camForwardVec);
+    _camForwardVec.y = 0;
+    if (_camForwardVec.lengthSq() > 0.0001) _camForwardVec.normalize();
+    _camRightVec.crossVectors(_camForwardVec, _worldUpVec).normalize();
 
     if (keysPressed['w'] || keysPressed['arrowup']) {
-        camera.position.addScaledVector(forward, panSpeed);
-        controls.target.addScaledVector(forward, panSpeed);
+        camera.position.addScaledVector(_camForwardVec, panSpeed);
+        controls.target.addScaledVector(_camForwardVec, panSpeed);
     }
     if (keysPressed['s'] || keysPressed['arrowdown']) {
-        camera.position.addScaledVector(forward, -panSpeed);
-        controls.target.addScaledVector(forward, -panSpeed);
+        camera.position.addScaledVector(_camForwardVec, -panSpeed);
+        controls.target.addScaledVector(_camForwardVec, -panSpeed);
     }
     if (keysPressed['a'] || keysPressed['arrowleft']) {
-        camera.position.addScaledVector(right, -panSpeed);
-        controls.target.addScaledVector(right, -panSpeed);
+        camera.position.addScaledVector(_camRightVec, -panSpeed);
+        controls.target.addScaledVector(_camRightVec, -panSpeed);
     }
     if (keysPressed['d'] || keysPressed['arrowright']) {
-        camera.position.addScaledVector(right, panSpeed);
-        controls.target.addScaledVector(right, panSpeed);
+        camera.position.addScaledVector(_camRightVec, panSpeed);
+        controls.target.addScaledVector(_camRightVec, panSpeed);
     }
 
     controls.update();
@@ -6026,18 +6774,34 @@ function animate(now) {
     }
 
     updateCameraViewportFrustum();
+    syncUnitAndBuildingCounters();
+    rebuildFrameSpatialGrids();
+    if (window.BRIDGE_TRAFFIC_MANAGER && typeof window.BRIDGE_TRAFFIC_MANAGER.update === 'function') {
+        window.BRIDGE_TRAFFIC_MANAGER.update(dt);
+    }
+    if (window.STRATEGIC_COMMANDER && typeof window.STRATEGIC_COMMANDER.update === 'function') {
+        window.STRATEGIC_COMMANDER.update(dt);
+    }
+    if (window.AI_DEBUG && typeof window.AI_DEBUG.update === 'function') {
+        window.AI_DEBUG.update(dt);
+    }
 
+    const perfCfg = (window.PERF_MANAGER && window.PERF_MANAGER.current) ? window.PERF_MANAGER.current : null;
+    const fowInterval = perfCfg ? perfCfg.fowInterval : 0.09;
     fowTimer -= dt;
     if (fowTimer <= 0) {
         _fowStepToggle = !_fowStepToggle;
         if (_fowStepToggle) {
             updateFogOfWarVision();
         } else {
+            if (window.PERF_PROFILER) window.PERF_PROFILER.begin('minimapRender');
             renderTacticalMinimap();
+            if (window.PERF_PROFILER) window.PERF_PROFILER.end('minimapRender');
         }
-        fowTimer = 0.09;
+        fowTimer = fowInterval;
     }
 
+    if (window.PERF_PROFILER) window.PERF_PROFILER.begin('weatherAndShaders');
     if (MAT.updateShaders) MAT.updateShaders(now * 0.001);
     if (window.SHADER_ENGINE && typeof window.SHADER_ENGINE.update === 'function') {
         window.SHADER_ENGINE.update(now * 0.001);
@@ -6052,14 +6816,17 @@ function animate(now) {
     }
     waterTex.offset.x += dt * 0.04;
     waterTex.offset.y += dt * 0.025;
-    for (let ti = 0; ti < swayTrees.length; ti++) {
+    const treeStride = perfCfg && perfCfg.particleBudgetScale < 0.7 ? 2 : 1;
+    const frameTickForTrees = window.PERF_PROFILER ? window.PERF_PROFILER.frameCount : 0;
+    for (let ti = frameTickForTrees % treeStride; ti < swayTrees.length; ti += treeStride) {
         const t = swayTrees[ti];
         if (!t || !t.crown) continue;
         const tp = t.crown.position;
         if (tp && !window.isWorldPosInViewport(tp.x, tp.y, tp.z, 4.5)) continue;
-        t.phase += dt * 1.6;
+        t.phase += dt * 1.6 * treeStride;
         t.crown.rotation.z = Math.sin(t.phase) * 0.035;
     }
+    if (window.PERF_PROFILER) window.PERF_PROFILER.end('weatherAndShaders');
 
     // Dynamic Red Glow Border Frame Modulation: ONLY appears when Friendly Main Base HP is low (<= 40% HP)!
     const redBorderEl = document.getElementById('red-border-glow-frame');
@@ -6211,9 +6978,7 @@ function animate(now) {
                 }
             } else if (b.hp < b.maxHp) {
                 b.hp = Math.min(b.maxHp, b.hp + dt * 4.5);
-                if (b.hb && b.hb.bar) {
-                    b.hb.bar.style.width = `${Math.max(0, (b.hp / b.maxHp) * 100)}%`;
-                }
+                if (b.hb) updateHealthPip(b.hb, b.hp, b.maxHp, b.shield || 0, b.maxShield || 0);
             }
         }
 
@@ -6229,11 +6994,15 @@ function animate(now) {
                 const allyBotCount = (state.multiplayerConfig && state.multiplayerConfig.allyBots) ? state.multiplayerConfig.allyBots.length : 1;
                 state.aiAllyTimer = Math.max(15.0, 29.0 - allyBotCount * 3.5);
                 // Spawn AI Ally Protoss reinforcements exclusively from completed Solaris Warp Gates & Robotics Bays!
-                const prodBuildings = solarisBuildings.filter(sb =>
-                    !state.solarisHostile &&
-                    (sb.role === 'gate' || sb.role === 'robotics') &&
-                    sb.hp > 0 && (sb.buildProgress === undefined || sb.buildProgress >= 1.0)
-                );
+                const prodBuildings = [];
+                if (!state.solarisHostile) {
+                    for (let sbi = 0; sbi < solarisBuildings.length; sbi++) {
+                        const sb = solarisBuildings[sbi];
+                        if (sb && (sb.role === 'gate' || sb.role === 'robotics') && sb.hp > 0 && (sb.buildProgress === undefined || sb.buildProgress >= 1.0)) {
+                            prodBuildings.push(sb);
+                        }
+                    }
+                }
                 if (units.length < 40 && prodBuildings.length > 0) {
                     const chosenBld = prodBuildings[Math.floor(Math.random() * prodBuildings.length)];
                     const spawnPos = chosenBld.pos;
@@ -6260,13 +7029,20 @@ function animate(now) {
                         }
                     }
 
-                    const stagedFleet = units.filter(u => u && u.hp > 0 && u.isFleetStaged);
-                    if (stagedFleet.length >= 6) {
-                        stagedFleet.forEach(fu => {
-                            fu.isFleetStaged = false;
-                            fu.order = 'attack_move';
-                            fu.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
-                        });
+                    let stagedCount = 0;
+                    for (let ui = 0; ui < units.length; ui++) {
+                        if (units[ui] && units[ui].hp > 0 && units[ui].isFleetStaged) stagedCount++;
+                    }
+                    if (stagedCount >= 6) {
+                        const targetPos = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS);
+                        for (let ui = 0; ui < units.length; ui++) {
+                            const fu = units[ui];
+                            if (fu && fu.hp > 0 && fu.isFleetStaged) {
+                                fu.isFleetStaged = false;
+                                fu.order = 'attack_move';
+                                fu.orderTarget = targetPos.clone();
+                            }
+                        }
                     }
                 }
             }
@@ -6280,10 +7056,13 @@ function animate(now) {
                 const diffMult = state.multiplayerConfig.botDifficulty === 'Brutal' ? 0.65
                     : (state.multiplayerConfig.botDifficulty === 'Hard' ? 0.80 : 1.0);
                 state.mpEnemyBotTimer = Math.max(11.0, (24.0 - eBots.length * 2.5) * diffMult);
-                const zergSpawners = enemyBuildings.filter(eb =>
-                    (eb.role === 'barracks' || eb.role === 'factory') &&
-                    eb.hp > 0 && (eb.buildProgress === undefined || eb.buildProgress >= 1.0)
-                );
+                const zergSpawners = [];
+                for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                    const eb = enemyBuildings[ebi];
+                    if (eb && (eb.role === 'barracks' || eb.role === 'factory') && eb.hp > 0 && (eb.buildProgress === undefined || eb.buildProgress >= 1.0)) {
+                        zergSpawners.push(eb);
+                    }
+                }
                 const dynamicEnemyCap = Math.min(72, 32 + Math.floor(units.length * 1.35));
                 if (enemies.length < dynamicEnemyCap && zergSpawners.length > 0) {
                     const variants = ['skitterer', 'spitter', 'crusher', 'burster', 'mutalisk'];
@@ -6384,28 +7163,41 @@ function animate(now) {
             if (eb.spawnDuration) eb.spawnTimer = eb.spawnDuration;
         }
 
-        const ud = eb.mesh.userData;
-        ud.pulsePhase = (ud.pulsePhase || 0) + dt * 2.8;
-        if (typeof updateEnemyBuildingAnimationAndBreak === 'function') {
-            updateEnemyBuildingAnimationAndBreak(eb, dt, state.elapsedSec);
-        }
-        if (ud.emblem) {
-            ud.emblem.rotation.y -= dt * 0.55;
-            if (ud.emblem.userData.holoPlane) {
-                ud.emblem.userData.holoPlane.position.y = 6.6 + Math.sin(ud.pulsePhase) * 0.25;
-            }
-        }
-        if (ud.psionicRing) ud.psionicRing.rotation.y += dt * 1.6;
-        if (ud.coreGem) ud.coreGem.rotation.x += dt * 2.2;
-        if (ud.sacs) ud.sacs.forEach((s, idx) => s.scale.setScalar(1 + Math.sin(ud.pulsePhase + idx) * 0.16));
-        if (ud.claws) ud.claws.forEach(c => { c.pivot.rotation.x = c.baseRotX + Math.sin(ud.pulsePhase * 0.7 + c.idx) * 0.08; });
-
         const ebInViewport = window.isWorldPosInViewport(eb.pos.x, eb.pos.y, eb.pos.z, 7.5);
         eb.mesh.visible = ebInViewport;
+
+        const ud = eb.mesh.userData;
+        ud.pulsePhase = (ud.pulsePhase || 0) + dt * 2.8;
+        if (ebInViewport) {
+            if (typeof updateEnemyBuildingAnimationAndBreak === 'function') {
+                updateEnemyBuildingAnimationAndBreak(eb, dt, state.elapsedSec);
+            }
+            if (ud.emblem) {
+                ud.emblem.rotation.y -= dt * 0.55;
+                if (ud.emblem.userData.holoPlane) {
+                    ud.emblem.userData.holoPlane.position.y = 6.6 + Math.sin(ud.pulsePhase) * 0.25;
+                }
+            }
+            if (ud.psionicRing) ud.psionicRing.rotation.y += dt * 1.6;
+            if (ud.coreGem) ud.coreGem.rotation.x += dt * 2.2;
+            if (ud.sacs) {
+                for (let si = 0; si < ud.sacs.length; si++) {
+                    ud.sacs[si].scale.setScalar(1 + Math.sin(ud.pulsePhase + si) * 0.16);
+                }
+            }
+            if (ud.claws) {
+                for (let ci = 0; ci < ud.claws.length; ci++) {
+                    const c = ud.claws[ci];
+                    c.pivot.rotation.x = c.baseRotX + Math.sin(ud.pulsePhase * 0.7 + c.idx) * 0.08;
+                }
+            }
+        }
+
         if (ebInViewport && isWorldPosVisible(eb.pos.x, eb.pos.z)) {
-            eb.hb.bar.style.width = `${Math.max(0, (eb.hp / eb.maxHp) * 100)}%`;
+            updateHealthPip(eb.hb, eb.hp, eb.maxHp);
             projectToScreen(eb.hb.root, eb.pos, eb.role === 'citadel' ? 3.8 : 2.1);
-        } else if (eb.hb && eb.hb.root) {
+        } else if (eb.hb && eb.hb.root && eb.hb._lastDisp !== 'none') {
+            eb.hb._lastDisp = 'none';
             eb.hb.root.style.display = 'none';
         }
 
@@ -6416,15 +7208,21 @@ function animate(now) {
             eb.cooldown = (eb.cooldown || 0) - dt;
             eb.whipAnim = Math.max(0, (eb.whipAnim || 0) - dt * 2.8);
 
-            let nearestTarget = null, minDist = 16.5;
-            units.forEach(u => {
-                const d = eb.pos.distanceTo(u.mesh.position);
-                if (d < minDist) { minDist = d; nearestTarget = u; }
-            });
-            buildings.forEach(b => {
-                const d = eb.pos.distanceTo(b.pos);
-                if (d < minDist) { minDist = d; nearestTarget = b; }
-            });
+            let nearestTarget = null, minDistSq = 16.5 * 16.5;
+            for (let ui = 0; ui < units.length; ui++) {
+                const u = units[ui];
+                const dx = u.mesh.position.x - eb.pos.x;
+                const dz = u.mesh.position.z - eb.pos.z;
+                const dSq = dx * dx + dz * dz;
+                if (dSq < minDistSq) { minDistSq = dSq; nearestTarget = u; }
+            }
+            for (let bi = 0; bi < buildings.length; bi++) {
+                const b = buildings[bi];
+                const dx = b.pos.x - eb.pos.x;
+                const dz = b.pos.z - eb.pos.z;
+                const dSq = dx * dx + dz * dz;
+                if (dSq < minDistSq) { minDistSq = dSq; nearestTarget = b; }
+            }
 
             if (nearestTarget) {
                 const tPos = nearestTarget.mesh ? nearestTarget.mesh.position : nearestTarget.pos;
@@ -6436,17 +7234,19 @@ function animate(now) {
                 else if (ud.head) ud.head.rotation.y = eb.currentYaw;
 
                 if (Math.abs(angleDiff) < 0.38 && eb.cooldown <= 0) {
-                    const muzzle = ud.cannonBarrel
-                        ? ud.cannonBarrel.getWorldPosition(new THREE.Vector3())
-                        : eb.pos.clone().add(new THREE.Vector3(0, 1.85, 0));
-                    launchOrdProjectile(muzzle, nearestTarget, 'spine', 24 * getWaveStrengthMultiplier(), true);
+                    if (ud.cannonBarrel) {
+                        ud.cannonBarrel.getWorldPosition(_muzzleScratch);
+                    } else {
+                        _muzzleScratch.set(eb.pos.x, eb.pos.y + 1.85, eb.pos.z);
+                    }
+                    launchOrdProjectile(_muzzleScratch, nearestTarget, 'spine', 24 * getWaveStrengthMultiplier(), true);
                     eb.whipAnim = 1.0;
                     eb.cooldown = 1.25;
                 }
             }
 
             // Multi-segment kinematic spine articulation (Serpentine sway + S-coil windup + violent forward whip snap)
-            if (ud.spineSegments && ud.spineSegments.length > 0) {
+            if (ebInViewport && ud.spineSegments && ud.spineSegments.length > 0) {
                 const segs = ud.spineSegments;
                 const w = eb.whipAnim || 0;
                 const whipPhase = w > 0.55
@@ -6467,11 +7267,12 @@ function animate(now) {
                     segObj.rotation.z = swayZ;
                 }
             }
-            if (ud.mawJaws) {
+            if (ebInViewport && ud.mawJaws) {
                 const flare = (eb.whipAnim || 0) * 0.55 + Math.sin(ud.pulsePhase * 2.2) * 0.08;
-                ud.mawJaws.forEach(j => {
+                for (let ji = 0; ji < ud.mawJaws.length; ji++) {
+                    const j = ud.mawJaws[ji];
                     j.pivot.rotation.x = j.baseFlare + flare;
-                });
+                }
             }
         }
 
@@ -6479,51 +7280,63 @@ function animate(now) {
         if (eb.role === 'drill_tower' && state.basePlaced && !state.missionWon) {
             eb.cooldown = (eb.cooldown || 0) - dt;
             const drillRad = eb.drillRadius || 18.5;
-            let groundTarget = null, minDist = drillRad;
-            units.forEach(u => {
-                if (u.isAir) return;
-                const d = Math.hypot(u.mesh.position.x - eb.pos.x, u.mesh.position.z - eb.pos.z);
-                if (d < minDist) { minDist = d; groundTarget = u; }
-            });
+            let groundTarget = null, minDistSq = drillRad * drillRad;
+            for (let ui = 0; ui < units.length; ui++) {
+                const u = units[ui];
+                if (u.isAir) continue;
+                const dx = u.mesh.position.x - eb.pos.x;
+                const dz = u.mesh.position.z - eb.pos.z;
+                const dSq = dx * dx + dz * dz;
+                if (dSq < minDistSq) { minDistSq = dSq; groundTarget = u; }
+            }
             if (!groundTarget) {
-                buildings.forEach(b => {
-                    const d = Math.hypot(b.pos.x - eb.pos.x, b.pos.z - eb.pos.z);
-                    if (d < minDist) { minDist = d; groundTarget = b; }
-                });
+                for (let bi = 0; bi < buildings.length; bi++) {
+                    const b = buildings[bi];
+                    const dx = b.pos.x - eb.pos.x;
+                    const dz = b.pos.z - eb.pos.z;
+                    const dSq = dx * dx + dz * dz;
+                    if (dSq < minDistSq) { minDistSq = dSq; groundTarget = b; }
+                }
             }
 
-            if (ud.drillAssembly) {
+            if (ebInViewport && ud.drillAssembly) {
                 const isDrilling = !!groundTarget;
                 ud.drillAssembly.rotation.y += dt * (isDrilling ? 22.0 : 4.5);
                 const targetDepth = isDrilling ? (0.48 + Math.sin(ud.pulsePhase * 5.0) * 0.28) : 1.05;
                 ud.drillAssembly.position.y = THREE.MathUtils.lerp(ud.drillAssembly.position.y, targetDepth, dt * 8.0);
             }
-            if (ud.seismicRing) {
+            if (ebInViewport && ud.seismicRing) {
                 const sScale = 0.85 + (ud.pulsePhase % 1.8) * 0.35;
                 ud.seismicRing.scale.setScalar(sScale);
             }
 
             if (groundTarget && eb.cooldown <= 0) {
-                const tPos = (groundTarget.mesh ? groundTarget.mesh.position : groundTarget.pos).clone();
+                const tPos = (groundTarget.mesh ? groundTarget.mesh.position : groundTarget.pos);
                 if (typeof spawnSubterraneanDrillEruptionFX === 'function') {
                     spawnSubterraneanDrillEruptionFX(tPos);
                 }
                 const dmg = Math.round(34 * getWaveStrengthMultiplier());
-                units.forEach(u => {
-                    if (u.isAir) return;
-                    if (Math.hypot(u.mesh.position.x - tPos.x, u.mesh.position.z - tPos.z) <= 2.4) {
+                for (let ui = 0; ui < units.length; ui++) {
+                    const u = units[ui];
+                    if (u.isAir) continue;
+                    const dx = u.mesh.position.x - tPos.x;
+                    const dz = u.mesh.position.z - tPos.z;
+                    if (dx * dx + dz * dz <= 5.76) { // 2.4^2
                         recordRagdollHitImpulse(u, tPos, true);
                         applyDamageWithTurretShield(u, dmg);
                         spawnCombatFloat(u.mesh.position, `${dmg} DRILL`, '#ff5400');
                     }
-                });
-                buildings.forEach(b => {
-                    if (Math.hypot(b.pos.x - tPos.x, b.pos.z - tPos.z) <= 2.8) {
+                }
+                for (let bi = 0; bi < buildings.length; bi++) {
+                    const b = buildings[bi];
+                    const dx = b.pos.x - tPos.x;
+                    const dz = b.pos.z - tPos.z;
+                    if (dx * dx + dz * dz <= 7.84) { // 2.8^2
                         applyDamageWithTurretShield(b, dmg);
                         spawnCombatFloat(b.pos, `${dmg} DRILL`, '#ff5400');
                         if (b === state.baseBuilding) updateHUD();
                     }
-                });
+                }
                 eb.cooldown = 2.45;
             }
         }
@@ -6593,7 +7406,8 @@ function animate(now) {
         if (sbInViewport && isWorldPosVisible(sb.pos.x, sb.pos.z)) {
             updateHealthPip(sb.hb, sb.hp, sb.maxHp, sb.shield || 0, sb.maxShield || 0);
             projectToScreen(sb.hb.root, sb.pos, sb.role === 'nexus' ? 3.2 : 2.2);
-        } else if (sb.hb && sb.hb.root && sb.hb.root.style.display !== 'none') {
+        } else if (sb.hb && sb.hb.root && sb.hb._lastDisp !== 'none') {
+            sb.hb._lastDisp = 'none';
             sb.hb.root.style.display = 'none';
         }
 
@@ -6602,37 +7416,45 @@ function animate(now) {
         if (state.basePlaced && !state.missionWon) {
             if (sb.role === 'spire') {
                 sb.cooldown = (sb.cooldown || 0) - dt;
-                let nearestEnemy = null, minDist = 24.5;
-                enemies.forEach(e => {
-                    if (e.hp <= 0) return;
-                    const d = sb.pos.distanceTo(e.mesh.position);
-                    if (d < minDist) { minDist = d; nearestEnemy = e; }
-                });
+                let nearestEnemy = null, minDistSq = 24.5 * 24.5;
+                for (let ei = 0; ei < enemies.length; ei++) {
+                    const e = enemies[ei];
+                    if (e.hp <= 0) continue;
+                    const dx = e.mesh.position.x - sb.pos.x;
+                    const dz = e.mesh.position.z - sb.pos.z;
+                    const dSq = dx * dx + dz * dz;
+                    if (dSq < minDistSq) { minDistSq = dSq; nearestEnemy = e; }
+                }
                 if (!nearestEnemy && !state.solarisHostile) {
-                    enemyBuildings.forEach(eb => {
-                        if (eb.hp <= 0) return;
-                        const d = sb.pos.distanceTo(eb.pos);
-                        if (d < minDist) { minDist = d; nearestEnemy = eb; }
-                    });
+                    for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                        const eb = enemyBuildings[ebi];
+                        if (eb.hp <= 0) continue;
+                        const dx = eb.pos.x - sb.pos.x;
+                        const dz = eb.pos.z - sb.pos.z;
+                        const dSq = dx * dx + dz * dz;
+                        if (dSq < minDistSq) { minDistSq = dSq; nearestEnemy = eb; }
+                    }
                 }
                 if (state.solarisHostile && !nearestEnemy) {
-                    units.forEach(u => {
-                        if (u.hp <= 0) return;
-                        const d = sb.pos.distanceTo(u.mesh.position);
-                        if (d < minDist) { minDist = d; nearestEnemy = u; }
-                    });
+                    for (let ui = 0; ui < units.length; ui++) {
+                        const u = units[ui];
+                        if (u.hp <= 0) continue;
+                        const dx = u.mesh.position.x - sb.pos.x;
+                        const dz = u.mesh.position.z - sb.pos.z;
+                        const dSq = dx * dx + dz * dz;
+                        if (dSq < minDistSq) { minDistSq = dSq; nearestEnemy = u; }
+                    }
                 }
                 if (nearestEnemy && sb.cooldown <= 0) {
-                    const muzzle = sb.pos.clone().add(new THREE.Vector3(0, 2.55, 0));
-                    launchOrdProjectile(muzzle, nearestEnemy, 'solaris_spire', 42, state.solarisHostile && units.includes(nearestEnemy));
+                    _muzzleScratch.set(sb.pos.x, sb.pos.y + 2.55, sb.pos.z);
+                    launchOrdProjectile(_muzzleScratch, nearestEnemy, 'solaris_spire', 42, state.solarisHostile && units.includes(nearestEnemy));
                     sb.cooldown = 1.15;
                 }
             } else if ((sb.role === 'gate' || sb.role === 'robotics') && !state.solarisHostile) {
                 // Only completed Protoss Warp Gates ('gate') & Robotics Bays ('robotics') spawn Solaris Protoss units!
                 sb.spawnTimer = (sb.spawnTimer || 13.5) - dt;
                 if (sb.spawnTimer <= 0) {
-                    const activeSolUnits = units.filter(u => ['zealot', 'stalker', 'archon'].includes(u.type));
-                    if (units.length < 38 && activeSolUnits.length < 16) {
+                    if (units.length < 38 && UNIT_COUNTS.solaris < 16) {
                         const doc = state.solarisDoctrine || 'zealot_rush';
                         const r = Math.random();
                         const sUnit = sb.role === 'robotics'
@@ -6643,12 +7465,13 @@ function animate(now) {
                                     ? (r < 0.48 ? 'archon' : (r < 0.85 ? 'stalker' : 'zealot'))
                                     : (r < 0.45 ? 'zealot' : (r < 0.80 ? 'stalker' : 'archon'))));
                         spawnAlliedUnit(sUnit, sb.pos);
+                        UNIT_COUNTS.solaris++;
                         const spawned = units[units.length - 1];
                         if (spawned) {
                             if (doc === 'zealot_rush' || sb.isProxy) {
                                 spawned.order = 'attack_move';
                                 spawned.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
-                            } else if (doc === 'massive_fleet' && activeSolUnits.length < 7) {
+                            } else if (doc === 'massive_fleet' && UNIT_COUNTS.solaris < 7) {
                                 spawned.isSolarisFleetStaged = true;
                                 spawned.order = 'attack_move';
                                 spawned.orderTarget = new THREE.Vector3(
@@ -6658,14 +7481,16 @@ function animate(now) {
                                 );
                             }
                         }
-                        if (activeSolUnits.length >= 6) {
-                            units.forEach(su => {
+                        if (UNIT_COUNTS.solaris >= 6) {
+                            const targetPos = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS);
+                            for (let ui = 0; ui < units.length; ui++) {
+                                const su = units[ui];
                                 if (su && su.isSolarisFleetStaged) {
                                     su.isSolarisFleetStaged = false;
                                     su.order = 'attack_move';
-                                    su.orderTarget = (enemyBuildings.length > 0 ? enemyBuildings[0].pos : ENEMY_BASE_POS).clone();
+                                    su.orderTarget = targetPos.clone();
                                 }
-                            });
+                            }
                         }
                     }
                     sb.spawnTimer = sb.role === 'robotics' ? 16.0 : 13.5;
@@ -6781,22 +7606,23 @@ function animate(now) {
             if (bInViewport) {
                 updateBuildingMechanicsAndDamage(b, dt);
                 updateHealthPip(b.hb, b.hp, b.maxHp, b.shield || 0, b.maxShield || 0);
-                projectToScreen(b.hb.root, b.pos, b.type === 'base' ? 2.1 : 1.6);
-            } else if (b.hb && b.hb.root && b.hb.root.style.display !== 'none') {
+                projectToScreen(b.hb.root, b.pos, b.type === 'base' ? 2.1 : 1.6, state.selectedBuilding === b);
+            } else if (b.hb && b.hb.root && b.hb._lastDisp !== 'none') {
+                b.hb._lastDisp = 'none';
                 b.hb.root.style.display = 'none';
             }
 
             // Wait for construction animation to finish (`buildProgress >= 1.0`) before spawning units or operating turrets!
             if (b.buildProgress < 1.0) continue;
 
-            if (b.mesh.userData.rotor) b.mesh.userData.rotor.rotation.y += dt * 2.0;
+            if (bInViewport && b.mesh.userData.rotor) b.mesh.userData.rotor.rotation.y += dt * 2.0;
 
             if (b.type === 'barracks') {
-                const infCount = units.filter(u => ['grunt', 'ranger', 'medic', 'rocketman', 'reaper', 'firebat', 'marauder'].includes(u.type)).length;
-                if (infCount < 24) {
+                if (UNIT_COUNTS.infantry < 24) {
                     b.spawnTimer -= dt;
                     if (b.spawnTimer <= 0) {
                         spawnAlliedUnit(b.unitType, b.pos);
+                        UNIT_COUNTS.infantry++;
                         const infTimes = { grunt: 9.0, ranger: 10.0, medic: 10.5, rocketman: 11.5, reaper: 10.0, firebat: 11.0, marauder: 12.5 };
                         b.spawnDuration = infTimes[b.unitType] || 10.0;
                         b.spawnTimer = b.spawnDuration;
@@ -6805,16 +7631,16 @@ function animate(now) {
                 }
             }
             else if (b.type === 'factory' || b.type === 'solaris_robotics') {
-                const hasActiveBarracks = buildings.some(allyB => (allyB.type === 'barracks' || allyB.type === 'solaris_gate') && allyB.hp > 0 && allyB.buildProgress >= 1.0);
+                const hasActiveBarracks = BUILDING_COUNTS.activeBarracksOrGate > 0;
                 if (b.unitType === 'transport' && !hasActiveBarracks) {
                     // Dropship requires an active Barracks / Warp Gate to operate!
                     b.spawnTimer = b.spawnDuration;
                 } else {
-                    const vehCount = units.filter(u => ['tank', 'siege_tank', 'heli', 'transport', 'valkyrie'].includes(u.type)).length;
-                    if (vehCount < 10) {
+                    if (UNIT_COUNTS.vehicles < 10) {
                         b.spawnTimer -= dt;
                         if (b.spawnTimer <= 0) {
                             spawnAlliedUnit(b.unitType, b.pos);
+                            UNIT_COUNTS.vehicles++;
                             const vehTimes = { tank: 15.5, siege_tank: 18.0, heli: 14.0, transport: 14.0, valkyrie: 16.5 };
                             b.spawnDuration = vehTimes[b.unitType] || 15.5;
                             b.spawnTimer = b.spawnDuration;
@@ -6824,12 +7650,12 @@ function animate(now) {
                 }
             }
             else if (b.type === 'solaris_gate') {
-                const solCount = units.filter(u => ['zealot', 'stalker', 'archon'].includes(u.type)).length;
-                if (solCount < 12) {
+                if (UNIT_COUNTS.solaris < 12) {
                     b.spawnTimer -= dt;
                     if (b.spawnTimer <= 0) {
                         const sType = b.unitType || 'zealot';
                         spawnAlliedUnit(sType, b.pos);
+                        UNIT_COUNTS.solaris++;
                         const solTimes = { zealot: 10.0, stalker: 12.0, archon: 15.5 };
                         b.spawnDuration = solTimes[sType] || 11.0;
                         b.spawnTimer = b.spawnDuration;
@@ -6838,7 +7664,7 @@ function animate(now) {
             }
             else if (b.type === 'mine_drill') {
                 // Animate Deep-Core Tungsten Auger Rotation & Vertical Reciprocating Bore Stroke
-                if (b.mesh && b.mesh.userData && b.mesh.userData.drillAuger) {
+                if (bInViewport && b.mesh && b.mesh.userData && b.mesh.userData.drillAuger) {
                     const auger = b.mesh.userData.drillAuger;
                     auger.rotation.y += dt * 14.0;
                     auger.position.y = 0.86 + Math.sin(now * 0.012) * 0.14;
@@ -6913,14 +7739,19 @@ function animate(now) {
                     drone.position.y = 0.68 + Math.sin(pod.userData.dronePhase) * 0.14;
                     drone.position.x = Math.cos(pod.userData.dronePhase * 0.6) * 0.22;
                     if (pod.userData.droneRotors) {
-                        pod.userData.droneRotors.forEach(r => { r.rotation.y += dt * 32; });
+                        for (let ri = 0; ri < pod.userData.droneRotors.length; ri++) {
+                            pod.userData.droneRotors[ri].rotation.y += dt * 32;
+                        }
                     }
 
                     // Fixing Drone patches up damaged friendly Mechanical Units (Tanks, Siege Tanks, Gunships, Dropships, Valkyries) AND friendly Buildings within 19.5m!
                     let repairTarget = null, lowestRatio = 1.0, isUnitTarget = false;
-                    units.forEach(allyU => {
+                    for (let ui = 0; ui < units.length; ui++) {
+                        const allyU = units[ui];
                         if (allyU && allyU.isMechanical && allyU.hp > 0 && allyU.hp < allyU.maxHp && allyU.mesh) {
-                            if (b.pos.distanceTo(allyU.mesh.position) <= 19.5) {
+                            const dx = allyU.mesh.position.x - b.pos.x;
+                            const dz = allyU.mesh.position.z - b.pos.z;
+                            if (dx * dx + dz * dz <= 380.25) { // 19.5^2
                                 const r = allyU.hp / allyU.maxHp;
                                 if (r < lowestRatio) {
                                     lowestRatio = r;
@@ -6929,17 +7760,22 @@ function animate(now) {
                                 }
                             }
                         }
-                    });
-                    buildings.forEach(allyB => {
-                        if (allyB.hp > 0 && allyB.hp < allyB.maxHp && b.pos.distanceTo(allyB.pos) <= 19.5) {
-                            const r = allyB.hp / allyB.maxHp;
-                            if (r < lowestRatio) {
-                                lowestRatio = r;
-                                repairTarget = allyB;
-                                isUnitTarget = false;
+                    }
+                    for (let bi2 = 0; bi2 < buildings.length; bi2++) {
+                        const allyB = buildings[bi2];
+                        if (allyB.hp > 0 && allyB.hp < allyB.maxHp) {
+                            const dx = allyB.pos.x - b.pos.x;
+                            const dz = allyB.pos.z - b.pos.z;
+                            if (dx * dx + dz * dz <= 380.25) {
+                                const r = allyB.hp / allyB.maxHp;
+                                if (r < lowestRatio) {
+                                    lowestRatio = r;
+                                    repairTarget = allyB;
+                                    isUnitTarget = false;
+                                }
                             }
                         }
-                    });
+                    }
 
                     let rBeam = pod.userData.repairBeam;
                     if (rBeam && !rBeam.userData?.coreMesh && typeof window.createRepairBeamAssembly === 'function') {
@@ -6963,23 +7799,23 @@ function animate(now) {
                             window.PORTRAIT_3D_VIEWER.setRepairing(true, 0.75);
                         }
 
-                        const dWorld = drone.getWorldPosition(new THREE.Vector3());
+                        drone.getWorldPosition(_beamStartScratch);
                         const rawTargetPos = isUnitTarget ? repairTarget.mesh.position : repairTarget.pos;
-                        const tWorld = rawTargetPos.clone().add(new THREE.Vector3(0, isUnitTarget && repairTarget.isAir ? 0.0 : 0.85, 0));
+                        _beamEndScratch.set(rawTargetPos.x, rawTargetPos.y + (isUnitTarget && repairTarget.isAir ? 0.0 : 0.85), rawTargetPos.z);
                         if (rBeam) {
                             if (typeof window.updateRepairBeamAssembly === 'function' && rBeam.userData?.coreMesh) {
-                                window.updateRepairBeamAssembly(rBeam, dWorld, tWorld, dt);
+                                window.updateRepairBeamAssembly(rBeam, _beamStartScratch, _beamEndScratch, dt);
                             } else {
-                                const dist = dWorld.distanceTo(tWorld);
+                                const dist = _beamStartScratch.distanceTo(_beamEndScratch);
                                 const pulseThick = 0.9 + Math.sin(pod.userData.dronePhase * 4) * 0.35;
                                 rBeam.visible = true;
-                                rBeam.position.lerpVectors(dWorld, tWorld, 0.5);
+                                rBeam.position.lerpVectors(_beamStartScratch, _beamEndScratch, 0.5);
                                 rBeam.scale.set(pulseThick, pulseThick, dist);
-                                rBeam.lookAt(tWorld);
+                                rBeam.lookAt(_beamEndScratch);
                             }
                         }
                         if (b.cooldowns[slot] <= 0) {
-                            spawnNanoWeldSparkFX(tWorld);
+                            spawnNanoWeldSparkFX(_beamEndScratch);
                             if (window.SFX) window.SFX.playHeal();
                             b.cooldowns[slot] = 0.85;
                         }
@@ -7004,9 +7840,9 @@ function animate(now) {
                     if (w === 'shield' && pod) {
                         b.cooldowns[slot] -= dt;
                         if (pod.userData.shieldRings) {
-                            pod.userData.shieldRings.forEach((r, idx) => {
-                                r.rotation.z += dt * (idx % 2 === 0 ? 3.5 : -3.5);
-                            });
+                            for (let ri = 0; ri < pod.userData.shieldRings.length; ri++) {
+                                pod.userData.shieldRings[ri].rotation.z += dt * (ri % 2 === 0 ? 3.5 : -3.5);
+                            }
                         }
                         if (b.maxShieldHp > 0) {
                             if (b.shieldBrokenTimer > 0) {
@@ -7027,9 +7863,9 @@ function animate(now) {
                     } else if (w === 'mindcontrol' && pod) {
                         b.cooldowns[slot] -= dt;
                         if (pod.userData.psiRings) {
-                            pod.userData.psiRings.forEach((r, idx) => {
-                                r.rotation.z += dt * (idx % 2 === 0 ? 4.2 : -4.2);
-                            });
+                            for (let ri = 0; ri < pod.userData.psiRings.length; ri++) {
+                                pod.userData.psiRings[ri].rotation.z += dt * (ri % 2 === 0 ? 4.2 : -4.2);
+                            }
                         }
                         const mBeam = pod.userData.mindBeam;
                         if (mBeam && b.cooldowns[slot] < 4.8) mBeam.visible = false;
@@ -7076,12 +7912,13 @@ function animate(now) {
                         }
                         if (!isAimed) return;
 
-                        const muzzle = pod ? pod.getWorldPosition(new THREE.Vector3()) : b.pos.clone();
+                        if (pod) pod.getWorldPosition(_muzzleScratch);
+                        else _muzzleScratch.copy(b.pos);
 
                         if (w === 'mg' && minDist <= 14.0 && b.cooldowns[slot] <= 0) {
-                            launchOrdProjectile(muzzle, nearest, 'mg', 16);
-                            triggerMuzzleFlash(muzzle);
-                            ejectBrassCasing(muzzle);
+                            launchOrdProjectile(_muzzleScratch, nearest, 'mg', 16);
+                            triggerMuzzleFlash(_muzzleScratch);
+                            ejectBrassCasing(_muzzleScratch);
                             if (pod) pod.position.z = basePodZ - 0.09;
                             b.cooldowns[slot] = 0.2;
                         }
@@ -7091,9 +7928,9 @@ function animate(now) {
                                     SHARED_FX_GEO.fireBall,
                                     Math.random() > 0.4 ? MAT.amberGlow : MAT.crimsonTank
                                 );
-                                fireBall.position.copy(muzzle);
+                                fireBall.position.copy(_muzzleScratch);
                                 scene.add(fireBall);
-                                const dir = tPos.clone().sub(muzzle).normalize();
+                                const dir = tPos.clone().sub(_muzzleScratch).normalize();
                                 particles.push({
                                     mesh: fireBall,
                                     vel: dir.multiplyScalar(11).add(new THREE.Vector3((Math.random()-0.5)*2, 1, (Math.random()-0.5)*2)),
@@ -7101,36 +7938,36 @@ function animate(now) {
                                     life: 0.32
                                 });
                             }
-                            recordRagdollHitImpulse(nearest, muzzle, false);
+                            recordRagdollHitImpulse(nearest, _muzzleScratch, false);
                             nearest.hp -= 9;
                             b.cooldowns[slot] = 0.08;
                         }
                         else if (w === 'plasma' && minDist <= 16.5 && b.cooldowns[slot] <= 0) {
-                            launchOrdProjectile(muzzle, nearest, 'plasma', 42);
-                            triggerMuzzleFlash(muzzle);
+                            launchOrdProjectile(_muzzleScratch, nearest, 'plasma', 42);
+                            triggerMuzzleFlash(_muzzleScratch);
                             if (pod) pod.position.z = basePodZ - 0.14;
                             b.cooldowns[slot] = 0.72;
                         }
                         else if (w === 'rocket' && minDist <= 20.0 && b.cooldowns[slot] <= 0) {
                             // Swarm Rocket Missile Pod: Fires twin ballistic high-explosive missiles!
-                            const leftMuzzle = muzzle.clone().add(new THREE.Vector3(-0.12, 0.06, 0));
-                            const rightMuzzle = muzzle.clone().add(new THREE.Vector3(0.12, 0.06, 0));
-                            launchOrdProjectile(leftMuzzle, nearest, 'rocket', 55);
-                            launchOrdProjectile(rightMuzzle, nearest, 'rocket', 55);
-                            triggerMuzzleFlash(muzzle);
+                            _muzzleScratch2.set(_muzzleScratch.x - 0.12, _muzzleScratch.y + 0.06, _muzzleScratch.z);
+                            launchOrdProjectile(_muzzleScratch2, nearest, 'rocket', 55);
+                            _muzzleScratch2.set(_muzzleScratch.x + 0.12, _muzzleScratch.y + 0.06, _muzzleScratch.z);
+                            launchOrdProjectile(_muzzleScratch2, nearest, 'rocket', 55);
+                            triggerMuzzleFlash(_muzzleScratch);
                             if (pod) pod.position.z = basePodZ - 0.18;
                             b.cooldowns[slot] = 1.65;
                         }
                         else if (w === 'sniper' && minDist <= 22.0 && b.cooldowns[slot] <= 0) {
-                            launchOrdProjectile(muzzle, nearest, 'sniper', 125);
-                            triggerMuzzleFlash(muzzle);
-                            ejectBrassCasing(muzzle);
+                            launchOrdProjectile(_muzzleScratch, nearest, 'sniper', 125);
+                            triggerMuzzleFlash(_muzzleScratch);
+                            ejectBrassCasing(_muzzleScratch);
                             if (pod) pod.position.z = basePodZ - 0.26;
                             b.cooldowns[slot] = 2.1;
                         }
                         else if (w === 'mortar' && minDist <= 18.0 && b.cooldowns[slot] <= 0) {
-                            launchOrdProjectile(muzzle, nearest, 'mortar', 70);
-                            triggerMuzzleFlash(muzzle);
+                            launchOrdProjectile(_muzzleScratch, nearest, 'mortar', 70);
+                            triggerMuzzleFlash(_muzzleScratch);
                             if (pod) pod.position.z = basePodZ - 0.22;
                             b.cooldowns[slot] = 2.3;
                         }
@@ -7138,37 +7975,39 @@ function animate(now) {
                             // Strictly enforce MAX_MIND_CONTROL_UNITS (3 units) cap!
                             if (getActiveMindControlledCount() < MAX_MIND_CONTROL_UNITS) {
                                 let domCandidate = null, bestDomScore = -1;
-                                enemies.forEach(e => {
-                                    if (e.hp <= 0) return;
-                                    const d = b.pos.distanceTo(e.mesh.position);
-                                    if (d <= 19.0 && e.maxHp > bestDomScore) {
+                                for (let ei = 0; ei < enemies.length; ei++) {
+                                    const e = enemies[ei];
+                                    if (e.hp <= 0) continue;
+                                    const dx2 = e.mesh.position.x - b.pos.x;
+                                    const dz2 = e.mesh.position.z - b.pos.z;
+                                    if (dx2 * dx2 + dz2 * dz2 <= 361.0 && e.maxHp > bestDomScore) { // 19.0^2
                                         bestDomScore = e.maxHp;
                                         domCandidate = e;
                                     }
-                                });
+                                }
                                 if (domCandidate) {
                                     const mBeam = pod ? pod.userData.mindBeam : null;
                                     if (mBeam) {
-                                        const end = domCandidate.mesh.position.clone().add(new THREE.Vector3(0, 0.8, 0));
-                                        const dist = muzzle.distanceTo(end);
+                                        _beamEndScratch.set(domCandidate.mesh.position.x, domCandidate.mesh.position.y + 0.8, domCandidate.mesh.position.z);
+                                        const dist = _muzzleScratch.distanceTo(_beamEndScratch);
                                         mBeam.visible = true;
-                                        mBeam.position.lerpVectors(muzzle, end, 0.5);
+                                        mBeam.position.lerpVectors(_muzzleScratch, _beamEndScratch, 0.5);
                                         mBeam.scale.set(1.3, 1.3, dist);
-                                        mBeam.lookAt(end);
+                                        mBeam.lookAt(_beamEndScratch);
                                     }
-                                    convertEnemyWithMindControl(domCandidate, muzzle);
+                                    convertEnemyWithMindControl(domCandidate, _muzzleScratch);
                                     b.cooldowns[slot] = 5.5;
                                 }
                             } else {
                                 // At 3/3 Mind Control capacity: fire psionic neural overload zap without converting a 4th unit
                                 const mBeam = pod ? pod.userData.mindBeam : null;
                                 if (mBeam && nearest.mesh) {
-                                    const end = nearest.mesh.position.clone().add(new THREE.Vector3(0, 0.8, 0));
-                                    const dist = muzzle.distanceTo(end);
+                                    _beamEndScratch.set(nearest.mesh.position.x, nearest.mesh.position.y + 0.8, nearest.mesh.position.z);
+                                    const dist = _muzzleScratch.distanceTo(_beamEndScratch);
                                     mBeam.visible = true;
-                                    mBeam.position.lerpVectors(muzzle, end, 0.5);
+                                    mBeam.position.lerpVectors(_muzzleScratch, _beamEndScratch, 0.5);
                                     mBeam.scale.set(0.95, 0.95, dist);
-                                    mBeam.lookAt(end);
+                                    mBeam.lookAt(_beamEndScratch);
                                 }
                                 nearest.hp -= 28;
                                 spawnCombatFloat(tPos, 'PSI ZAP (3/3 MAX)', '#d946ef');
@@ -7190,6 +8029,7 @@ function animate(now) {
         // Update Allied Units (With Weather Speed Mult, Smart Targeting, Tactical Formations, Dropship Anti-Air Retreat & 360° Heli Belly Turret Aiming)
         const mainBaseAnchor = state.baseBuilding ? state.baseBuilding.pos : PLAYER_START_POS;
 
+        if (perfProf) perfProf.begin('unitAI');
         units.forEach((u, unitIdx) => {
             u.cooldown -= dt;
             if (u.maxShield && u.maxShield > 0) {
@@ -7200,6 +8040,7 @@ function animate(now) {
             }
             const inViewport = window.isWorldPosInViewport(u.mesh.position.x, u.mesh.position.y, u.mesh.position.z, 3.8);
             u.mesh.visible = inViewport;
+            const isSelectedUnit = state.selectedUnits.includes(u);
             let moving = false;
             const envTactical = (!u.isAir && typeof window.getEnvironmentalTacticalModifiers === 'function')
                 ? window.getEnvironmentalTacticalModifiers(u.mesh.position.x, u.mesh.position.z, false, !!u.isVehicle)
@@ -7225,7 +8066,7 @@ function animate(now) {
                         if (inViewport) {
                             updateUnitAnimation(u.mesh, dt, moving, null);
                             updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
-                            projectToScreen(u.hb.root, u.mesh.position, 1.55);
+                            projectToScreen(u.hb.root, u.mesh.position, 1.55, isSelectedUnit);
                         } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
                             u.hb.root.style.display = 'none';
                         }
@@ -7237,38 +8078,36 @@ function animate(now) {
             }
 
             // --- FORWARD DROPSHIP AI WITH ANTI-AIR THREAT EVASION ('transport') ---
-            // Flies near enemy territory (dedicated slot outside enemy perimeter) to deploy troops,
-            // and automatically GOES BACK toward friendly base if any air-shooting enemy threatens it (or when enemy base is destroyed)!
             if (u.type === 'transport') {
-                const allDropships = units.filter(x => x.type === 'transport');
+                const allDropships = UNIT_COUNTS.dropships;
                 const myIndex = Math.max(0, allDropships.indexOf(u));
 
-                // Detect if any air-shooting enemy (spitter, mutalisk, behemoth, or spine_turret) is within threat radius (17.5m)
                 let airShootingThreat = null;
                 let minThreatDist = 17.5;
-                enemies.forEach(e => {
-                    if (e.hp <= 0) return;
+                for (let ei = 0; ei < enemies.length; ei++) {
+                    const e = enemies[ei];
+                    if (e.hp <= 0) continue;
                     const shootsAir = (e.variant === 'spitter' || e.variant === 'mutalisk' || e.variant === 'behemoth' || e.range >= 4.0);
-                    if (!shootsAir) return;
+                    if (!shootsAir) continue;
                     const d = Math.hypot(e.mesh.position.x - u.mesh.position.x, e.mesh.position.z - u.mesh.position.z);
                     if (d < minThreatDist) {
                         minThreatDist = d;
                         airShootingThreat = e;
                     }
-                });
-                enemyBuildings.forEach(eb => {
-                    if (eb.hp <= 0 || eb.role !== 'spine_turret') return;
+                }
+                for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                    const eb = enemyBuildings[ebi];
+                    if (eb.hp <= 0 || eb.role !== 'spine_turret') continue;
                     const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
                     if (d < minThreatDist) {
                         minThreatDist = d;
                         airShootingThreat = eb;
                     }
-                });
+                }
 
                 const slotAngles = [0.78, 1.32, 0.35, 1.75, 2.15];
                 const slotAng = slotAngles[myIndex % slotAngles.length];
 
-                // Determine Forward Enemy Territory Drop Zone vs Safe Friendly Base Fallback Position
                 const hasEnemyTerritory = enemyBuildings.length > 0;
                 const enemyAnchor = hasEnemyTerritory ? enemyBuildings[0].pos : ENEMY_BASE_POS;
                 const standoffDist = 19.5 + (myIndex % 2) * 4.5;
@@ -7279,7 +8118,7 @@ function animate(now) {
                 const safeHomeZ = THREE.MathUtils.clamp(mainBaseAnchor.z + Math.sin(slotAng) * (7.5 + myIndex * 2.5), -102, 102);
 
                 if (airShootingThreat) {
-                    u.evasionTimer = 3.6; // Sustain pullback toward friendly base when air-shooting enemy is near
+                    u.evasionTimer = 3.6;
                 } else if (u.evasionTimer > 0) {
                     u.evasionTimer = Math.max(0, u.evasionTimer - dt);
                 }
@@ -7317,14 +8156,13 @@ function animate(now) {
 
                 smoothAirVehicleTransform(u, lookX, lookZ, 6.2, moving, dt);
 
-                // Deploy Infantry Squads when near enemy territory (or rapid drop right as it turns back from an anti-air threat)
                 u.dropTimer -= dt;
                 const nearDropArea = (!shouldGoBackToBase && distToDest < 8.5) || (airShootingThreat && u.dropTimer <= 0.8);
                 if (u.dropTimer <= 0 && nearDropArea && hasEnemyTerritory) {
-                    const hasActiveBarracks = buildings.some(b => b.type === 'barracks' && b.hp > 0 && b.buildProgress >= 1.0);
+                    const hasActiveBarracks = BUILDING_COUNTS.activeBarracks > 0;
                     if (!hasActiveBarracks) {
                         u.dropTimer = 4.5;
-                    } else if (units.filter(x => !x.isAir).length < 24) {
+                    } else if (UNIT_COUNTS.ground < 24) {
                         const clearDrop = typeof findClearSpawnPoint === 'function'
                             ? findClearSpawnPoint(u.mesh.position.x, u.mesh.position.z, enemyAnchor.x, enemyAnchor.z, 0.55, buildings, enemyBuildings, units)
                             : new THREE.Vector3(u.mesh.position.x, getTerrainHeight(u.mesh.position.x, u.mesh.position.z), u.mesh.position.z);
@@ -7337,9 +8175,13 @@ function animate(now) {
                     }
                 }
 
-                updateUnitAnimation(u.mesh, dt, moving, null);
-                u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
-                projectToScreen(u.hb.root, u.mesh.position, 1.25);
+                if (inViewport) {
+                    updateUnitAnimation(u.mesh, dt, moving, null);
+                    updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                    projectToScreen(u.hb.root, u.mesh.position, 1.25, isSelectedUnit);
+                } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                    u.hb.root.style.display = 'none';
+                }
                 return;
             }
 
@@ -7356,9 +8198,13 @@ function animate(now) {
                             checkAndUnstickGroundUnit(u, navPt, dt);
                         }
                         u.healBeam.visible = false;
-                        updateUnitAnimation(u.mesh, dt, moving, null);
-                        u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
-                        projectToScreen(u.hb.root, u.mesh.position, 1.5);
+                        if (inViewport) {
+                            updateUnitAnimation(u.mesh, dt, moving, null);
+                            updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                            projectToScreen(u.hb.root, u.mesh.position, 1.5, isSelectedUnit);
+                        } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                            u.hb.root.style.display = 'none';
+                        }
                         return;
                     } else {
                         u.order = 'auto';
@@ -7369,7 +8215,8 @@ function animate(now) {
                 let injuredBioAlly = null, minAllyDist = Infinity, bestMedicScore = -Infinity;
                 let isTargetBridgeCongested = false;
 
-                units.forEach(ally => {
+                for (let ai = 0; ai < units.length; ai++) {
+                    const ally = units[ai];
                     if (ally !== u && ally.isBiological && !ally.isMechanical && ally.type !== 'medic') {
                         const d = u.mesh.position.distanceTo(ally.mesh.position);
                         const missingRatio = Math.max(0, (ally.maxHp - ally.hp) / Math.max(1, ally.maxHp));
@@ -7378,7 +8225,6 @@ function animate(now) {
                             && ally.mesh.position.z > -1.0;
                         const isRearQueuedOrStuck = (ally.stuckTimer || 0) > 0.08 || (nearBridgeRear && (ally.stuckTimer || 0) > 0.03);
 
-                        // Prioritize injured allies first, plus a strong assist bonus for units stuck/queued at the back of the bridge
                         if (missingRatio > 0.01 || isRearQueuedOrStuck) {
                             const score = missingRatio * 120 + (isRearQueuedOrStuck ? 48 : 0) + (nearBridgeRear ? 18 : 0) - d * 1.35;
                             if (score > bestMedicScore) {
@@ -7389,15 +8235,15 @@ function animate(now) {
                             }
                         }
                     }
-                });
+                }
                 if (!injuredBioAlly) {
-                    units.forEach(ally => {
+                    for (let ai = 0; ai < units.length; ai++) {
+                        const ally = units[ai];
                         if (ally !== u && ally.isBiological && !ally.isMechanical && ally.type !== 'medic') {
                             const d = u.mesh.position.distanceTo(ally.mesh.position);
                             const nearBridgeRear = typeof getRiverDist === 'function'
                                 && getRiverDist(ally.mesh.position.x, ally.mesh.position.z) < (RIVER_HALF_WIDTH + 10.5)
                                 && ally.mesh.position.z > 0;
-                            // Bias toward escorting units at the rear of a bridge crossing if they are still trying to cross
                             const effectiveDist = nearBridgeRear ? d * 0.55 : d;
                             if (effectiveDist < minAllyDist) {
                                 minAllyDist = d;
@@ -7405,26 +8251,25 @@ function animate(now) {
                                 isTargetBridgeCongested = nearBridgeRear || (ally.stuckTimer || 0) > 0.06;
                             }
                         }
-                    });
+                    }
                 }
 
                 if (injuredBioAlly) {
                     const rawDest = injuredBioAlly.mesh.position;
-                    // Move much closer when an ally is injured or queued/unable to cross at the back of the bridge!
                     const desiredApproachDist = isTargetBridgeCongested ? 1.35 : (injuredBioAlly.hp < injuredBioAlly.maxHp ? u.range * 0.58 : u.range * 0.72);
 
                     if (minAllyDist <= u.range && injuredBioAlly.hp < injuredBioAlly.maxHp) {
                         alignGroundUnitToTerrain(u.mesh, rawDest.x, rawDest.z, dt);
                         injuredBioAlly.hp = Math.min(injuredBioAlly.maxHp, injuredBioAlly.hp + 28 * dt);
 
-                        const start = u.mesh.position.clone().add(new THREE.Vector3(0, 0.75, 0));
-                        const end = rawDest.clone().add(new THREE.Vector3(0, 0.75, 0));
-                        const dist = start.distanceTo(end);
+                        _beamStartScratch.set(u.mesh.position.x, u.mesh.position.y + 0.75, u.mesh.position.z);
+                        _beamEndScratch.set(rawDest.x, rawDest.y + 0.75, rawDest.z);
+                        const dist = _beamStartScratch.distanceTo(_beamEndScratch);
                         const bioPulse = 0.85 + Math.sin(now * 0.015) * 0.35;
                         u.healBeam.visible = true;
-                        u.healBeam.position.lerpVectors(start, end, 0.5);
+                        u.healBeam.position.lerpVectors(_beamStartScratch, _beamEndScratch, 0.5);
                         u.healBeam.scale.set(bioPulse, bioPulse, dist);
-                        u.healBeam.lookAt(end);
+                        u.healBeam.lookAt(_beamEndScratch);
 
                         if (u.cooldown <= 0) {
                             spawnMedicBioPulseFX(rawDest);
@@ -7433,7 +8278,6 @@ function animate(now) {
                             u.cooldown = 0.85;
                         }
 
-                        // Even while healing in range, step closer if the target is queued at the back of the bridge
                         if (minAllyDist > desiredApproachDist && u.order !== 'hold') {
                             const navPt = getGroundNavigationWaypoint(u.mesh.position, rawDest, u);
                             const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed * 0.85, dt, u, units, buildings, enemyBuildings);
@@ -7459,22 +8303,23 @@ function animate(now) {
                     u.healBeam.visible = false;
                 }
 
-                updateUnitAnimation(u.mesh, dt, moving, null);
-                u.hb.bar.style.width = `${Math.max(0, (u.hp / u.maxHp) * 100)}%`;
-                projectToScreen(u.hb.root, u.mesh.position, 1.5);
+                if (inViewport) {
+                    updateUnitAnimation(u.mesh, dt, moving, null);
+                    updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
+                    projectToScreen(u.hb.root, u.mesh.position, 1.5, isSelectedUnit);
+                } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
+                    u.hb.root.style.display = 'none';
+                }
                 return;
             }
 
             // --- SMARTER VALKYRIE VARIABLE-FIGHTER & SEMI-MECH AI ---
-            // Automatically chooses Flight Mode to traverse long distances, rivers, bridges, or complex obstructed terrain fast,
-            // intercepts Air threats in Flight Mode, and smoothly lands into Semi-Mech Walker Mode when arriving at Ground targets!
             if (u.type === 'valkyrie') {
                 u.modeSwitchCooldown = Math.max(0, (u.modeSwitchCooldown || 0) - dt);
                 if (u.manualModeLockTimer > 0) {
                     u.manualModeLockTimer = Math.max(0, u.manualModeLockTimer - dt);
                 }
 
-                // Scan for closest Air threat and closest Ground target across the battlefield
                 let closestAirEnemy = null, minAirDist = Infinity;
                 let closestGroundEnemy = null, minGroundDist = Infinity;
                 for (let ei = 0; ei < enemies.length; ei++) {
@@ -7495,7 +8340,6 @@ function animate(now) {
                     if (d < minBldDist) { minBldDist = d; closestEnemyBld = eb; }
                 }
 
-                // Determine primary tactical destination for navigation/terrain analysis
                 let navGoalPos = null;
                 if ((u.order === 'move' || u.order === 'retreat' || u.order === 'attack_move') && u.orderTarget) {
                     navGoalPos = u.orderTarget;
@@ -7514,7 +8358,6 @@ function animate(now) {
                         ? Math.hypot(navGoalPos.x - u.mesh.position.x, navGoalPos.z - u.mesh.position.z)
                         : 0;
 
-                    // Detect complex terrain between Valkyrie and its destination (river crossing, bridge detour, cliff slope, or stuck)
                     let complexTerrainAhead = false;
                     if (navGoalPos && distToGoal > 9.5) {
                         if (typeof getRiverCoords === 'function') {
@@ -7567,7 +8410,6 @@ function animate(now) {
                 u.manualSiegeLockTimer = Math.max(0, (u.manualSiegeLockTimer || 0) - dt);
                 const targetTr = u.siegeMode ? 1.0 : 0.0;
                 const curTr = u.mesh.userData.siegeTransition || 0.0;
-                // Smooth 3.6-second (under 5s) hydraulic Siege / Unsiege animation
                 if (Math.abs(targetTr - curTr) > 0.001) {
                     u.mesh.userData.siegeTransition = curTr + Math.sign(targetTr - curTr) * Math.min(Math.abs(targetTr - curTr), dt / 3.6);
                 } else {
@@ -7575,7 +8417,6 @@ function animate(now) {
                 }
                 isSiegeTransitioning = (u.siegeTransitionTimer > 0) || (Math.abs(targetTr - (u.mesh.userData.siegeTransition || 0)) > 0.02);
 
-                // When in Siege Mode or mid-transition, hard-anchor the tank chassis at u.anchoredPos and u.anchoredYaw so the tank body CANNOT move or rotate at all!
                 if (u.siegeMode || isSiegeTransitioning) {
                     if (!u.anchoredPos) u.anchoredPos = u.mesh.position.clone();
                     if (u.anchoredYaw === undefined) {
@@ -7590,9 +8431,6 @@ function animate(now) {
                 }
             }
 
-            // --- TANK & SIEGE TANK TACTICAL RETREAT & ESCORT AI ---
-            // If too many enemies charge the tank while too few friendly defenders escort it, the tank automatically
-            // retreats toward friendly defenders (or Main Base HQ) until enough friendly units are nearby to defend it, then advances to shoot!
             if ((u.type === 'tank' || u.type === 'siege_tank') && u.order !== 'hold' && u.order !== 'move') {
                 let chargingEnemies = 0;
                 let closeDeadzoneEnemies = 0;
@@ -7632,17 +8470,14 @@ function animate(now) {
 
                 if (overwhelmedBySwarm) {
                     u.tankTacticalRetreat = true;
-                    // If Siege Tank is in Siege Mode while overwhelmed at close range, immediately unsiege so it can retreat!
                     if (u.type === 'siege_tank' && u.siegeMode && !isSiegeTransitioning && u.siegeSwitchCooldown <= 0) {
                         setSiegeTankMode(u, false, false);
                         isSiegeTransitioning = true;
                     }
                 } else if (u.tankTacticalRetreat && (escortAllies >= 3 || chargingEnemies === 0)) {
-                    // Enough friendly units are now defending the tank (or threat cleared) — advance back near the enemy to shoot!
                     u.tankTacticalRetreat = false;
                 }
 
-                // Execute Tank Tactical Retreat movement when mobile and not locked in Siege Mode
                 if (u.tankTacticalRetreat && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning)) && effSpeed > 0.01) {
                     const fallbackDest = nearestDefenderClusterPos || mainBaseAnchor;
                     let retreatPt = fallbackDest;
@@ -7657,7 +8492,8 @@ function animate(now) {
                         const toBaseLen = Math.hypot(toBaseX, toBaseZ) || 1;
                         const rx = THREE.MathUtils.clamp(u.mesh.position.x + ((awayX / awayLen) * 0.55 + (toBaseX / toBaseLen) * 0.45) * 9.0, -100, 100);
                         const rz = THREE.MathUtils.clamp(u.mesh.position.z + ((awayZ / awayLen) * 0.55 + (toBaseZ / toBaseLen) * 0.45) * 9.0, -100, 100);
-                        retreatPt = new THREE.Vector3(rx, getTerrainHeight(rx, rz), rz);
+                        if (!u._retreatScratch) u._retreatScratch = new THREE.Vector3();
+                        retreatPt = u._retreatScratch.set(rx, getTerrainHeight(rx, rz), rz);
                     }
                     const navPt = getGroundNavigationWaypoint(u.mesh.position, retreatPt, u);
                     const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed, dt, u, units, buildings, enemyBuildings);
@@ -7671,57 +8507,58 @@ function animate(now) {
             }
 
             if (u.type === 'siege_tank' && !u.tankTacticalRetreat) {
-                // Auto-Siege AI when cooldown & transition are ready and not manually locked
                 if (!isSiegeTransitioning && u.siegeSwitchCooldown <= 0 && u.manualSiegeLockTimer <= 0) {
                     if ((u.order === 'move' || u.order === 'retreat') && u.orderTarget) {
                         if (u.siegeMode) setSiegeTankMode(u, false, false);
                     } else {
                         let validSiegeBandDist = Infinity;
                         let closestEnemyDist = Infinity;
-                        enemies.forEach(e => {
-                            if (e.hp <= 0 || e.isAir) return;
+                        for (let ei = 0; ei < enemies.length; ei++) {
+                            const e = enemies[ei];
+                            if (e.hp <= 0 || e.isAir) continue;
                             const ex = e.mesh.position.x, ez = e.mesh.position.z;
                             const d = Math.hypot(ex - u.mesh.position.x, ez - u.mesh.position.z);
-                            if (d > 28.5 && !isWorldPosVisible(ex, ez)) return;
+                            if (d > 28.5 && !isWorldPosVisible(ex, ez)) continue;
                             if (d < closestEnemyDist) closestEnemyDist = d;
                             if (d >= SIEGE_MIN_RANGE && d <= 28.5 && d < validSiegeBandDist) {
                                 validSiegeBandDist = d;
                             }
-                        });
-                        enemyBuildings.forEach(eb => {
+                        }
+                        for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                            const eb = enemyBuildings[ebi];
                             const d = Math.hypot(eb.pos.x - u.mesh.position.x, eb.pos.z - u.mesh.position.z);
-                            if (d > 28.5 && !isWorldPosVisible(eb.pos.x, eb.pos.z)) return;
+                            if (d > 28.5 && !isWorldPosVisible(eb.pos.x, eb.pos.z)) continue;
                             if (d < closestEnemyDist) closestEnemyDist = d;
                             if (d >= SIEGE_MIN_RANGE && d <= 28.5 && d < validSiegeBandDist) {
                                 validSiegeBandDist = d;
                             }
-                        });
+                        }
 
                         if (!u.siegeMode && validSiegeBandDist <= 28.0 && closestEnemyDist >= SIEGE_MIN_RANGE + 1.0) {
                             setSiegeTankMode(u, true, false);
                         } else if (u.siegeMode && (validSiegeBandDist === Infinity && (closestEnemyDist < SIEGE_MIN_RANGE || closestEnemyDist > 29.5))) {
-                            // Unsiege if enemy is inside the 7.5m deadzone with no valid long-range target, or if all targets left range!
                             setSiegeTankMode(u, false, false);
                         }
                     }
                 }
             }
 
-            // In Endless Mode (or when all enemy buildings are destroyed), if ANY enemy is alive on the map, cancel auto-recall so units attack the enemy instead of returning to base!
-            if (u.order === 'retreat' && u.isAutoRecall && enemies.some(e => e && e.hp > 0)) {
+            if (u.order === 'retreat' && u.isAutoRecall && enemies.length > 0) {
                 u.order = 'auto';
                 u.orderTarget = null;
                 u.isAutoRecall = false;
             }
 
-            // Pure Move OR Retreat Order: march/fly straight to destination before re-engaging (Siege Tank in Siege Mode or mid-transition cannot move!)
             if ((u.order === 'move' || u.order === 'retreat') && u.orderTarget && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning))) {
                 const distToDest = Math.hypot(u.orderTarget.x - u.mesh.position.x, u.orderTarget.z - u.mesh.position.z);
                 if (distToDest > 1.35) {
                     const navPt = u.isAir ? u.orderTarget : getGroundNavigationWaypoint(u.mesh.position, u.orderTarget, u);
                     if (u.isAir) {
-                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
-                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        const dxAir = navPt.x - u.mesh.position.x;
+                        const dzAir = navPt.z - u.mesh.position.z;
+                        const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                        u.mesh.position.x += (dxAir / lenAir) * effSpeed * dt;
+                        u.mesh.position.z += (dzAir / lenAir) * effSpeed * dt;
                         smoothAirVehicleTransform(u, navPt.x, navPt.z, 6.0, true, dt);
                         moving = true;
                     } else if (effSpeed > 0.01) {
@@ -7736,7 +8573,7 @@ function animate(now) {
                     if (inViewport) {
                         updateUnitAnimation(u.mesh, dt, moving, null);
                         updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
-                        projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55);
+                        projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55, isSelectedUnit);
                     } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
                         u.hb.root.style.display = 'none';
                     }
@@ -7748,7 +8585,6 @@ function animate(now) {
                 }
             }
 
-            // Realistic Vision & Sensor-Based Target Acquisition (Units DO NOT instantly know hidden enemy locations across the map!)
             let target = null;
             let minDist = Infinity;
             let valkGroundApproachPos = null;
@@ -7846,7 +8682,7 @@ function animate(now) {
 
                 if (!target) {
                     const effectiveSensorRad = u.isMindControlled ? Math.max(localSensorRad, 28.0) : localSensorRad;
-                    target = selectSmartTarget(u.mesh.position, effectiveSensorRad, canHitAir, preferHeavy, isMeleeUnit);
+                    target = selectSmartTarget(u.mesh.position, effectiveSensorRad, canHitAir, preferHeavy, isMeleeUnit, u);
                     minDist = target ? Math.hypot((target.mesh ? target.mesh.position.x : target.pos.x) - u.mesh.position.x, (target.mesh ? target.mesh.position.z : target.pos.z) - u.mesh.position.z) : Infinity;
                 }
 
@@ -7922,13 +8758,13 @@ function animate(now) {
             // GUNSHIP HELICOPTER UNDER-BELLY MINIGUN TURRET:
             if (u.type === 'heli' && target && minDist <= u.range + 2.5) {
                 const tPos = target.mesh ? target.mesh.position : target.pos;
-                aimTargetPos = tPos.clone().add(new THREE.Vector3(0, 0.5, 0));
+                aimTargetPos = _aimScratch.set(tPos.x, (tPos.y || 0) + 0.5, tPos.z);
                 u.bellyCooldown = (u.bellyCooldown || 0) - dt;
                 if (u.bellyCooldown <= 0) {
                     const bellyMuzzleObj = u.mesh.userData.bellyMuzzle || u.mesh.userData.bellyTurret;
                     const bellyMuzzle = bellyMuzzleObj
-                        ? bellyMuzzleObj.getWorldPosition(new THREE.Vector3())
-                        : u.mesh.position.clone().add(new THREE.Vector3(0, -0.38, 0));
+                        ? bellyMuzzleObj.getWorldPosition(_muzzleScratch)
+                        : _muzzleScratch.set(u.mesh.position.x, u.mesh.position.y - 0.38, u.mesh.position.z);
                     launchOrdProjectile(bellyMuzzle, target, 'mg', 11);
                     if (typeof triggerHeliBellyMinigunFlash === 'function') {
                         triggerHeliBellyMinigunFlash(u.mesh);
@@ -7940,21 +8776,19 @@ function animate(now) {
             }
 
             // TANK & SIEGE TANK TURRET FIRE CONTROL:
-            // - Enforces Siege Mode 7.5m minimum range deadzone (cannot shoot when enemies are near!)
-            // - Strictly blocks turret shooting during BOTH Siege and Unsiege animations (`!isSiegeTransitioning`) until the 3.6s animation is 100% finished!
             const canSiegeFireAtDist = !(u.type === 'siege_tank' && u.siegeMode && minDist < SIEGE_MIN_RANGE);
             if ((u.type === 'tank' || u.type === 'siege_tank') && target && canSiegeFireAtDist && minDist <= u.range + (enemyBuildings.includes(target) ? 2.5 : 0)) {
                 const tPos = target.mesh ? target.mesh.position : target.pos;
                 const trReady = u.type !== 'siege_tank' || !isSiegeTransitioning;
                 if (trReady) {
-                    aimTargetPos = tPos.clone().add(new THREE.Vector3(0, 0.5, 0));
+                    aimTargetPos = _aimScratch.set(tPos.x, (tPos.y || 0) + 0.5, tPos.z);
                 }
                 if (u.damage > 0 && u.cooldown <= 0 && trReady) {
                     u.mesh.userData.attackAnim = 1.0;
                     const muzzleObj = u.mesh.userData.tankMuzzleFlash || u.mesh.userData.cannonBarrel || u.mesh.userData.cannonPivot;
                     const muzzle = muzzleObj
-                        ? muzzleObj.getWorldPosition(new THREE.Vector3())
-                        : u.mesh.position.clone().add(new THREE.Vector3(0, 0.75, 0));
+                        ? muzzleObj.getWorldPosition(_muzzleScratch)
+                        : _muzzleScratch.set(u.mesh.position.x, u.mesh.position.y + 0.75, u.mesh.position.z);
                     launchOrdProjectile(muzzle, target, u.type, u.damage);
                     if (typeof triggerTankCannonMuzzleFlash === 'function') {
                         triggerTankCannonMuzzleFlash(u.mesh, muzzle, tPos);
@@ -7971,8 +8805,11 @@ function animate(now) {
                 if (distToDest > 1.4) {
                     const navPt = u.isAir ? u.orderTarget : getGroundNavigationWaypoint(u.mesh.position, u.orderTarget, u);
                     if (u.isAir) {
-                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
-                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        const dxAir = navPt.x - u.mesh.position.x;
+                        const dzAir = navPt.z - u.mesh.position.z;
+                        const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                        u.mesh.position.x += (dxAir / lenAir) * effSpeed * dt;
+                        u.mesh.position.z += (dzAir / lenAir) * effSpeed * dt;
                         smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
                         moving = true;
                     } else if (effSpeed > 0.01) {
@@ -7990,12 +8827,11 @@ function animate(now) {
                 }
             } else if (target) {
                 const tPos = target.mesh ? target.mesh.position : target.pos;
-                if (!aimTargetPos) aimTargetPos = tPos.clone().add(new THREE.Vector3(0, target.isAir ? 0.0 : 0.5, 0));
+                if (!aimTargetPos) aimTargetPos = _aimScratch.set(tPos.x, (tPos.y || 0) + (target.isAir ? 0.0 : 0.5), tPos.z);
                 const targetFootprint = enemyBuildings.includes(target) ? 2.5 : ((u.radius || 0.55) + (target.radius || 0.65) + 0.55);
                 const stopRange = enemyBuildings.includes(target) ? u.range + 2.5 : Math.max(u.range, targetFootprint);
                 const flatDist = Math.hypot(tPos.x - u.mesh.position.x, tPos.z - u.mesh.position.z);
 
-                // Engage immediately when within stopRange without backtracking
                 if (flatDist <= stopRange) {
                     if (u.isAir) {
                         if (u.type === 'heli') {
@@ -8011,25 +8847,30 @@ function animate(now) {
 
                     if (u.damage > 0 && u.cooldown <= 0 && u.type !== 'tank' && u.type !== 'siege_tank') {
                         u.mesh.userData.attackAnim = 1.0;
-                        let muzzle = u.mesh.position.clone().add(new THREE.Vector3(0, u.isAir ? (u.type === 'reaper' ? 0.65 : -0.25) : 0.75, 0));
+                        let muzzle = _muzzleScratch.set(u.mesh.position.x, u.mesh.position.y + (u.isAir ? (u.type === 'reaper' ? 0.65 : -0.25) : 0.75), u.mesh.position.z);
                         if (u.type === 'heli' && u.mesh.userData.bellyMuzzle) {
-                            muzzle = u.mesh.userData.bellyMuzzle.getWorldPosition(new THREE.Vector3());
+                            muzzle = u.mesh.userData.bellyMuzzle.getWorldPosition(_muzzleScratch);
                         } else if (u.type === 'hero' && u.mesh.userData.gunMuzzle) {
-                            muzzle = u.mesh.userData.gunMuzzle.getWorldPosition(new THREE.Vector3());
+                            muzzle = u.mesh.userData.gunMuzzle.getWorldPosition(_muzzleScratch);
                         }
                         const isMeleeStrike = (u.type === 'grunt' || u.type === 'zealot' || u.type === 'skitterer' || u.type === 'crusher' || u.type === 'burster');
                         if (!isMeleeStrike && u.range > 2.35) {
                             if (u.type === 'valkyrie') {
-                                const rightVec = new THREE.Vector3(Math.cos(u.currentYaw || u.mesh.rotation.y || 0), 0, -Math.sin(u.currentYaw || u.mesh.rotation.y || 0));
+                                const rx = Math.cos(u.currentYaw || u.mesh.rotation.y || 0);
+                                const rz = -Math.sin(u.currentYaw || u.mesh.rotation.y || 0);
                                 if (!u.mechMode) {
                                     if (target && target.isAir) {
-                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.95), target, 'valk_aa', u.damage);
-                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.95), target, 'valk_aa', u.damage);
+                                        _muzzleScratch2.set(muzzle.x - rx * 0.95, muzzle.y, muzzle.z - rz * 0.95);
+                                        launchOrdProjectile(_muzzleScratch2, target, 'valk_aa', u.damage);
+                                        _muzzleScratch2.set(muzzle.x + rx * 0.95, muzzle.y, muzzle.z + rz * 0.95);
+                                        launchOrdProjectile(_muzzleScratch2, target, 'valk_aa', u.damage);
                                     }
                                 } else {
                                     if (target && !target.isAir) {
-                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.58), target, 'valk_mech', u.damage);
-                                        launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.58), target, 'valk_mech', u.damage);
+                                        _muzzleScratch2.set(muzzle.x - rx * 0.58, muzzle.y, muzzle.z - rz * 0.58);
+                                        launchOrdProjectile(_muzzleScratch2, target, 'valk_mech', u.damage);
+                                        _muzzleScratch2.set(muzzle.x + rx * 0.58, muzzle.y, muzzle.z + rz * 0.58);
+                                        launchOrdProjectile(_muzzleScratch2, target, 'valk_mech', u.damage);
                                         ejectBrassCasing(muzzle);
                                     }
                                 }
@@ -8037,39 +8878,43 @@ function animate(now) {
                                 launchOrdProjectile(muzzle, target, 'sunlance', u.damage);
                                 u.heroShotCounter = ((u.heroShotCounter || 0) + 1) % 3;
                                 if (u.heroShotCounter === 0) {
-                                    const shoulderPos = u.mesh.position.clone().add(new THREE.Vector3(0, 1.35, 0));
-                                    launchOrdProjectile(shoulderPos, target, 'rocket', Math.round(u.damage * 0.85));
+                                    _muzzleScratch2.set(u.mesh.position.x, u.mesh.position.y + 1.35, u.mesh.position.z);
+                                    launchOrdProjectile(_muzzleScratch2, target, 'rocket', Math.round(u.damage * 0.85));
                                 }
                             } else if (u.type === 'firebat') {
                                 if (typeof triggerFirebatFlameStreamFX === 'function') {
                                     triggerFirebatFlameStreamFX(muzzle, tPos);
                                 }
-                                enemies.forEach(e => {
+                                for (let ei = 0; ei < enemies.length; ei++) {
+                                    const e = enemies[ei];
                                     const d = Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z);
                                     if (d <= 3.0) {
                                         recordRagdollHitImpulse(e, u.mesh.position, false);
                                         e.hp -= u.damage;
                                         spawnCombatFloat(e.mesh.position, u.damage, '#ff5500');
                                     }
-                                });
-                                enemyBuildings.forEach(eb => {
+                                }
+                                for (let ebi = 0; ebi < enemyBuildings.length; ebi++) {
+                                    const eb = enemyBuildings[ebi];
                                     const d = Math.hypot(eb.pos.x - tPos.x, eb.pos.z - tPos.z);
                                     if (d <= 3.2) {
                                         eb.hp -= u.damage;
                                         spawnCombatFloat(eb.pos, u.damage, '#ff5500');
                                         updateHUD();
                                     }
-                                });
+                                }
                             } else if (u.type === 'marauder') {
                                 launchOrdProjectile(muzzle, target, 'marauder', u.damage);
                             } else if (u.type === 'rocketman') {
                                 launchOrdProjectile(muzzle, target, 'rocket', u.damage);
                             } else if (u.type === 'reaper') {
-                                const rightVec = new THREE.Vector3(Math.cos(u.currentYaw || 0), 0, -Math.sin(u.currentYaw || 0));
-                                launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, -0.22), target, 'reaper', u.damage);
-                                launchOrdProjectile(muzzle.clone().addScaledVector(rightVec, 0.22), target, 'reaper', Math.round(u.damage * 0.65));
+                                const rx = Math.cos(u.currentYaw || 0);
+                                const rz = -Math.sin(u.currentYaw || 0);
+                                _muzzleScratch2.set(muzzle.x - rx * 0.22, muzzle.y, muzzle.z - rz * 0.22);
+                                launchOrdProjectile(_muzzleScratch2, target, 'reaper', u.damage);
+                                _muzzleScratch2.set(muzzle.x + rx * 0.22, muzzle.y, muzzle.z + rz * 0.22);
+                                launchOrdProjectile(_muzzleScratch2, target, 'reaper', Math.round(u.damage * 0.65));
                             } else {
-                                // Friendly ranged unit or Mind-Controlled Zerg ranged bio-unit (isEnemyAcid = false so it damages enemies!)
                                 launchOrdProjectile(muzzle, target, u.type, u.damage, false);
                             }
                             if (u.type === 'heli' && typeof triggerHeliBellyMinigunFlash === 'function') {
@@ -8080,7 +8925,6 @@ function animate(now) {
                             }
                             if (!u.isAir && !u.isMindControlled && u.type !== 'rocketman' && u.type !== 'hero' && u.type !== 'firebat' && u.type !== 'marauder') ejectBrassCasing(muzzle);
                         } else {
-                            // Close-Quarter Melee Strike (Grunt Shock-Blade, Zealot Psi-Blades, or Mind-Controlled Zerg Claws/Burster!)
                             recordRagdollHitImpulse(target, u.mesh.position, u.type === 'crusher' || u.type === 'burster');
                             target.hp -= u.damage;
                             if (typeof triggerSparks === 'function' && !u.isMindControlled) {
@@ -8094,17 +8938,17 @@ function animate(now) {
                         u.cooldown = u.fireRate;
                     }
 
-                    // WALKING & SHOOTING RANK-STEPPING FOR NON-MELEE ARMED UNITS:
-                    // Ranged non-melee units continue advancing closer toward the enemy (down to ~56% of their max weapon range)
-                    // while shooting on the move so that units behind them can step into range and shoot as well instead of being blocked!
                     const isRangedGroundShooter = !u.isAir && u.order !== 'hold' && u.range > 2.35 && u.type !== 'tank' && u.type !== 'siege_tank';
                     if (isRangedGroundShooter && effSpeed > 0.01) {
                         const desiredAdvanceBand = Math.max(3.0, u.range * 0.56);
-                        if (flatDist > desiredAdvanceBand) {
-                            const navPt = getGroundNavigationWaypoint(u.mesh.position, tPos, u);
-                            const stepDir = computeSafeGroundStep(u.mesh.position, navPt, effSpeed * 0.74, dt, u, units, buildings, enemyBuildings);
+                        const clearLane = hasClearFiringLane(u, tPos);
+                        if (!clearLane || flatDist > desiredAdvanceBand) {
+                            const slotGoal = !clearLane ? findOpenFiringSlot(u, tPos) : tPos;
+                            const navPt = getGroundNavigationWaypoint(u.mesh.position, slotGoal, u);
+                            const stepSpd = !clearLane ? effSpeed * 0.90 : effSpeed * 0.74;
+                            const stepDir = computeSafeGroundStep(u.mesh.position, navPt, stepSpd, dt, u, units, buildings, enemyBuildings);
                             if (stepDir.lengthSq() > 0.0001) {
-                                u.mesh.position.addScaledVector(stepDir, effSpeed * 0.74 * dt);
+                                u.mesh.position.addScaledVector(stepDir, stepSpd * dt);
                                 alignGroundUnitToTerrain(u.mesh, tPos.x, tPos.z, dt);
                                 moving = true;
                             }
@@ -8113,8 +8957,11 @@ function animate(now) {
                 } else if (u.order !== 'hold' && !u.tankTacticalRetreat && !(u.type === 'siege_tank' && (u.siegeMode || isSiegeTransitioning))) {
                     const navPt = u.isAir ? tPos : getGroundNavigationWaypoint(u.mesh.position, tPos, u);
                     if (u.isAir) {
-                        const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
-                        u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                        const dxAir = navPt.x - u.mesh.position.x;
+                        const dzAir = navPt.z - u.mesh.position.z;
+                        const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                        u.mesh.position.x += (dxAir / lenAir) * effSpeed * dt;
+                        u.mesh.position.z += (dzAir / lenAir) * effSpeed * dt;
                         smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
                         moving = true;
                     } else if (effSpeed > 0.01) {
@@ -8132,20 +8979,19 @@ function animate(now) {
                     smoothAirVehicleTransform(u, holdLookX, holdLookZ, unitFlyAlt, false, dt);
                 }
             } else if (u.type === 'valkyrie' && !u.mechMode && valkGroundApproachPos && u.order !== 'hold') {
-                // Flight Mode has no flying targets: fly toward the ground combat zone so it can land into Mech Mode (never fires from air!)
                 const distToGnd = Math.hypot(valkGroundApproachPos.x - u.mesh.position.x, valkGroundApproachPos.z - u.mesh.position.z);
                 if (distToGnd > 8.0) {
-                    const dir = new THREE.Vector3(valkGroundApproachPos.x - u.mesh.position.x, 0, valkGroundApproachPos.z - u.mesh.position.z).normalize();
-                    u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                    const dxAir = valkGroundApproachPos.x - u.mesh.position.x;
+                    const dzAir = valkGroundApproachPos.z - u.mesh.position.z;
+                    const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                    u.mesh.position.x += (dxAir / lenAir) * effSpeed * dt;
+                    u.mesh.position.z += (dzAir / lenAir) * effSpeed * dt;
                     smoothAirVehicleTransform(u, valkGroundApproachPos.x, valkGroundApproachPos.z, 6.0, true, dt);
                     moving = true;
                 } else {
                     smoothAirVehicleTransform(u, valkGroundApproachPos.x, valkGroundApproachPos.z, 6.0, false, dt);
                 }
             } else if (u.order !== 'hold' && !(u.type === 'siege_tank' && u.siegeMode)) {
-                // AUTO-SCOUT BASE CHECK & ENDLESS MODE BEHAVIOR:
-                // In Endless Mode (or when enemyBuildings.length === 0): ONLY come back to main base when there are NO enemies on the map;
-                // as soon as any enemy exists, march directly to attack the enemy instead of returning to the main base!
                 if (enemyBuildings.length === 0) {
                     let nearestEnemy = null;
                     let bestEDist = Infinity;
@@ -8159,7 +9005,8 @@ function animate(now) {
                         }
                     }
                     if (nearestEnemy) {
-                        u.patrolTarget = new THREE.Vector3(
+                        if (!u.patrolTarget) u.patrolTarget = new THREE.Vector3();
+                        u.patrolTarget.set(
                             nearestEnemy.mesh.position.x,
                             getTerrainHeight(nearestEnemy.mesh.position.x, nearestEnemy.mesh.position.z),
                             nearestEnemy.mesh.position.z
@@ -8167,23 +9014,23 @@ function animate(now) {
                     } else {
                         const arcAngle = -Math.PI * 0.5 + ((unitIdx % 10) - 4.5) * 0.22;
                         const guardRad = 7.2 + Math.floor(unitIdx / 10) * 2.4;
-                        u.patrolTarget = new THREE.Vector3(
+                        if (!u.patrolTarget) u.patrolTarget = new THREE.Vector3();
+                        u.patrolTarget.set(
                             mainBaseAnchor.x + Math.sin(arcAngle) * guardRad,
                             0,
                             mainBaseAnchor.z + Math.cos(arcAngle) * guardRad
                         );
                     }
                 } else if (state.enemyBaseDiscovered) {
-                    // Enemy Base is discovered: converge all auto units directly on the active Enemy Zerg Base structures!
                     const activeEnemyBld = enemyBuildings[unitIdx % enemyBuildings.length] || enemyBuildings[0];
                     const targetBldPos = activeEnemyBld ? activeEnemyBld.pos : (state.discoveredEnemyBasePos || ENEMY_BASE_POS);
-                    u.patrolTarget = new THREE.Vector3(
+                    if (!u.patrolTarget) u.patrolTarget = new THREE.Vector3();
+                    u.patrolTarget.set(
                         targetBldPos.x,
                         getTerrainHeight(targetBldPos.x, targetBldPos.z),
                         targetBldPos.z
                     );
                 } else {
-                    // Direct Forward Recon Progression toward Enemy Base (never orbit unwalkable ruin centers or loop back!)
                     const distToPatrol = u.patrolTarget
                         ? Math.hypot(u.patrolTarget.x - u.mesh.position.x, u.patrolTarget.z - u.mesh.position.z)
                         : 0;
@@ -8213,7 +9060,8 @@ function animate(now) {
                         const clearPt = typeof findClearSpawnPoint === 'function'
                             ? findClearSpawnPoint(rawPx, rawPz, u.mesh.position.x, u.mesh.position.z, 0.85, buildings, enemyBuildings, [])
                             : { x: rawPx, z: rawPz };
-                        u.patrolTarget = new THREE.Vector3(clearPt.x, getTerrainHeight(clearPt.x, clearPt.z), clearPt.z);
+                        if (!u.patrolTarget) u.patrolTarget = new THREE.Vector3();
+                        u.patrolTarget.set(clearPt.x, getTerrainHeight(clearPt.x, clearPt.z), clearPt.z);
                     }
                 }
 
@@ -8222,8 +9070,11 @@ function animate(now) {
                     if (distToPatrol > 2.2) {
                         const navPt = u.isAir ? u.patrolTarget : getGroundNavigationWaypoint(u.mesh.position, u.patrolTarget, u);
                         if (u.isAir) {
-                            const dir = new THREE.Vector3(navPt.x - u.mesh.position.x, 0, navPt.z - u.mesh.position.z).normalize();
-                            u.mesh.position.addScaledVector(dir, effSpeed * dt);
+                            const dxAir = navPt.x - u.mesh.position.x;
+                            const dzAir = navPt.z - u.mesh.position.z;
+                            const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                            u.mesh.position.x += (dxAir / lenAir) * effSpeed * dt;
+                            u.mesh.position.z += (dzAir / lenAir) * effSpeed * dt;
                             smoothAirVehicleTransform(u, navPt.x, navPt.z, unitFlyAlt, true, dt);
                             moving = true;
                         } else {
@@ -8264,16 +9115,18 @@ function animate(now) {
                 }
                 updateUnitAnimation(u.mesh, dt, moving, aimTargetPos);
                 updateHealthPip(u.hb, u.hp, u.maxHp, u.shield || 0, u.maxShield || 0);
-                projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55);
+                projectToScreen(u.hb.root, u.mesh.position, u.isAir ? 1.2 : 1.55, isSelectedUnit);
             } else if (u.hb && u.hb.root && u.hb.root.style.display !== 'none') {
                 u.hb.root.style.display = 'none';
             }
         });
+        if (perfProf) perfProf.end('unitAI');
 
         // --- ZERG OVERMIND TACTICAL EVALUATION: Detect When Losing & Coordinate Multi-Corridor Flanking ---
         const isZergLosing = (units.length > enemies.length * 1.05) || (enemyBuildings.length < 4) || (state.kills >= 12);
 
         // Update Enemy Zerg Units (Ground Bio-Swarm + Flying Mutalisk Leviathans + Adaptive Flanking AI + Stuck Babyspot Calibration)
+        if (perfProf) perfProf.begin('enemyAI');
         for (let i = enemies.length - 1; i >= 0; i--) {
             const e = enemies[i];
             if (e.slowTimer && e.slowTimer > 0) e.slowTimer = Math.max(0, e.slowTimer - dt);
@@ -8310,7 +9163,6 @@ function animate(now) {
 
             e.cooldown -= dt;
 
-            // Assign or adapt tactical flanking doctrine when Zerg is losing or unit is a designated flanker
             if ((isZergLosing || e.isFlanker) && !e.flankTactic) {
                 e.isFlanker = true;
                 const tactics = ['west_bridge_pincer', 'east_bridge_pincer', 'canyon_rim_envelopment', 'rear_eco_raid'];
@@ -8327,7 +9179,6 @@ function animate(now) {
                 for (let bi = 0; bi < RIVER_BRIDGES.length; bi++) {
                     const bWorld = typeof riverCoordsToWorld === 'function' ? riverCoordsToWorld(RIVER_BRIDGES[bi].sCoord, 0) : { x: 0, z: 0 };
                     const stuckPen = typeof window.getNavStuckPenalty === 'function' ? window.getNavStuckPenalty(bWorld.x, bWorld.z) * 14.0 : 0;
-                    // Count player defensive turrets near this bridge exit
                     let turretThreat = 0;
                     for (let k = 0; k < buildings.length; k++) {
                         const b = buildings[k];
@@ -8336,7 +9187,6 @@ function animate(now) {
                             if (dB < 22.0) turretThreat += (22.0 - dB) * 1.4;
                         }
                     }
-                    // Tactical corridor bias so flanking squads split across West and East bridges
                     const tacticBias = (e.flankTactic === 'west_bridge_pincer' && bi === 0) ? -12.0
                         : ((e.flankTactic === 'east_bridge_pincer' && bi === RIVER_BRIDGES.length - 1) ? -12.0 : 0);
                     const totalScore = stuckPen + turretThreat + tacticBias;
@@ -8347,41 +9197,54 @@ function animate(now) {
                 }
                 if (bestBrIdx !== e.preferredBridgeIdx) {
                     e.preferredBridgeIdx = bestBrIdx;
-                    e.navWaypoints = null; // Recompute path through calibrated bridge
+                    e.navWaypoints = null;
                 }
             }
 
             let bestTarget = null, bestDist = Infinity, isBuildingTarget = false;
-            // Multi-Pronged Enemy Zerg Base Assault: Split enemy squads across Player Terran Base(s) AND Allied Solaris Base!
             const preferSolarisBase = (!state.solarisHostile && typeof solarisBuildings !== 'undefined' && solarisBuildings.length > 0 && (i % 3 === 0));
 
-            units.forEach(u => {
-                if (u.isAir && e.range < 4.0) return;
-                const d = Math.hypot(u.mesh.position.x - e.mesh.position.x, u.mesh.position.z - e.mesh.position.z);
-                const effectiveD = (isZergLosing && e.flankTactic === 'rear_eco_raid' && d > 7.5) ? d * 1.45 : d;
-                if (effectiveD < bestDist) { bestDist = effectiveD; bestTarget = u; isBuildingTarget = false; }
-            });
+            // Fast spatial query for nearby player units within 34m first; fall back to full units scan only if none nearby
+            const nearAlliesCount = ALLY_GRID.queryRadiusInto(e.mesh.position.x, e.mesh.position.z, 34.0, _spatialQueryBuf);
+            if (nearAlliesCount > 0) {
+                for (let ai = 0; ai < nearAlliesCount; ai++) {
+                    const u = _spatialQueryBuf[ai];
+                    if (u.isAir && e.range < 4.0) continue;
+                    const d = Math.hypot(u.mesh.position.x - e.mesh.position.x, u.mesh.position.z - e.mesh.position.z);
+                    const effectiveD = (isZergLosing && e.flankTactic === 'rear_eco_raid' && d > 7.5) ? d * 1.45 : d;
+                    if (effectiveD < bestDist) { bestDist = effectiveD; bestTarget = u; isBuildingTarget = false; }
+                }
+            } else {
+                for (let ui = 0; ui < units.length; ui++) {
+                    const u = units[ui];
+                    if (u.isAir && e.range < 4.0) continue;
+                    const d = Math.hypot(u.mesh.position.x - e.mesh.position.x, u.mesh.position.z - e.mesh.position.z);
+                    const effectiveD = (isZergLosing && e.flankTactic === 'rear_eco_raid' && d > 7.5) ? d * 1.45 : d;
+                    if (effectiveD < bestDist) { bestDist = effectiveD; bestTarget = u; isBuildingTarget = false; }
+                }
+            }
 
-            buildings.forEach(b => {
-                if (!b || b.hp <= 0) return;
+            for (let bi = 0; bi < buildings.length; bi++) {
+                const b = buildings[bi];
+                if (!b || b.hp <= 0) continue;
                 let d = Math.hypot(b.pos.x - e.mesh.position.x, b.pos.z - e.mesh.position.z);
                 if (isZergLosing && e.isFlanker && b.type !== 'turret') {
                     d *= 0.78;
                 }
                 if (preferSolarisBase && d > 14.0) d *= 1.38;
                 if (d < bestDist) { bestDist = d; bestTarget = b; isBuildingTarget = true; }
-            });
+            }
 
             if (!state.solarisHostile && typeof solarisBuildings !== 'undefined') {
-                solarisBuildings.forEach(sb => {
-                    if (!sb || sb.hp <= 0) return;
+                for (let sbi = 0; sbi < solarisBuildings.length; sbi++) {
+                    const sb = solarisBuildings[sbi];
+                    if (!sb || sb.hp <= 0) continue;
                     let d = Math.hypot(sb.pos.x - e.mesh.position.x, sb.pos.z - e.mesh.position.z);
                     if (preferSolarisBase) d *= 0.65;
                     if (d < bestDist) { bestDist = d; bestTarget = sb; isBuildingTarget = true; }
-                });
+                }
             }
 
-            // Target Fallback: Always target player's main base HQ, allied Solaris Nexus, or spawn location so enemies NEVER halt stuck!
             if (!bestTarget) {
                 if (state.baseBuilding && state.baseBuilding.hp > 0) {
                     bestTarget = state.baseBuilding;
@@ -8394,16 +9257,13 @@ function animate(now) {
                 }
             }
 
-            // Recalculate true Euclidean distance to bestTarget for engagement range checks
             if (bestTarget) {
                 const trueTPos = isBuildingTarget ? bestTarget.pos : bestTarget.mesh.position;
                 bestDist = Math.hypot(trueTPos.x - e.mesh.position.x, trueTPos.z - e.mesh.position.z);
             }
 
-            // --- DYNAMIC ENEMY AI: STAGING, BURROW AMBUSH, TACTICAL FLANKING & RELENTLESS ASSAULT ---
             let moving = false;
 
-            // Burrow Ambush for Skitterers (Zerglings) and Bursters (Banelings)
             if ((e.variant === 'skitterer' || e.variant === 'burster') && !e.isAir) {
                 e.burrowCooldown = (e.burrowCooldown || 0) - dt;
                 if (!e.burrowed && e.burrowCooldown <= 0 && bestDist > 16.0 && Math.abs(e.mesh.position.z) < 22 && Math.random() < 0.05) {
@@ -8424,7 +9284,6 @@ function animate(now) {
                 }
             }
 
-            // Staging AI: transition quickly to assault so units never stay idle
             if (e.aiState === 'staging' && !e.isAir) {
                 if (bestDist <= 24.0 || state.rushGraceTimer <= 0 || state.isEndless || isZergLosing) {
                     e.aiState = 'charge';
@@ -8436,7 +9295,6 @@ function animate(now) {
                 }
             }
 
-            // Assault & Flanking Navigation: compute lateral pincer / envelopment waypoint when losing or flanking
             let rawTargetPos = isBuildingTarget ? (bestTarget.pos || PLAYER_START_POS) : (bestTarget.mesh ? bestTarget.mesh.position : bestTarget.pos);
             if (!rawTargetPos) {
                 rawTargetPos = PLAYER_START_POS;
@@ -8456,12 +9314,12 @@ function animate(now) {
                 else if (e.flankTactic === 'canyon_rim_envelopment') lateralSpread = flankSign * 15.0;
                 else if (e.flankTactic === 'rear_eco_raid') lateralSpread = flankSign * 11.5;
 
-                // Blend lateral flank offset so the unit sweeps wide around the front line and hooks into the flank
                 const blend = Math.min(1.0, (bestDist - 9.0) / 22.0);
                 const candidateX = rawTargetPos.x + perpX * lateralSpread * blend;
                 const candidateZ = rawTargetPos.z + perpZ * lateralSpread * blend;
                 if (e.isAir || (typeof isWalkableGround === 'function' && isWalkableGround(candidateX, candidateZ, (e.radius || 0.50) * 0.6))) {
-                    attackNavTarget = new THREE.Vector3(candidateX, rawTargetPos.y || 0, candidateZ);
+                    if (!e._flankScratch) e._flankScratch = new THREE.Vector3();
+                    attackNavTarget = e._flankScratch.set(candidateX, rawTargetPos.y || 0, candidateZ);
                 }
             }
 
@@ -8472,13 +9330,11 @@ function animate(now) {
                 let targetRad = isBuildingTarget ? 1.45 : (bestTarget.radius || 0.55);
                 let engageRange = e.range + targetRad + 0.35;
 
-                // Physical Turret Shield Barrier Check:
-                // If an active turret shield dome (9.5m radius) protects the target OR blocks this enemy at the perimeter,
-                // the enemy CANNOT enter the 9.5m radius and instead attacks the shield barrier at the perimeter until destroyed!
+                // Physical Turret Shield Barrier Check via pre-filtered BUILDING_COUNTS.activeShieldTurrets
                 let blockingShieldTurret = null;
-                for (let bi = 0; bi < buildings.length; bi++) {
-                    const b = buildings[bi];
-                    if (!b || b.type !== 'turret' || b.hp <= 0 || !(b.maxShieldHp > 0 && b.shieldHp > 15) || b.shieldBrokenTimer > 0) continue;
+                const activeTurrets = BUILDING_COUNTS.activeShieldTurrets;
+                for (let bi = 0; bi < activeTurrets.length; bi++) {
+                    const b = activeTurrets[bi];
                     const dEnemyToTurret = Math.hypot(e.mesh.position.x - b.pos.x, e.mesh.position.z - b.pos.z);
                     const dTargetToTurret = Math.hypot(tPos.x - b.pos.x, tPos.z - b.pos.z);
                     if (dTargetToTurret <= 9.5 || dEnemyToTurret <= 9.5 + (e.radius || 0.55) + 1.2) {
@@ -8490,7 +9346,6 @@ function animate(now) {
                     const dToTurret = Math.hypot(e.mesh.position.x - blockingShieldTurret.pos.x, e.mesh.position.z - blockingShieldTurret.pos.z);
                     const shieldPerimeter = 9.5 + (e.radius || 0.55);
                     if (dToTurret <= shieldPerimeter + Math.max(e.range, 0.85)) {
-                        // Enemy has reached the shield perimeter (or is in ranged weapon reach of the shield dome): attack the shield barrier!
                         bestTarget = blockingShieldTurret;
                         isBuildingTarget = true;
                         tPos = blockingShieldTurret.pos;
@@ -8500,12 +9355,11 @@ function animate(now) {
                     }
                 }
 
-                // BEHEMOTH & GORGON MOBILE BIO-ARTILLERY: Fire Dorsal Bio-Plasma or Scorpion Tail-Catapult Bile Meteor while marching!
                 if ((e.variant === 'behemoth' || e.variant === 'gorgon') && bestDist <= Math.max(e.range, engageRange)) {
                     if (e.cooldown <= 0) {
                         e.mesh.userData.attackAnim = 1.0;
-                        const muzzleOffset = new THREE.Vector3(0, e.variant === 'gorgon' ? 1.55 : 1.1, 0);
-                        launchOrdProjectile(e.mesh.position.clone().add(muzzleOffset), bestTarget, e.variant, e.damage, true);
+                        _muzzleScratch.set(e.mesh.position.x, e.mesh.position.y + (e.variant === 'gorgon' ? 1.55 : 1.1), e.mesh.position.z);
+                        launchOrdProjectile(_muzzleScratch, bestTarget, e.variant, e.damage, true);
                         e.cooldown = e.fireRate;
                     }
                     if (bestDist > (blockingShieldTurret ? 11.2 : 5.5)) {
@@ -8519,7 +9373,6 @@ function animate(now) {
                         }
                     }
                 } else if (bestDist <= engageRange) {
-                    // Close-Range or Shield-Perimeter Engagement
                     if (e.isAir) {
                         smoothAirVehicleTransform(e, tPos.x, tPos.z, 5.8, false, dt);
                     } else {
@@ -8530,7 +9383,7 @@ function animate(now) {
                         if (!isBuildingTarget) {
                             recordRagdollHitImpulse(bestTarget, e.mesh.position, true);
                         }
-                        if (typeof spawnBombCrater === 'function') spawnBombCrater( e.mesh.position, 0.55);
+                        if (typeof spawnBombCrater === 'function') spawnBombCrater(e.mesh.position, 0.55);
                         applyDamageWithTurretShield(bestTarget, e.damage, e.mesh.position);
                         spawnCombatFloat(e.mesh.position, e.damage, '#ff5400');
                         if (bestTarget === state.baseBuilding) updateHUD();
@@ -8542,8 +9395,12 @@ function animate(now) {
                             bestTarget.retaliateTarget = e;
                         }
                         if (e.variant === 'spitter' || e.variant === 'behemoth' || e.variant === 'gorgon' || e.variant === 'mutalisk') {
-                            const muzzleOffset = e.isAir ? new THREE.Vector3(0, -0.15, 0) : new THREE.Vector3(0, e.variant === 'gorgon' ? 1.55 : 0.7, 0);
-                            launchOrdProjectile(e.mesh.position.clone().add(muzzleOffset), bestTarget, e.variant, e.damage, true);
+                            _muzzleScratch.set(
+                                e.mesh.position.x,
+                                e.mesh.position.y + (e.isAir ? -0.15 : (e.variant === 'gorgon' ? 1.55 : 0.7)),
+                                e.mesh.position.z
+                            );
+                            launchOrdProjectile(_muzzleScratch, bestTarget, e.variant, e.damage, true);
                         } else {
                             if (!isBuildingTarget) {
                                 recordRagdollHitImpulse(bestTarget, e.mesh.position, e.variant === 'crusher');
@@ -8555,9 +9412,11 @@ function animate(now) {
                         e.cooldown = e.fireRate;
                     }
                 } else if (e.isAir) {
-                    // Flying Mutalisk Sky-Leviathan glides across terrain & executes wide aerial flanking arcs when losing
-                    const dir = new THREE.Vector3(attackNavTarget.x - e.mesh.position.x, 0, attackNavTarget.z - e.mesh.position.z).normalize();
-                    e.mesh.position.addScaledVector(dir, effEnemySpeed * dt);
+                    const dxAir = attackNavTarget.x - e.mesh.position.x;
+                    const dzAir = attackNavTarget.z - e.mesh.position.z;
+                    const lenAir = Math.hypot(dxAir, dzAir) || 1;
+                    e.mesh.position.x += (dxAir / lenAir) * effEnemySpeed * dt;
+                    e.mesh.position.z += (dzAir / lenAir) * effEnemySpeed * dt;
                     smoothAirVehicleTransform(e, attackNavTarget.x, attackNavTarget.z, 5.8, true, dt);
                     moving = true;
                 } else {
@@ -8580,12 +9439,13 @@ function animate(now) {
                     window.updateZergUnitBruiseDamage(e);
                 }
                 updateUnitAnimation(e.mesh, dt, moving, enemyAimPos);
-                e.hb.bar.style.width = `${Math.max(0, (e.hp / e.maxHp) * 100)}%`;
+                updateHealthPip(e.hb, e.hp, e.maxHp, 0, 0);
                 projectToScreen(e.hb.root, e.mesh.position, e.isAir ? 1.25 : (e.variant === 'behemoth' ? 1.8 : 1.15));
             } else if (e.hb && e.hb.root && e.hb.root.style.display !== 'none') {
                 e.hb.root.style.display = 'none';
             }
         }
+        if (perfProf) perfProf.end('enemyAI');
 
         resolveAllUnitCollisions();
 
@@ -8606,13 +9466,11 @@ function animate(now) {
                     if (u.selCircle) u.mesh.remove(u.selCircle);
                     u.hb.root.remove();
                     if (u.type === 'heli' && typeof startHelicopterTailDestroyCrash === 'function' && Math.random() < 0.50) {
-                        // 50% chance: Gunship Helicopter spins/crashes downward (no floating crash text!)
                         startHelicopterTailDestroyCrash(u);
                     } else if (u.isVehicle || u.isAir) {
                         spawnVehicleWreckageExplosion(u.mesh.position, u.type);
                         scene.remove(u.mesh);
                     } else {
-                        // Ground biological unit died: trigger subtle blood splash ONLY on death!
                         if (!u.isMindControlled) {
                             spawnAlliedBloodPhysicsSplash(u.mesh.position, u.lastHitImpulse);
                         }
@@ -8633,9 +9491,17 @@ function animate(now) {
         }
     }
 
+    if (perfProf) perfProf.begin('corpsesAndDebris');
     // Animate Out-Of-Control Tail-Destroyed Crashing Helicopters
     if (typeof updateCrashingHelicopters === 'function') {
         updateCrashingHelicopters(dt);
+    }
+
+    // Cap corpses and wreckage parts dynamically based on adaptive quality budget
+    const maxCorpseBudget = perfCfg ? perfCfg.maxCorpses : 48;
+    while (corpses.length > maxCorpseBudget) {
+        const oldest = corpses.shift();
+        if (oldest && oldest.mesh) disposeHierarchy(oldest.mesh);
     }
 
     // Animate Articulated Ragdoll Death Corpses
@@ -8646,6 +9512,12 @@ function animate(now) {
             disposeHierarchy(c.mesh);
             corpses.splice(i, 1);
         }
+    }
+
+    const maxDebrisBudget = perfCfg ? perfCfg.maxDebris : 64;
+    while (wreckageParts.length > maxDebrisBudget) {
+        const oldestW = wreckageParts.shift();
+        if (oldestW && oldestW.mesh) scene.remove(oldestW.mesh);
     }
 
     // Animate Scattered Flaming Vehicle Wreckage & Detached Weapon/Chitin Parts
@@ -8681,7 +9553,7 @@ function animate(now) {
                     Math.random() > 0.35 ? SHARED_FX_MAT.smokeDark : SHARED_FX_MAT.smokeFire
                 );
                 sm.scale.setScalar(0.75);
-                sm.position.copy(wp.mesh.position).add(new THREE.Vector3(0, 0.2, 0));
+                sm.position.set(wp.mesh.position.x, wp.mesh.position.y + 0.2, wp.mesh.position.z);
                 scene.add(sm);
                 smokeClouds.push({ mesh: sm, vel: new THREE.Vector3((Math.random()-0.5)*0.6, 1.8, (Math.random()-0.5)*0.6), life: 0.6 });
                 wp.smokeTimer = 0.22;
@@ -8694,7 +9566,10 @@ function animate(now) {
             wreckageParts.splice(i, 1);
         }
     }
+    if (perfProf) perfProf.end('corpsesAndDebris');
 
+    if (perfProf) perfProf.begin('projectilesAndFX');
+    const maxParticlesBudget = perfCfg ? perfCfg.maxParticles : 120;
     // Update Projectiles (Tracks fast-moving air targets so Barracks anti-air infantry reliably hit flying Mutalisks!)
     for (let i = projectiles.length - 1; i >= 0; i--) {
         const p = projectiles[i];
@@ -8704,21 +9579,20 @@ function animate(now) {
         }
         const tPos = p.landingPos;
 
-        const prevPos = p.mesh.position.clone();
+        _projPrevPosScratch.copy(p.mesh.position);
         p.mesh.position.lerpVectors(p.start, tPos, Math.min(1, p.progress));
         if (p.wType === 'mortar' || p.isBioGoo || p.isEnemyAcid || p.wType === 'siege_tank') {
             p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'mortar' ? 6.2 : (p.wType === 'siege_tank' ? 4.8 : 2.6));
             if (p.wType === 'siege_tank' && typeof emitThrusterExhaustParticles === 'function') {
-                const trailDir = prevPos.clone().sub(p.mesh.position).normalize();
-                emitThrusterExhaustParticles(p.mesh.position, trailDir, 0.92, true);
+                _projTrailDirScratch.copy(_projPrevPosScratch).sub(p.mesh.position).normalize();
+                emitThrusterExhaustParticles(p.mesh.position, _projTrailDirScratch, 0.92, true);
             }
         } else if (p.wType === 'rocket' || p.wType === 'heli' || p.wType === 'rocketman' || p.wType === 'valkyrie' || p.wType === 'valk_aa' || p.wType === 'marauder') {
             p.mesh.position.y += Math.sin(p.progress * Math.PI) * 1.45;
-            // Pure Particle Engine Rocket Booster Plume (NO flat square smoke quad!)
             if (typeof emitThrusterExhaustParticles === 'function') {
-                const trailDir = prevPos.clone().sub(p.mesh.position).normalize();
-                emitThrusterExhaustParticles(p.mesh.position, trailDir, 0.85, false);
-                emitThrusterExhaustParticles(prevPos, trailDir, 0.65, false);
+                _projTrailDirScratch.copy(_projPrevPosScratch).sub(p.mesh.position).normalize();
+                emitThrusterExhaustParticles(p.mesh.position, _projTrailDirScratch, 0.85, false);
+                emitThrusterExhaustParticles(_projPrevPosScratch, _projTrailDirScratch, 0.65, false);
             }
         } else if (p.wType === 'stalker' || p.wType === 'archon' || p.wType === 'solaris_spire') {
             p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'archon' ? 0.25 : 0.45);
@@ -8726,7 +9600,7 @@ function animate(now) {
                 if (p.mesh.userData.gyroRing1) p.mesh.userData.gyroRing1.rotation.z += dt * 18.0;
                 if (p.mesh.userData.gyroRing2) p.mesh.userData.gyroRing2.rotation.y -= dt * 22.0;
             }
-            if (Math.random() < 0.65 && particles.length < 110 && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
+            if (Math.random() < 0.65 && particles.length < maxParticlesBudget && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
                 const wake = new THREE.Mesh(
                     SHARED_FX_GEO.weldSpark,
                     Math.random() > 0.4 ? (MAT.solarisPrismGlow || MAT.cyanGlow) : (MAT.solarisGold || MAT.amberGlow)
@@ -8742,9 +9616,8 @@ function animate(now) {
                 });
             }
         } else if (p.wType === 'tank' || p.wType === 'sunlance') {
-            // Flat, high-velocity supersonic trajectory with glowing plasma wake
             p.mesh.position.y += Math.sin(p.progress * Math.PI) * (p.wType === 'sunlance' ? 0.35 : 0.65);
-            if (Math.random() < 0.55 && particles.length < 105 && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
+            if (Math.random() < 0.55 && particles.length < maxParticlesBudget && window.isWorldPosInViewport(p.mesh.position.x, p.mesh.position.y, p.mesh.position.z, 3.0)) {
                 const wake = new THREE.Mesh(SHARED_FX_GEO.weldSpark, p.wType === 'sunlance' ? MAT.amberGlow : MAT.cyanGlow);
                 wake.scale.setScalar(p.wType === 'sunlance' ? 0.95 : 0.85);
                 wake.position.copy(p.mesh.position);
@@ -8757,12 +9630,12 @@ function animate(now) {
                 });
             }
         } else if (p.wType === 'valk_mech') {
-            // Direct ballistic cannon trajectory without pulse/plasma wake
             p.mesh.position.y += Math.sin(p.progress * Math.PI) * 0.25;
         }
-        const deltaVec = p.mesh.position.clone().sub(prevPos);
-        if (deltaVec.lengthSq() > 0.00001) {
-            p.mesh.lookAt(p.mesh.position.clone().add(deltaVec));
+        _projDeltaScratch.copy(p.mesh.position).sub(_projPrevPosScratch);
+        if (_projDeltaScratch.lengthSq() > 0.00001) {
+            _projTrailDirScratch.copy(p.mesh.position).add(_projDeltaScratch);
+            p.mesh.lookAt(_projTrailDirScratch);
             if (p.mesh.userData && p.mesh.userData.wakeRing) {
                 p.mesh.userData.wakeRing.rotation.z += dt * 20.0;
             }
@@ -8774,7 +9647,6 @@ function animate(now) {
             const gt = p.gooTime;
             const ud = p.mesh.userData;
             if (ud.coreBlob) {
-                // Volume-preserving peristaltic jelly squash-and-stretch
                 const sx = 1.0 + Math.sin(gt) * 0.26;
                 const sy = 1.0 + Math.cos(gt * 1.25) * 0.26;
                 const sz = 1.28 - Math.sin(gt) * 0.22;
@@ -8803,16 +9675,15 @@ function animate(now) {
                     strand.mesh.scale.set(0.85 + Math.sin(sp) * 0.2, 0.85 + Math.cos(sp) * 0.2, 1.15 + Math.sin(sp * 0.8) * 0.35);
                 }
             }
-            // Shed small algorithmic viscoelastic goo droplets along flight trajectory
-            if (Math.random() < 0.32 && particles.length < 95 && ud.dripGeo && ud.dripMat) {
+            if (Math.random() < 0.32 && particles.length < maxParticlesBudget && ud.dripGeo && ud.dripMat) {
                 const drip = new THREE.Mesh(ud.dripGeo, ud.dripMat);
                 const s = 0.55 + Math.random() * 0.45;
                 drip.scale.set(s, s, s * 1.45);
-                drip.position.copy(p.mesh.position).add(new THREE.Vector3(
-                    (Math.random() - 0.5) * 0.14,
-                    (Math.random() - 0.5) * 0.14,
-                    (Math.random() - 0.5) * 0.14
-                ));
+                drip.position.set(
+                    p.mesh.position.x + (Math.random() - 0.5) * 0.14,
+                    p.mesh.position.y + (Math.random() - 0.5) * 0.14,
+                    p.mesh.position.z + (Math.random() - 0.5) * 0.14
+                );
                 scene.add(drip);
                 particles.push({
                     mesh: drip,
@@ -8828,11 +9699,9 @@ function animate(now) {
                 const isHeavySplash = (p.wType === 'mortar' || p.wType === 'tank' || p.wType === 'siege_tank' || p.wType === 'rocket' || p.wType === 'heli' || p.wType === 'behemoth' || p.wType === 'sunlance' || p.wType === 'valk_mech');
                 triggerWaterRippleFX(tPos.x, tPos.z, isHeavySplash ? 1.45 : 0.82, true);
             }
-            // High-Ground Elevation Tactical Advantage (+12% damage when firing from elevated plateau/ridge > 1.6m above target)
             if (p.start && !p.isAirTarget && (p.start.y - tPos.y) > 1.6) {
                 p.damage = Math.round(p.damage * 1.12);
             }
-            // Real-Time Destructible Environment: Heavy ordnance & explosive projectiles damage/collapse procedural buildings & fell trees
             if (!p.isAirTarget && typeof window.damageEnvironmentalStructuresAt === 'function') {
                 const isExplosiveOrd = ['tank', 'siege_tank', 'mortar', 'rocket', 'sunlance', 'valk_mech', 'marauder', 'plasma', 'behemoth', 'gorgon', 'archon'].includes(p.wType);
                 if (isExplosiveOrd) {
@@ -8841,7 +9710,6 @@ function animate(now) {
                 }
             }
             if (p.wType === 'tank' || p.wType === 'siege_tank') {
-                // Distinct 120mm / 180mm APFSDS-HEAT & Shock-Artillery Detonation (Hits GROUND units & buildings only, carves 3D crater depression & scorch!)
                 if (typeof detonateTankKineticShell === 'function') {
                     detonateTankKineticShell(tPos, p.wType === 'siege_tank');
                 } else {
@@ -8851,7 +9719,7 @@ function animate(now) {
                 const bldRad = p.wType === 'siege_tank' ? 6.5 : 5.5;
                 const tag = p.wType === 'siege_tank' ? 'SIEGE' : 'AP';
                 enemies.forEach(e => {
-                    if (e.isAir) return; // Tank & Siege Tank shells only hit ground units!
+                    if (e.isAir) return;
                     if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= splashRad) {
                         recordRagdollHitImpulse(e, p.start, true);
                         e.hp -= p.damage;
@@ -8866,7 +9734,6 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'sunlance') {
-                // Bespoke Hero Vanguard Aegis-X9 Sunlance Rail-Bolt Impact: 3D Solar-Ion Particle Burst + Permanent Scorch & Crater Decal!
                 if (typeof spawnBombCrater === 'function' && !p.isAirTarget) spawnBombCrater(tPos, 0.56);
                 if (typeof window.spawnParticleBlastWaveFX === 'function') {
                     window.spawnParticleBlastWaveFX(tPos, 0xffaa00, 1.05, 16);
@@ -8886,11 +9753,10 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'valk_mech') {
-                // Valkyrie Semi-Mech 35mm Ground-Assault Explosive Shell (Hits GROUND units & buildings only, no pulse ring!)
                 if (typeof spawnBombCrater === 'function') spawnBombCrater(tPos, 0.48);
                 triggerSparks(tPos);
                 enemies.forEach(e => {
-                    if (e.isAir) return; // Semi-Mech ground autocannon only hits ground units!
+                    if (e.isAir) return;
                     if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 2.6) {
                         recordRagdollHitImpulse(e, p.start, false);
                         e.hp -= p.damage;
@@ -8905,10 +9771,9 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'valk_aa') {
-                // Valkyrie Flight Mode Anti-Air Halo Missile: STRICTLY hits flying units ONLY (no pulse ring!)
                 triggerSparks(tPos);
                 enemies.forEach(e => {
-                    if (!e.isAir) return; // Strict Air-Only damage!
+                    if (!e.isAir) return;
                     if (Math.hypot(e.mesh.position.x - tPos.x, e.mesh.position.z - tPos.z) <= 3.6) {
                         recordRagdollHitImpulse(e, p.start, true);
                         e.hp -= p.damage;
@@ -8916,7 +9781,6 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'rocket') {
-                // Explosive Rocket Missile Detonation (3D Particle Blast Burst + Scorch Crater Decal!)
                 if (typeof spawnBombCrater === 'function' && !p.isAirTarget) spawnBombCrater(tPos, 0.58);
                 if (typeof window.spawnParticleBlastWaveFX === 'function') {
                     window.spawnParticleBlastWaveFX(tPos, 0xff4500, 1.15, 16);
@@ -8951,7 +9815,6 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'marauder') {
-                // Marauder Punisher Concussive Grenade: 2.4m splash + 48% movement slow + 1.35x bonus damage vs armored/structures!
                 if (typeof detonateMarauderConcussiveShell === 'function') {
                     detonateMarauderConcussiveShell(tPos);
                 }
@@ -8975,7 +9838,6 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'plasma') {
-                // Plasma Gun splash ionization + simulated plasma combustion plume + permanent scorch crater
                 if (typeof spawnBombCrater === 'function') spawnBombCrater(tPos, 0.52);
                 if (typeof spawnSimulatedVolumetricExplosion === 'function') {
                     spawnSimulatedVolumetricExplosion(tPos, 0.58, 1.38, 1.0, 6, 10);
@@ -8997,8 +9859,6 @@ function animate(now) {
                     }
                 });
             } else if (p.isEnemyAcid) {
-                // Enemy Acid / Glaive / Bio-Plasma / Gorgon Bile-Web / Spine impact at landing spot:
-                // Burst 3D viscoelastic goo droplets & slime particles (Zero expanding white block quads!)
                 if (typeof spawnEnemyGooSplashFX === 'function') {
                     spawnEnemyGooSplashFX(tPos, p.wType);
                 }
@@ -9031,8 +9891,6 @@ function animate(now) {
                     });
                 }
             } else if (p.isBioGoo && !p.isEnemyAcid) {
-                // Mind-Controlled Friendly Zerg Bio-Goo / Glaive / Bile-Web / Bio-Plasma Impact:
-                // Hits and damages ENEMY Zerg units and ENEMY Zerg buildings!
                 if (typeof spawnEnemyGooSplashFX === 'function') {
                     spawnEnemyGooSplashFX(tPos, p.wType);
                 }
@@ -9055,7 +9913,6 @@ function animate(now) {
                     }
                 });
             } else if (p.wType === 'stalker' || p.wType === 'archon' || p.wType === 'solaris_spire') {
-                // Protoss Solaris Phase-Disruptor / Psionic Shock-Orb Impact: 3D Particle System Burst (Zero flat square planes!)
                 triggerSparks(tPos);
                 const isArchonOrb = (p.wType === 'archon');
                 if (typeof window.spawnParticleBlastWaveFX === 'function') {
@@ -9079,7 +9936,6 @@ function animate(now) {
                     }
                 });
             } else {
-                // Friendly ballistic/sniper/rifle/reaper/heli rocket round hitting whatever enemy is at the landing coordinate
                 if ((p.wType === 'heli' || p.wType === 'reaper') && typeof spawnBombCrater === 'function' && !p.isAirTarget) {
                     spawnBombCrater(tPos, p.wType === 'heli' ? 0.48 : 0.36);
                     if (p.wType === 'heli' && typeof spawnSimulatedVolumetricExplosion === 'function') {
@@ -9138,6 +9994,11 @@ function animate(now) {
         if (c.life <= 0) { scene.remove(c.mesh); shellCasings.splice(i, 1); }
     }
 
+    while (particles.length > maxParticlesBudget) {
+        const oldestPt = particles.shift();
+        if (oldestPt && oldestPt.mesh) scene.remove(oldestPt.mesh);
+    }
+
     for (let i = particles.length - 1; i >= 0; i--) {
         const pt = particles[i];
         pt.life -= dt;
@@ -9189,7 +10050,6 @@ function animate(now) {
                     pt.mesh.position.z + pt.vel.z
                 );
             }
-            // Smooth needle-cone taper as thruster plasma stream cools
             pt.mesh.scale.x *= 0.88;
             pt.mesh.scale.y *= 0.88;
             pt.mesh.scale.z *= 0.94;
@@ -9243,12 +10103,11 @@ function animate(now) {
         if (sw.alpha <= 0) { scene.remove(sw.mesh); sw.mesh.material.dispose(); shockwaves.splice(i, 1); }
     }
 
-    // Animate 3D Tactical Order Waypoint Markers (Converging 4-Chevron Reticle + Descending Beacon Pin)
+    // Animate 3D Tactical Order Waypoint Markers
     for (let i = tacticalWaypoints.length - 1; i >= 0; i--) {
         const tw = tacticalWaypoints[i];
         tw.age += dt;
         const t = Math.min(1.0, tw.age / tw.maxLife);
-        // Smooth ease-out convergence from 0.92m radius inward to 0.22m lock point
         const ease = 1.0 - Math.pow(1.0 - t, 3.0);
         const rad = THREE.MathUtils.lerp(0.92, 0.22, ease);
         for (let ci = 0; ci < tw.chevrons.length; ci++) {
@@ -9270,16 +10129,31 @@ function animate(now) {
             tacticalWaypoints.splice(i, 1);
         }
     }
+    if (perfProf) perfProf.end('projectilesAndFX');
 
+    const portraitTargetInterval = perfCfg ? perfCfg.portraitInterval : 0.065;
     _portrait3DAccum += dt;
-    if (_portrait3DAccum >= 0.065) {
+    if (_portrait3DAccum >= portraitTargetInterval) {
         if (window.PORTRAIT_3D_VIEWER && typeof window.PORTRAIT_3D_VIEWER.update === 'function') {
+            if (perfProf) perfProf.begin('portrait3D');
             window.PORTRAIT_3D_VIEWER.update(_portrait3DAccum);
+            if (perfProf) perfProf.end('portrait3D');
         }
         _portrait3DAccum = 0;
     }
 
+    if (perfProf) perfProf.begin('renderScene');
     renderer.render(scene, camera);
+    if (perfProf) {
+        perfProf.end('renderScene');
+        perfProf.endFrame(renderer, {
+            units: units.length,
+            enemies: enemies.length,
+            buildings: buildings.length + enemyBuildings.length + (typeof solarisBuildings !== 'undefined' ? solarisBuildings.length : 0),
+            projectiles: projectiles.length,
+            particles: particles.length + smokeClouds.length + shockwaves.length
+        });
+    }
     } catch (err) {
         if (window.APP_ERROR_HANDLER) window.APP_ERROR_HANDLER.record('animate', err);
         try { renderer.render(scene, camera); } catch (_) {}
@@ -9569,6 +10443,9 @@ window.GAME_API = {
             return window.regenerateDynamicSectorMap(customSeed, lobbyPlayers);
         }
     },
+    getPerfReport: () => (window.PERF_PROFILER ? window.PERF_PROFILER.getReport() : null),
+    togglePerfHUD: () => (window.PERF_PROFILER ? window.PERF_PROFILER.toggleHUD() : false),
+    setQualityPreset: (preset) => (window.PERF_MANAGER ? window.PERF_MANAGER.setPreset(preset, renderer) : null),
     handleNetworkOrder: (order, senderId) => {
         if (!order) return;
         if (order.type === 'ping' && order.pos) {
@@ -9591,10 +10468,14 @@ window.GAME_API = {
 // wave, timers, FOW) and starts fresh on the newly generated terrain algorithm!
 // ============================================================================
 window.resetMatchForNewMap = function(newSeed) {
-    // 0. Clear active autonomous mining drones
+    // 0. Clear active autonomous mining drones & invalidate cached A* static walkability grid
     if (typeof clearAutoMiningDrones === 'function') {
         clearAutoMiningDrones();
     }
+    if (typeof window.invalidateStaticAStarGrid === 'function') {
+        window.invalidateStaticAStarGrid();
+    }
+    _fowLastSig = -1;
 
     // 1. Remove & clean up all player buildings
     buildings.forEach(b => {
@@ -9629,14 +10510,24 @@ window.resetMatchForNewMap = function(newSeed) {
     projectiles.length = 0;
     particles.forEach(pt => { if (pt && pt.mesh) scene.remove(pt.mesh); });
     particles.length = 0;
-    smokeClouds.forEach(sm => { if (sm && sm.mesh) scene.remove(sm.mesh); });
+    smokeClouds.forEach(sm => {
+        if (sm && sm.mesh) {
+            scene.remove(sm.mesh);
+            if (sm.ownsMaterial && sm.mesh.material) sm.mesh.material.dispose();
+        }
+    });
     smokeClouds.length = 0;
-    shockwaves.forEach(sw => { if (sw && sw.mesh) scene.remove(sw.mesh); });
+    shockwaves.forEach(sw => {
+        if (sw && sw.mesh) {
+            scene.remove(sw.mesh);
+            if (sw.mesh.material) sw.mesh.material.dispose();
+        }
+    });
     shockwaves.length = 0;
     shellCasings.forEach(sc => { if (sc && sc.mesh) scene.remove(sc.mesh); });
     shellCasings.length = 0;
     if (typeof corpses !== 'undefined') {
-        corpses.forEach(c => { if (c && c.mesh) scene.remove(c.mesh); });
+        corpses.forEach(c => { if (c && c.mesh) disposeHierarchy(c.mesh); });
         corpses.length = 0;
     }
     if (typeof wreckageParts !== 'undefined') {

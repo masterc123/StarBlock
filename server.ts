@@ -375,7 +375,9 @@ wss.on('connection', (ws) => {
             maxPlayers: msg.maxPlayers || 6,
             ping: 15,
             status: 'Waiting',
-            seed: Math.floor(Math.random() * 10000),
+            seed: (Number.isFinite(Number(msg.seed)) && Number(msg.seed) > 0)
+              ? Math.floor(Number(msg.seed))
+              : Math.floor(100000 + Math.random() * 899999),
             players: [
               {
                 id: meta.playerId,
@@ -532,7 +534,10 @@ wss.on('connection', (ws) => {
           if (!meta.lobbyId) return;
           const lobby = lobbies.get(meta.lobbyId);
           if (!lobby) return;
-          lobby.seed = msg.seed || Math.floor(100000 + Math.random() * 899999);
+          const candidateSeed = Number(msg.seed);
+          lobby.seed = (Number.isFinite(candidateSeed) && candidateSeed > 0)
+            ? Math.floor(candidateSeed)
+            : Math.floor(100000 + Math.random() * 899999);
           broadcastRoom(meta.lobbyId);
           break;
         }
